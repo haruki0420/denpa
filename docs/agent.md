@@ -276,7 +276,7 @@ CM 検出用のロゴはチューナーを使いません。録れたものか�
 | siano-userland  | `siano-ts --list` ([下記](#siano-userland-の作り))                                                                                                          |
 | asicen-userland | `/sys/bus/usb/devices` の USB ID を読む (試験的。配布物が無ければ挙げない。[下記](#asicen-userland-の作り))                                                 |
 | CECH-ZD1 J      | Linux は `/sys/bus/usb/devices` の USB ID、Windows・macOS は OS に聞く。並べるだけで開かない ([下記](#cech-zd1-j-の作り))                                   |
-| PIX-DT295       | CECH-ZD1 J と同じ。開くと常駐イメージを機材に入れるので並べるだけ (試験的。[tuners.md](tuners.md#pixela-pix-dt295-試験的))                                                |
+| PIX-DT295       | CECH-ZD1 J と同じ。開くと常駐イメージを機材に入れるので並べるだけ (試験的。[tuners.md](tuners.md#pixela-pix-dt295-試験的))                                  |
 
 書いてあれば書いたほうが勝ちます (LNB や 1 台だけ止めるのは人にしか決められない)。
 
