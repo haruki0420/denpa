@@ -87,13 +87,28 @@ export function backgroundPlayback(options: Options): Background {
       gone = false;
       check();
     };
+    const onLeavePip = () => {
+      // `leavepictureinpicture` はバブルしない (bubbles: false) のでキャプチャで受け取る。
+      // video のリスナー (pip.svelte.ts) が先に on を null に戻すのを待ってから check を呼ぶ
+      queueMicrotask(check);
+    };
     document.addEventListener("visibilitychange", check);
-    document.addEventListener("leavepictureinpicture", check);
+    document.addEventListener("leavepictureinpicture", onLeavePip, true);
+    document.addEventListener(
+      "webkitpresentationmodechanged",
+      onLeavePip,
+      true,
+    );
     window.addEventListener("pagehide", hide);
     window.addEventListener("pageshow", show);
     return () => {
       document.removeEventListener("visibilitychange", check);
-      document.removeEventListener("leavepictureinpicture", check);
+      document.removeEventListener("leavepictureinpicture", onLeavePip, true);
+      document.removeEventListener(
+        "webkitpresentationmodechanged",
+        onLeavePip,
+        true,
+      );
       window.removeEventListener("pagehide", hide);
       window.removeEventListener("pageshow", show);
     };
