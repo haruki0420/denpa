@@ -2,44 +2,31 @@
 
 更新: 2026-11-08
 
-この文書は、B-CAS の契約確認・復号テスト・期限切れ通知の作業を別の AI や
-開発者へ引き継ぐためのもの。仕様・実測・複数 PR の方針は
-[bcas-contracts.md](bcas-contracts.md) に詳しく書いてある。こちらは
-「いま何がどこまで終わっていて、次に何をするか」を短くまとめる。
+この文書は、B-CAS の契約確認・復号テスト・期限切れ通知の作業を引き継ぐためのもの。
+仕様・実測・複数 PR の方針は [bcas-contracts.md](bcas-contracts.md) に詳しく書いてある。
+こちらは「いま何がどこまで終わっていて、次に何をするか」を短くまとめる。
 
-関連: danything/denpa#2221、PR #2231、Antigravity の引継書
-(`b664cd3a-7fb6-4bb2-b304-db32cf5243f6/handoff.md`)
+関連: danything/denpa#2221、PR #2231
 
 ## 0. 最初に守ること
 
 - 絵文字は UI・通知・コード・ログ・文書で使わない。
 - 用語は「期限切れ」で統一する (「次期 Kw」は使わない)。
 - 変更したら次を通す。
-  - `TZ=Asia/Tokyo npx -y bun test --isolate src packages scripts`
-  - `npx -y bun run check`
-  - `npx -y bun run lint`
+  - `TZ=Asia/Tokyo bun test --isolate src packages scripts`
+  - `bun run check`
+  - `bun run lint`
 - 上流 PR の範囲を壊さない。EMM・期限切れ通知・バッジは feature 枝に残す。
 
-## 1. リポジトリと枝
+## 1. 枝の構成
 
-- 作業場所: `/home/kuni/dev/denpa`
-- 作業する枝: `pr/bcas-contract-management` (2026-11-08 から `origin/main` を取り込んだ)
-- **kuni1 で動かしているのは、この枝ではなく公開リリースのイメージ**
-  (`ghcr.io/danything/denpa:latest`)。枝を試すときだけ自分で組む (§9)
-- remote:
-  - `origin` = `danything/denpa` (push は 403 で不可)
-  - `myfork` = `haruki0420/denpa` (push はここ)
-- 上流 `origin/main` の先頭: `990d093c` (v2.35.0 のあと 4 コミット)。
-  この枝は `40867a74` (v2.35.0) まで取り込んだ `9a974398` の上にある。
-  **未リリースの 4 コミットはまだ取り込んでいない** (EMM の #2339 が枝の実装と衝突する)
-- 上流 main には EMM・期限切れ通知・バッジ・事業者単位の管理・手動設定は入っていない。
-  それらは `pr/bcas-contract-management` にある。
-- 旧配備枝の `feat/bcas-keep-emm-expiry`・`feat/bcas-integrated` は上流から 90 件以上
-  遅れていて、上流との衝突も 20〜30 ファイルある。**もう配備には使わない。**
-  `feat/bcas-batch-decode` も別途配備しない。
-- 枝を上げるときは `git fetch origin && git merge origin/main` で取り込み、
-  `myfork` へ push してから、kuni1 の worktree (`/home/kuni/.cache/denpa-work`) で
-  `git checkout pr/bcas-contract-management && git pull` する。
+- 上流: `danything/denpa` の `main`
+- 作業枝: `pr/bcas-contract-management`
+- 上流へは直接 push できないので、フォークから PR を出す。
+- 上流 `main` には EMM・期限切れ通知・バッジ・`contract_warning` は入っていない。
+  それらはこの枝にある。
+- 配備に使うのはこの枝だけ。`feat/bcas-batch-decode` は別途配備しない
+  (一括復号はこの枝に取り込み済み)。
 
 主なコミット:
 
@@ -53,12 +40,6 @@
 | `aebc0563` | ジャパネットを BS10 と BS10 プレミアムへ整理     |
 | `9754c252` | スターチャンネルの CS 放送の現状                 |
 | `f66f3492` | Kw の配布と契約管理の単位を区別                  |
-
-`192c8d4f` までは `myfork` に push 済み。それより後の文書コミットは、
-この引き継ぎ書を足したあとに push する。
-
-作業ツリーには `Dockerfile.agent.custom` と `Dockerfile.denpa.custom` が
-未追跡で残っている。これは kuni1 で使うカスタムビルド用で、コミットしない。
 
 ## 2. 実装済みのこと
 
@@ -93,7 +74,8 @@
 
 - `expired` の局は予約・番組表で「期限切れ」バッジを出す。
 - 自動録画の対象から外す。
-- `scheduler.tick()` が `CONTRACT_SCAN_INTERVAL` (既定 12 時間) または深夜 JST 03:00 に `scanContracts()` を呼ぶ。
+- `scheduler.tick()` が `CONTRACT_SCAN_INTERVAL` (既定 12 時間) または深夜 JST 03:00 に
+  `scanContracts()` を呼ぶ。
 - 前回の状態と比べて **新たに `expired` になった局** に `contract.expired` Webhook を送る。
 - `subscribed` かつ `valid_until` が 7 日以内の局に **`contract.expiring` (期限切れ予告) Webhook** を送る。
 - `contract_notifications` テーブルに記録し、同一期限に対する二重通知を防ぐ。
@@ -104,7 +86,7 @@
 - これは鍵の更新であり、契約の有無・期限を読み出すものではない。
 - 契約判定とは別の PR に分ける方針。
 
-## 3. kuni1 での実測結果
+## 3. 実測結果
 
 ### 3.1 一括復号テスト
 
@@ -172,7 +154,7 @@
 - 「Kw を配っているのは WOWOW・ジャパネット・スカパーだけ」は正確ではない。
   Kw は EMM に載って各契約事業者から配られる。
 - 3 つに集約されるのは **契約を管理している単位 (課金単位)**。
-  kuni1 で受信できる有料局は、WOWOW (直契約)、ジャパネット (直契約)、
+  受信できる有料局は、WOWOW (直契約)、ジャパネット (直契約)、
   スカパー! (プラットフォーム経由) の 3 つに整理できる可能性が高い。
 - スカパー! は 1 契約で全チャンネルが見られるわけではなく、チャンネル単位・
   パック単位で契約が分かれる。
@@ -205,7 +187,8 @@
 - `card_contracts.state` に `unknown` を追加。
 - 判定根拠 `source` (`eit_ca` / `decode` / `manual`) を追加。
 - 0xCB が無く復号テスト未実施の局を「未確認」と判定・記録。
-- `ContractDialog.svelte` で「契約中」「期限切れ」「未確認」「未契約」の表示と判定元（カード判定 / 復号テスト）を整理。
+- `ContractDialog.svelte` で「契約中」「期限切れ」「未確認」「未契約」の表示と
+  判定元 (カード判定 / 復号テスト) を整理。
 
 ### PR B: 7 日前通知と深夜スキャン (実装完了)
 
@@ -213,110 +196,86 @@
 - `contract.expiring` イベントを追加し、Discord などへ「7 日後に期限切れ」予告を送信。
 - `contract_notifications` テーブルに記録し、同一期限での重複通知を抑止。
 - 深夜 (JST 03:00) を跨いだタイミングでの定期スキャン実行を追加。
-- 0xCB が無い局は 7 日後判定の対象外（復号テスト有効期限に基づく）。
+- 0xCB が無い局は 7 日後判定の対象外 (復号テストの有効期限に基づく)。
 
 ### PR C: 契約確認方式の抽象化と拡張 (実装完了)
 
-- `ContractChecker` オブジェクトを新設し、局の利用可能方式 (`getAvailableMethods`: `eit_ca` / `decode` / `manual`) を特定。
+- `ContractChecker` オブジェクトを新設し、局の利用可能方式
+  (`getAvailableMethods`: `eit_ca` / `decode` / `manual`) を特定。
 - 優先順位ルール (`manual` > `eit_ca` > `decode` > `unknown`) を一元化。
-- `ContractDialog.svelte` に対応方式（カード・復号 / 復号テストのみ）を表示。
+- `ContractDialog.svelte` に対応方式 (カード・復号 / 復号テストのみ) を表示。
 
 ### PR D: 手動設定と除外 (実装完了)
 
-- `card_contracts.manual_state` カラムを追加し、手動での「契約中」「未契約・除外」「未確認」設定を保持。
+- `card_contracts.manual_state` カラムを追加し、手動での「契約中」「未契約・除外」
+  「未確認」設定を保持。
 - `setManualContract` サーバーアクションおよび API を実装。
-- 手動設定された局は `checkContracts` や `recordDecode`、`noteStillScrambled` で勝手に上書きされないよう保護。
+- 手動設定された局は `checkContracts` や `recordDecode`、`noteStillScrambled` で
+  勝手に上書きされないよう保護。
 - `paidAllowed` が手動契約中 (`manualState === 'subscribed'`) を自動録画対象として認識。
 - `ContractDialog.svelte` の行ごとに手動設定ドロップダウンを追加。
 
-### PR E: 事業者単位の管理・促進 (実装完了)
+### PR E: 事業者単位の管理 (実装完了)
 
-- 契約事業者（WOWOW / スカパー! / ジャパネット / その他）の判別マスタ `getContractProvider` を新設。
-- WOWOW は 3 局直契約（プライム / ライブ / シネマ）の契約状態・有効期限を連動同期。
-- スカパー！は局ごとの個別契約と、代表局（スカチャン 1 等）との一括同期をシステム設定で切り替え可能に両対応。
+- 契約事業者 (WOWOW / スカパー! / ジャパネット / その他) の判別マスタ
+  `getContractProvider` を新設。
+- WOWOW は 3 局直契約 (プライム / ライブ / シネマ) の契約状態・有効期限を連動同期。
+- スカパー! は代表局 (スカチャン 1 等) との一括同期を行う。**切り替えの設定は持たず、
+  常に同期する。**
 - `ContractDialog.svelte` を事業者ごとのグループヘッダー表示に改修。
 
-### PR F: モーダル表示のオプション設定 (実装完了)
+### PR F: 案内の表示設定 (実装完了)
 
-- 設定画面・契約確認ダイアログに「契約期限・更新案内」（モーダルで通知 / 控えめに通知 / 通知しない）および「スカパー！の期限・契約情報を全局で同期する」の設定 UI を実装。
-- 設定値（`contract_skyperfect_sync`, `contract_modal_mode`）を `settings` テーブルに永続化し、サーバー側・UI 側でリアルタイム連動。
+- 設定画面・契約確認ダイアログに「契約期限・更新案内」(モーダルで通知 /
+  控えめに通知 / 通知しない) の設定 UI を実装。
+- 設定値 (`contract_modal_mode`) を `settings` テーブルに永続化し、
+  サーバー側・UI 側で連動させる。
 - `tuners.server.ts` に `saveContractSettings` アクションを新設。
 
 ## 8. 検証
 
 この引き継ぎ書を書いた時点の結果:
 
-- `PATH="/home/kuni/.bun/bin:$PATH" TZ=Asia/Tokyo bun test --isolate src packages scripts`
+- `TZ=Asia/Tokyo bun test --isolate src packages scripts`
   - 3126 pass / 0 fail / 14273 expect() calls
-- `PATH="/home/kuni/.bun/bin:$PATH" bun run check`
+- `bun run check`
   - svelte-check 0 errors / 0 warnings
-- `PATH="/home/kuni/.bun/bin:$PATH" bun run lint`
+- `bun run lint`
   - pass (oxlint 0 errors, bun fmt pass)
 
 注意:
 
-- この環境では `bun` が PATH に無いので `npx -y bun` を使う。
 - `bun test` は TZ を指定しないと UTC で走る。JST の 00:00-09:00 の間は
   `src/lib/server/clips.test.ts` の日付テストが 1 件落ちる既知の環境依存がある。
   `TZ=Asia/Tokyo` を付ければ通る。今回の変更とは無関係。
 
-## 9. kuni1 の確認環境
+## 9. 移行の注意
 
-- `ssh kuni1`
-- compose: `/home/kuni/denpa/compose.yml` と `compose.override.yml`
-- worktree: `/home/kuni/.cache/denpa-work` (枝は `pr/bcas-contract-management`)
-- DB: `/data/denpa.db` (コンテナ内、実体は `denpa_denpa-data` ボリューム)
-- **2026-11-08 12:58 から、公開リリースのイメージで動かしている。**
-  - app: `ghcr.io/danything/denpa:latest` (いまは v2.35.0)
-  - agent: `ghcr.io/danything/denpa-agent:latest`
-  - 更新は `cd ~/denpa && docker compose pull && docker compose up -d`。
-    イメージのタグが変われば compose が作り直す (`--force-recreate` は要らない)
-  - `compose.override.yml` はこの 2 つの `image:` を指すだけにしてある。
-    `DENPA_VERSION` は書かない (イメージに焼いてある。`:latest` は v2.35.0 を返す)
-  - 切り替える前の override は `compose.override.yml.bak-20261108-1257`
-  - **枝だけの機能 (事業者別の契約管理・手動設定・一括復号・EMM の手動受信・
-    モーダル表示の設定) は、この切り替えで kuni1 からは見えなくなった。**
-    もう一度試すなら、枝を組んで `image:` を `denpa:feat-bcas` /
-    `denpa-agent:feat-bcas` に戻す
-- 枝のイメージを組むとき (kuni1 には `bun` が無いが、組み込みは docker の中で完結する):
-  - `cd /home/kuni/.cache/denpa-work && docker build -t denpa:feat-bcas -f Dockerfile .`
-  - `cd /home/kuni/.cache/denpa-work && docker build -t denpa-agent:feat-bcas -f agent/Dockerfile .`
-  - 配備は `docker compose up -d --force-recreate denpa tuner-agent`。
-    `docker compose restart` ではイメージが差し替わらない。
 - **マイグレーションの番号は枝をまたぐと食い違う。** `feat/bcas-integrated` は
-  0032_contract-notifications・0033_contract-source・0034_contract-manual-state の 3 本、
-  `pr/bcas-contract-management` は同じ変更を 0033_contract-notifications 1 本にまとめている。
+  `0032_contract-notifications`・`0033_contract-source`・`0034_contract-manual-state` の 3 本、
+  `pr/bcas-contract-management` は同じ変更を `0033_contract-notifications` 1 本にまとめている。
   そのまま起動すると `table contract_notifications already exists` で落ちる。
   **DB を控えてから**、当て記録 (`__drizzle_migrations`) を今の `drizzle/` に合わせる。
-  控えは `/home/kuni/backup/` に 3 つ (すべて `VACUUM INTO` で取った、起動前のもの):
-  - `denpa-20261108-before.db` (止める前)
-  - `denpa-20261108-stopped.db` (止めた後)
-  - `denpa-20261108-before-rebuild.db` (契約の表を作り直す前。**`card_contracts` 132 行が残っているのはこれだけ**)
-  控えから戻すときは denpa を止めてから `denpa_denpa-data` の `denpa.db` に置き換える
-  (WAL の 3 つも消す)。
-- **`card_contracts` と `contract_notifications` は 2026-11-08 に作り直した。**
-  前の枝のマイグレーションが `decoded_at` の引用符を落として作ったため、表の定義が
-  新しい枝と 1 か所だけ食い違っていた (動作は同じ)。利用者の判断で中身ごと捨てて、
-  新しい枝の定義で作り直した。**復号テストの記録 (67 行) は失われた。**
-  作り直した後、起動した契約スキャンが EIT から埋め直す (7 局が `eit_ca` で契約中、
-  残りは `unknown`)。`programs.contract_verification` は残してあるので、
-  0xCB を持つ局は次のスキャンで戻る。0xCB を持たない局は、復号テストをやり直すまで
-  「未確認」のまま。
-- **DB には枝だけで使うものが残っている** (`contract_notifications` の表と、
+- **`card_contracts` と `contract_notifications` は作り直した。** 前の枝の
+  マイグレーションが `decoded_at` の引用符を落として作ったため、表の定義が
+  新しい枝と 1 か所だけ食い違っていた (動作は同じ)。作り直したことで、
+  復号テストの記録 (67 行) は失われた。作り直した後に起動した契約スキャンが
+  EIT から埋め直す (7 局が `eit_ca` で契約中、残りは `unknown`)。
+  `programs.contract_verification` は残るので、0xCB を持つ局は次のスキャンで戻る。
+  0xCB を持たない局は、復号テストをやり直すまで「未確認」のまま。
+- **DB には枝だけで使うものが残る** (`contract_notifications` の表と、
   `card_contracts.source`・`manual_state` の列)。公開リリースのイメージは使わないので
   害は無いが、将来のリリースが同じ名前の表・列を足すと、当て記録の時刻が
   こちらのほうが新しいため、そのマイグレーションが飛ばされることがある。
   そのときは当て記録を確かめる。
-- 生 EIT の一時計測スクリプトは `/tmp/opencode/eit-probe.ts` に置いた。
-  リポジトリには入れていない。再計測するなら同じ `EpgReader` を使う。
-- `docker compose run --rm unit bun run check` と `… bun run lint`、`… unit` (単体テスト) は
-  compose の `unit` で通る (`3194 pass / 0 fail`、check は 0 errors、lint も通る)。
+- 生 EIT を数える一時スクリプトはリポジトリに入れていない。再計測するなら
+  同じ `EpgReader` を使う。
 
 ## 10. 関連ファイル
 
-- `docs/bcas-contracts.md`: 仕様・実測・複数 PR 方針の本体
+- [bcas-contracts.md](bcas-contracts.md): 仕様・実測・複数 PR 方針の本体
 - `src/lib/server/contracts.ts`: `checkContracts`, `testDecode`,
-  `testDecodeUnconfirmed`, `recordDecode`, 7 日後判定、`ContractChecker`,
+  `testDecodeUnconfirmed`, `recordDecode`, 7 日後判定, `ContractChecker`,
   `getContractProvider`, `paidAllowed`
 - `src/lib/server/scheduler.ts`: `scanContracts`, 12 時間ごとの契約スキャン,
   `contract.expired`・`contract.expiring` 通知
