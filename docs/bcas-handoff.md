@@ -1,6 +1,6 @@
 # B-CAS 契約確認の引き継ぎ書
 
-更新: 2026-11-07
+更新: 2026-11-08
 
 この文書は、B-CAS の契約確認・復号テスト・期限切れ通知の作業を別の AI や
 開発者へ引き継ぐためのもの。仕様・実測・複数 PR の方針は
@@ -23,15 +23,20 @@
 ## 1. リポジトリと枝
 
 - 作業場所: `/home/kuni/dev/denpa`
-- 枝: `feat/bcas-keep-emm-expiry`
+- 配備する枝: `pr/bcas-contract-management` (2026-11-08 から `origin/main` を取り込んで配備)
 - remote:
   - `origin` = `danything/denpa` (push は 403 で不可)
   - `myfork` = `haruki0420/denpa` (push はここ)
-- 上流 `origin/main` の先頭: `8c6dca1e`
-- 上流 main には EMM・期限切れ通知・バッジ・`contract_warning` は入っていない。
-  それらはこの feature 枝にある。
-- 配備に使うのは `feat/bcas-keep-emm-expiry` だけ。
-  `feat/bcas-batch-decode` は別途配備しない (一括復号はこの枝に cherry-pick 済み)。
+- 上流 `origin/main` の先頭: `40867a74` (v2.35.0)。`9a974398` でこの枝に取り込んだ。
+  **2026-11-08 の時点で、この枝は上流より遅れていない。**
+- 上流 main には EMM・期限切れ通知・バッジ・事業者単位の管理・手動設定は入っていない。
+  それらは `pr/bcas-contract-management` にある。
+- 旧配備枝の `feat/bcas-keep-emm-expiry`・`feat/bcas-integrated` は上流から 90 件以上
+  遅れていて、上流との衝突も 20〜30 ファイルある。**もう配備には使わない。**
+  `feat/bcas-batch-decode` も別途配備しない。
+- 枝を上げるときは `git fetch origin && git merge origin/main` で取り込み、
+  `myfork` へ push してから、kuni1 の worktree (`/home/kuni/.cache/denpa-work`) で
+  `git checkout pr/bcas-contract-management && git pull` する。
 
 主なコミット:
 
@@ -256,33 +261,49 @@
 
 - `ssh kuni1`
 - compose: `/home/kuni/denpa/compose.yml` と `compose.override.yml`
-- worktree: `/home/kuni/.cache/denpa-work`
-- DB: `/data/denpa.db` (コンテナ内)
-- イメージ:
-  - app: `denpa:feat-bcas` (`75ae348c7bfa` を最後に配備)
-  - agent: `denpa-agent:feat-bcas` (`83d72baed776`、ファーム v2)
-- `DENPA_VERSION: v2.31.1`
-- `docker compose restart` ではイメージが差し替わらない。
-  必ず `--force-recreate` を使う。
+- worktree: `/home/kuni/.cache/denpa-work` (枝は `pr/bcas-contract-management`)
+- DB: `/data/denpa.db` (コンテナ内、実体は `denpa_denpa-data` ボリューム)
+- イメージ (2026-11-08 11:20 に配備):
+  - app: `denpa:feat-bcas` (`d98c3578d4ee`。`9a974398` から組んだ)
+  - agent: `denpa-agent:feat-bcas` (`629df00334be`)
+- 組み方 (kuni1 には `bun` が無いが、イメージの組み込みは docker の中で完結する):
+  - `cd /home/kuni/.cache/denpa-work && docker build -t denpa:feat-bcas -f Dockerfile .`
+  - `cd /home/kuni/.cache/denpa-work && docker build -t denpa-agent:feat-bcas -f agent/Dockerfile .`
+- 配備は `cd /home/kuni/denpa && docker compose up -d --force-recreate denpa tuner-agent`。
+  `docker compose restart` ではイメージが差し替わらない。
+- `DENPA_VERSION: v2.31.1` (compose.override.yml。この枝の中身は v2.35.0 相当)
+- **マイグレーションの番号は枝をまたぐと食い違う。** `feat/bcas-integrated` は
+  0032_contract-notifications・0033_contract-source・0034_contract-manual-state の 3 本、
+  `pr/bcas-contract-management` は同じ変更を 0033_contract-notifications 1 本にまとめている。
+  そのまま起動すると `table contract_notifications already exists` で落ちる。
+  **DB を控えてから**、当て記録 (`__drizzle_migrations`) を今の `drizzle/` に合わせる。
+  控えは `/home/kuni/backup/denpa-20261108-before.db` と `-stopped.db` (どちらも
+  起動前のもの。`VACUUM INTO` で取った)。控えから戻すときは denpa を止めてから
+  `denpa_denpa-data` の `denpa.db` に置き換える (WAL の 3 つも消す)。
 - 生 EIT の一時計測スクリプトは `/tmp/opencode/eit-probe.ts` に置いた。
   リポジトリには入れていない。再計測するなら同じ `EpgReader` を使う。
+- `docker compose run --rm unit bun run check` と `… bun run lint`、`… unit` (単体テスト) は
+  compose の `unit` で通る (`3194 pass / 0 fail`、check は 0 errors、lint も通る)。
 
 ## 10. 関連ファイル
 
 - `docs/bcas-contracts.md`: 仕様・実測・複数 PR 方針の本体
 - `src/lib/server/contracts.ts`: `checkContracts`, `testDecode`,
-  `testDecodeUnconfirmed`, `recordDecode`, 7 日後判定
+  `testDecodeUnconfirmed`, `recordDecode`, 7 日後判定、`ContractChecker`,
+  `getContractProvider`, `paidAllowed`
 - `src/lib/server/scheduler.ts`: `scanContracts`, 12 時間ごとの契約スキャン,
-  `contract.expired` 通知
+  `contract.expired`・`contract.expiring` 通知
 - `src/lib/server/webhook.ts`: `notifyContractExpired`, `contract.expired`
 - `packages/arib/src/eit.ts`: 0xCB の解析 (EIT[p/f] と EIT[schedule] の両方)
 - `src/lib/server/epg.ts`: `contract_verification` の保存と `COALESCE` 更新
-- `src/lib/server/schema.ts`: `card_contracts` の `state`, `valid_until`,
-  `decode_ok`, `decoded_at`
+- `src/lib/server/schema.ts`: `card_contracts` の `state`, `source`,
+  `manual_state`, `valid_until`, `decode_ok`, `decoded_at` と
+  `contract_notifications` テーブル
 - `src/routes/settings/reception/ContractDialog.svelte`: 契約確認・EMM・
-  一括復号の UI
+  一括復号・事業者ごとの表示・手動設定の UI
 - `src/routes/settings/reception/tuners.server.ts`: `checkContracts`,
-  `testDecode`, `testDecodeAll`, `receiveEmm` の actions
+  `testDecode`, `testDecodeAll`, `receiveEmm`, `setManualContract`,
+  `saveContractSettings` の actions
 - `src/lib/server/contracts.test.ts`: 一括復号・契約判定のテスト
 - `src/lib/server/scheduler-contracts.test.ts`: 期限切れスキャンと通知のテスト
 - `src/lib/server/webhook.test.ts`: `contract.expired` のテスト

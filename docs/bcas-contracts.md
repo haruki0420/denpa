@@ -36,8 +36,8 @@
 | 第 4 弾 | EMM を受信してカードを自動更新                                                              | 実装済み (feature 枝) |
 
 上流 `main` に入った #2231 は第 1 弾が中心。EMM、期限切れ通知、バッジ、
-`contract_warning` は feature 枝 `feat/bcas-keep-emm-expiry` に残している。
-kuni1 で動かしているのはこの feature 枝。
+事業者単位の管理、手動設定は `pr/bcas-contract-management` に残している。
+kuni1 で動かしているのはこの枝 (2026-11-08 から上流 v2.35.0 を取り込んだもの)。
 
 ## 3. 現在の仕様
 
