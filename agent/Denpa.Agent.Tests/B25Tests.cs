@@ -125,14 +125,17 @@ public class B25Tests
 
         /// <summary>
         /// 中身のパケット。<paramref name="adaptation"/> バイトのアダプテーションを前に置き、
-        /// 残りを <paramref name="even"/> の鍵で掛ける (null なら掛けない)
+        /// 残りを <paramref name="even"/> の鍵で掛ける (null なら掛けない)。
+        /// **PES の始まり (payload_unit_start と `00 00 01`) を付ける** — 復号が合っているかを
+        /// この 3 バイトで確かめる (B25.cs の `Unscramble`)。<paramref name="pusi"/> を false にすると
+        /// PES の途中のパケットになる
         /// </summary>
-        public Ts Payload(int pid, byte? generation, bool even = true, int adaptation = -1, int seed = 0)
+        public Ts Payload(int pid, byte? generation, bool even = true, int adaptation = -1, int seed = 0, int? control = null, bool pusi = true)
         {
             var packet = new byte[188];
             new Random(seed + Wire.Count).NextBytes(packet);
             packet[0] = 0x47;
-            packet[1] = (byte)(pid >> 8);
+            packet[1] = (byte)((pusi ? 0x40 : 0) | (pid >> 8));
             packet[2] = (byte)pid;
             var start = 4;
             if (adaptation >= 0)
@@ -141,6 +144,12 @@ public class B25Tests
                 start = 5 + adaptation;
             }
             packet[3] = (byte)((adaptation >= 0 ? 0x20 : 0) | (start < 188 ? 0x10 : 0) | Counter(pid));
+            if (pusi && start + 3 <= 188)
+            {
+                packet[start] = 0;
+                packet[start + 1] = 0;
+                packet[start + 2] = 1;
+            }
             Plain.AddRange(packet);
 
             if (generation is { } g)
@@ -148,7 +157,7 @@ public class B25Tests
                 var cipher = new Multi2(SystemKey, InitCbc);
                 cipher.SetKeys(Key(g, even: false), Key(g, even: true));
                 if (start < 188) cipher.Encrypt(even, packet.AsSpan(start));
-                packet[3] |= (byte)(even ? 0x80 : 0xC0);
+                packet[3] |= (byte)((control ?? (even ? 2 : 3)) << 6);
             }
             Wire.AddRange(packet);
             return this;
@@ -242,6 +251,87 @@ public class B25Tests
         await Assert.That(descrambler.Decoded).IsEqualTo(50);
         await Assert.That(descrambler.Undecodable).IsEqualTo(0);
         await Assert.That(descrambler.LastError).IsNull();
+    }
+
+    /// <summary>
+    /// **制御ビットが 0b01 (規格では使わない) でも、合うほうの鍵で復号する。** 既定の「0b01 は odd」で
+    /// 合わなければ even を試す。固定の対応のままだと、掛けた印だけ下ろして中身が化ける
+    /// </summary>
+    [Test]
+    public async Task 制御ビットが0b01でも合うほうの鍵で復号する()
+    {
+        var ts = Channel().Ecm(EcmPid, 1)
+            .Payload(VideoPid, 1, even: true, control: 1)
+            .Payload(VideoPid, 1, even: true, control: 1);
+        var descrambler = new Descrambler(new Cards());
+
+        var output = Run(descrambler, ts.Wire.ToArray());
+
+        await Assert.That(Diff(output, Expected(ts))).IsEqualTo(-1);
+        await Assert.That(descrambler.Undecodable).IsEqualTo(0);
+    }
+
+    /// <summary>
+    /// **途中で奇数/偶数の鍵が入れ替わっても追いつく。** ECM が変わって鍵が入れ替わると、制御ビットと
+    /// 鍵の対応が前の ECM のままでは合わない。PES の始まりで確かめて、合うほうに入れ替える
+    /// </summary>
+    [Test]
+    public async Task 途中で奇数と偶数の鍵が入れ替わっても追いつく()
+    {
+        var ts = Channel()
+            .Ecm(EcmPid, 1)
+            .Payload(VideoPid, 1, even: true)
+            .Ecm(EcmPid, 2)
+            // 新しい ECM では、制御ビット 0b10 でも odd の鍵で掛かっている
+            .Payload(VideoPid, 2, even: false, control: 2);
+        var descrambler = new Descrambler(new Cards());
+
+        var output = Run(descrambler, ts.Wire.ToArray());
+
+        await Assert.That(Diff(output, Expected(ts))).IsEqualTo(-1);
+        await Assert.That(descrambler.Undecodable).IsEqualTo(0);
+    }
+
+    /// <summary>
+    /// **ECM が変わっても、前に覚えた偶奇の対応を残す。** ECM が変わるたびに既定へ戻すと、
+    /// 変わった直後の PES の途中（PES の始まりではないパケット）が、次の PES の始まりまで化ける
+    /// </summary>
+    [Test]
+    public async Task ECMが変わっても覚えた偶奇の対応を残す()
+    {
+        var ts = Channel()
+            .Ecm(EcmPid, 1)
+            // 制御ビット 0b10 でも odd の鍵で掛かっている (対応を odd に覚える)
+            .Payload(VideoPid, 1, even: false, control: 2)
+            .Ecm(EcmPid, 2)
+            // ECM が変わった直後の PES の途中。PES の始まりではないので、覚えた対応で復号する
+            .Payload(VideoPid, 2, even: false, control: 2, pusi: false);
+        var descrambler = new Descrambler(new Cards());
+
+        var output = Run(descrambler, ts.Wire.ToArray());
+
+        await Assert.That(Diff(output, Expected(ts))).IsEqualTo(-1);
+        await Assert.That(descrambler.Undecodable).IsEqualTo(0);
+    }
+
+    /// <summary>
+    /// **鍵が合わなければ、掛けた印を下ろさずに未復号として数える。** いままでは、間違った鍵で復号しても
+    /// 「復号できた」として印を下ろしていたので、中身が化けたまま流れ、契約の復号テストも通っていた
+    /// </summary>
+    [Test]
+    public async Task 鍵が合わなければ掛けた印を下ろさず未復号に数える()
+    {
+        // カードは世代 9 の鍵を返すが、パケットは世代 1 で掛かっている
+        var ts = Channel().Ecm(EcmPid, 9).Payload(VideoPid, 1, even: true);
+        var descrambler = new Descrambler(new Cards());
+
+        var output = Run(descrambler, ts.Wire.ToArray());
+
+        await Assert.That(descrambler.Undecodable).IsEqualTo(1);
+        await Assert.That(descrambler.Decoded).IsEqualTo(0);
+        // 掛けた印 (0b10) は下ろさない
+        var at = output.Length - 188;
+        await Assert.That(output[at + 3] >> 6).IsEqualTo(2);
     }
 
     /// <summary>
