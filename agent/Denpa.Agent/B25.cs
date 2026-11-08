@@ -317,7 +317,9 @@ public sealed class Descrambler(IKeySource source, Stopwatch? clock = null, Func
         {
             if ((packet[1] & 0x40) != 0)
             {
-                // 新しい PES の始まり。先に検証して対応を更新し、この PES が復号できるかを決める (数えない)
+                // 新しい PES の始まり。先に検証して対応を更新し、この PES が復号できるかを決める (数えない)。
+                // **確かめられなかったとき (鍵が無い・中身が 3 バイト未満) は復号できるものとして扱う** —
+                // 続きは到着時の鍵で復号するので、後から来た鍵で化けることはない
                 Span<byte> probe = stackalloc byte[PacketSize];
                 packet.CopyTo(probe);
                 _pesGarbled[pid] = Unscramble(probe, routed, usable: true, count: false, keys: routed.Keys) == false;
@@ -514,7 +516,7 @@ public sealed class Descrambler(IKeySource source, Stopwatch? clock = null, Func
         _earlyPmts.Clear();
         /*
          * **先に PES の始まりを確かめる。** 復号は後ろから回すので、始まりを確かめた結果
-         * (`_garbled`) を先に決めておかないと、合わなかった PES の残りを化けたまま
+         * (`_pesGarbled`) を先に決めておかないと、合わなかった PES の残りを化けたまま
          * 「復号できた」として流してしまう (Take の probe と同じことを、溜めたぶんにもする)
          */
         var garbled = new bool[_held];
@@ -530,7 +532,7 @@ public sealed class Descrambler(IKeySource source, Stopwatch? clock = null, Func
                 packet.CopyTo(probe);
                 _pesGarbled[pid] = Unscramble(probe, routed, usable: true, count: false, keys: routed.Keys) == false;
             }
-            garbled[at] = _pesGarbled[pid];
+            garbled[at] = _pes.Contains(pid) && _pesGarbled[pid];
         }
         for (var at = _held - 1; at >= 0; at--)
         {
@@ -910,6 +912,9 @@ public sealed class Descrambler(IKeySource source, Stopwatch? clock = null, Func
                 {
                     _caSystemId = _init.CaSystemId;
                     ecm.Last = null;
+                    // 方式が変わったら、前の方式で貰った鍵は使わない
+                    ecm.Keys = null;
+                    ecm.CipherKeys = null;
                     FindEmm();
                     Rebuild();
                     return;
