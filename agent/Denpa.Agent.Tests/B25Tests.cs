@@ -132,7 +132,7 @@ public class B25Tests
         /// この 3 バイトで確かめる (B25.cs の `Unscramble`)。<paramref name="pusi"/> を false にすると
         /// PES の途中のパケットになる
         /// </summary>
-        public Ts Payload(int pid, byte? generation, bool even = true, int adaptation = -1, int seed = 0, int? control = null, bool pusi = true)
+        public Ts Payload(int pid, byte? generation, bool even = true, int adaptation = -1, int seed = 0, int? control = null, bool pusi = true, bool pes = true)
         {
             var packet = new byte[188];
             new Random(seed + Wire.Count).NextBytes(packet);
@@ -146,7 +146,7 @@ public class B25Tests
                 start = 5 + adaptation;
             }
             packet[3] = (byte)((adaptation >= 0 ? 0x20 : 0) | (start < 188 ? 0x10 : 0) | Counter(pid));
-            if (pusi && start + 4 <= 188)
+            if (pusi && pes && start + 4 <= 188)
             {
                 // 本物の PES の始まりと同じ 4 バイト (00 00 01 + ストリーム ID)。4 バイト目まで見ないと、
                 // 00 00 01 から始まるただのデータを PES の始まりと読み違える
@@ -338,6 +338,118 @@ public class B25Tests
         // 掛けた印 (0b10) は下ろさない
         var at = output.Length - 188;
         await Assert.That(output[at + 3] >> 6).IsEqualTo(2);
+    }
+
+    /// <summary>
+    /// **制御ビットが同じまま ECM だけが変わっても、前の PES は前の鍵で復号する。** 新しい鍵で復号すると、
+    /// PES の始まりでないパケットは確かめようがないので、化けたまま「復号できた」として流れてしまう
+    /// </summary>
+    [Test]
+    public async Task 制御ビットが同じままECMが変わっても前のPESは前の鍵で復号する()
+    {
+        var ts = Channel()
+            .Ecm(EcmPid, 1)
+            .Payload(VideoPid, 1, even: true, control: 2)
+            .Payload(VideoPid, 1, even: true, control: 2, pusi: false)
+            .Ecm(EcmPid, 2)
+            .Payload(VideoPid, 2, even: true, control: 2);
+        var descrambler = new Descrambler(new Cards());
+
+        var output = Run(descrambler, ts.Wire.ToArray());
+
+        await Assert.That(Diff(output, Expected(ts))).IsEqualTo(-1);
+        await Assert.That(descrambler.Undecodable).IsEqualTo(0);
+    }
+
+    /// <summary>
+    /// **PES の始まりがどちらの鍵でも合わなければ、その PES は掛かったまま流す。** 印だけ下ろして
+    /// 「復号できた」と数えると、化けたものがそのまま出る。次の PES からは復号できる
+    /// </summary>
+    [Test]
+    public async Task PESの始まりが合わなければそのPESは掛かったまま流す()
+    {
+        var ts = Channel()
+            .Ecm(EcmPid, 1)
+            // PES の始まりの印はあるが、中身は PES の頭になっていない (化けたときと同じ)
+            .Payload(VideoPid, 1, even: true, control: 2, pes: false)
+            .Payload(VideoPid, 1, even: true, control: 2, pusi: false)
+            .Payload(VideoPid, 1, even: true, control: 2);
+        var descrambler = new Descrambler(new Cards());
+
+        var output = Run(descrambler, ts.Wire.ToArray());
+
+        await Assert.That(descrambler.Undecodable).IsEqualTo(2);
+        await Assert.That(descrambler.Decoded).IsEqualTo(1);
+        // 壊れた PES の 2 つは掛かったまま (流した姿のまま)、最後の PES だけ復号する
+        var wire = ts.Wire.ToArray();
+        var run = wire.Length - 188;
+        await Assert.That(Diff(output[..run], wire[..run])).IsEqualTo(-1);
+        await Assert.That(Diff(output[run..], Expected(ts)[run..])).IsEqualTo(-1);
+    }
+
+    /// <summary>映像と音声の PES が交互に来ても、来た順のまま復号して流す (溜めは 1 本で順序を保つ)</summary>
+    [Test]
+    public async Task 映像と音声のPESが交互に来ても順序を崩さない()
+    {
+        var ts = Channel().Ecm(EcmPid, 1)
+            .Payload(VideoPid, 1, even: true)
+            .Payload(AudioPid, 1, even: true)
+            .Payload(VideoPid, 1, even: true, pusi: false)
+            .Payload(AudioPid, 1, even: true, pusi: false)
+            .Payload(VideoPid, 1, even: true)
+            .Payload(AudioPid, 1, even: true);
+        var descrambler = new Descrambler(new Cards());
+
+        var output = Run(descrambler, ts.Wire.ToArray());
+
+        await Assert.That(Diff(output, Expected(ts))).IsEqualTo(-1);
+        await Assert.That(descrambler.Undecodable).IsEqualTo(0);
+    }
+
+    /// <summary>**終わらない PES でも溜め込み続けない。** 上限で区切って流し、届いたものは 1 つも落とさない</summary>
+    [Test]
+    public async Task 終わらないPESでも上限で区切って流す()
+    {
+        // 1MB (188 バイト × 5,578) を超える長さの PES。途中で区切って流す
+        var ts = Channel().Ecm(EcmPid, 1).Payload(VideoPid, 1, even: true);
+        for (var i = 0; i < 6000; i++) ts.Payload(VideoPid, 1, even: true, pusi: false);
+        var descrambler = new Descrambler(new Cards());
+
+        var output = Run(descrambler, ts.Wire.ToArray());
+
+        await Assert.That(output.Length).IsEqualTo(ts.Wire.Count);
+        await Assert.That(Diff(output, Expected(ts))).IsEqualTo(-1);
+        await Assert.That(descrambler.Undecodable).IsEqualTo(0);
+    }
+
+    /// <summary>
+    /// **鍵の要る利用者がいなくなったら、溜めていた PES を落とさず掛かったまま流す。**
+    /// 溜めたまま捨てると、その PES がまるごと消える
+    /// </summary>
+    [Test]
+    public async Task 鍵が要らなくなったら溜めていたPESを掛かったまま流す()
+    {
+        var wanted = true;
+        var ts = Channel().Ecm(EcmPid, 1)
+            // 1 つ目は溜めから出て復号される。2 つ目と 3 つ目は PES の溜めに入ったまま
+            .Payload(VideoPid, 1, even: true)
+            .Payload(VideoPid, 1, even: true)
+            .Payload(VideoPid, 1, even: true, pusi: false);
+        var descrambler = new Descrambler(new Cards(), keysWanted: () => wanted);
+        var output = new ArrayBufferWriter<byte>();
+
+        descrambler.Decode(ts.Wire.ToArray(), output);
+        wanted = false;
+        // 次の塊を受けたときに StopKeys が走る
+        descrambler.Decode([], output);
+        descrambler.Flush(output);
+
+        // 溜めていた 2 つは落とさず、掛かったまま流す
+        var released = 4 * 188;
+        byte[] expected = [.. Expected(ts)[..released], .. ts.Wire.ToArray()[released..]];
+        await Assert.That(output.WrittenCount).IsEqualTo(ts.Wire.Count);
+        await Assert.That(Diff(output.WrittenSpan.ToArray(), expected)).IsEqualTo(-1);
+        await Assert.That(descrambler.CardUse()).IsEqualTo("カード 使わない");
     }
 
     /// <summary>
