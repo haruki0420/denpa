@@ -108,8 +108,11 @@ public sealed class Descrambler(IKeySource source, Stopwatch? clock = null, Func
     private bool[] _bufferGarbled = new bool[64];
     /// <summary>PES を溜める上限 (バイト)。終わらない PES で溜め込み続けない</summary>
     private const int BufferLimit = 1024 * 1024;
-    /// <summary>ES の PID → いまの PES の始まりがどの鍵でも合わなかった (次の PES の始まりまで、その PID は復号せずに流す)</summary>
-    private readonly bool[] _garbled = new bool[8192];
+    /// <summary>
+    /// ES の PID → **いま溜めている PES の始まりがどの鍵でも合わなかった。** 次の PES の始まりまで、
+    /// その PID は復号せずに流す。PES の始まりを確かめたときだけ書き換える (続きのパケットでは触らない)
+    /// </summary>
+    private readonly bool[] _pesGarbled = new bool[8192];
     /// <summary>
     /// ECM が 1 本だけなら、PMT に載っていない PID もそれで復号する。**PAT の PMT がみな来てから**にして、
     /// 来ていない番組の ES を別の ECM の鍵で復号しない
@@ -314,10 +317,10 @@ public sealed class Descrambler(IKeySource source, Stopwatch? clock = null, Func
         {
             if ((packet[1] & 0x40) != 0)
             {
-                // 新しい PES の始まり。先に検証して対応を更新する (数えない)
+                // 新しい PES の始まり。先に検証して対応を更新し、この PES が復号できるかを決める (数えない)
                 Span<byte> probe = stackalloc byte[PacketSize];
                 packet.CopyTo(probe);
-                Unscramble(probe, routed, usable: true, count: false, keys: routed.Keys);
+                _pesGarbled[pid] = Unscramble(probe, routed, usable: true, count: false, keys: routed.Keys) == false;
                 // 溜めていたぶん (前の PES と、その間のパケット) を、来た順のまま復号して流す
                 FlushBuffer(output);
             }
@@ -327,8 +330,14 @@ public sealed class Descrambler(IKeySource source, Stopwatch? clock = null, Func
             return;
         }
 
-        // PES を溜めている間の PSI・ECM・ほかの PID は、その PES のあとに回す (順序を崩さない)
-        if (_bufferLength > 0 && control == 0) { Buffer(packet, routed); return; }
+        // PES を溜めている間の PSI・ECM・ほかの PID は、その PES のあとに回す (順序を崩さない)。
+        // **こちらも上限で区切る** (PES が終わらないまま PSI・ECM だけが来続けても溜め込み続けない)
+        if (_bufferLength > 0 && control == 0)
+        {
+            if (_bufferLength + PacketSize > BufferLimit) FlushBuffer(output);
+            Buffer(packet, routed);
+            return;
+        }
         // 溜めている PES が終わらないうちに、その PES でないパケットが来た (PMT で ES が外れた等)。
         // 溜めたぶんを流してから、このパケットをそのまま流す (バッファが止まったままにならない)
         if (_bufferLength > 0) FlushBuffer(output);
@@ -367,7 +376,7 @@ public sealed class Descrambler(IKeySource source, Stopwatch? clock = null, Func
         var index = _bufferLength / PacketSize;
         _bufferEcms[index] = ecm;
         _bufferKeys[index] = ecm?.Keys;
-        _bufferGarbled[index] = ecm is not null && _garbled[((packet[1] & 0x1F) << 8) | packet[2]];
+        _bufferGarbled[index] = ecm is not null && _pesGarbled[((packet[1] & 0x1F) << 8) | packet[2]];
         _bufferLength += PacketSize;
     }
 
@@ -385,74 +394,81 @@ public sealed class Descrambler(IKeySource source, Stopwatch? clock = null, Func
     /// **到着時に鍵が無かったパケットは、あとから来た鍵で復号しない** (別の世代の鍵で化けたものを「復号できた」と数えない)
     /// </para>
     /// </summary>
-    private void Unscramble(Span<byte> packet, Ecm? ecm, bool usable, bool count = true, EcmAnswer? keys = null, bool garbled = false)
+    /// <returns>
+    /// PES の始まりを確かめたなら、合ったかどうか。確かめていない (PES の始まりでない・中身が 3 バイト未満・
+    /// アダプテーションだけ・契約が無い) なら null
+    /// </returns>
+    private bool? Unscramble(Span<byte> packet, Ecm? ecm, bool usable, bool count = true, EcmAnswer? keys = null, bool garbled = false)
     {
         // 鍵の要らない利用者だけなら触らない (掛かったままにも数えない)
-        if (!_keys || (packet[1] & 0x80) != 0 || packet[3] >> 6 == 0) return;
+        if (!_keys || (packet[1] & 0x80) != 0 || packet[3] >> 6 == 0) return null;
         var start = PayloadStart(packet);
         if (start == PacketSize)
         {
             // 中身の無いパケット (アダプテーションだけ) は、印を下ろすだけで済む
             packet[3] &= 0x3F;
             if (count) _decoded++;
-            return;
+            return null;
         }
         // 契約が無い (同じ TS に入っている有料局)。復号の失敗には数えずにそのまま流す
-        if (ecm is { Unentitled: true }) return;
+        if (ecm is { Unentitled: true }) return null;
         var control = packet[3] >> 6;
         var pid = ((packet[1] & 0x1F) << 8) | packet[2];
         if (start < 0 || !usable || ecm?.Cipher is not { HasKeys: true } cipher || keys is not { } key)
         {
             if (count) _undecodable++;
-            return;
+            return null;
         }
         if (garbled)
         {
             // この PES の始まりが合わなかった。残りも掛かったまま流す
             if (count) _undecodable++;
-            return;
+            return null;
         }
         // 鍵は、溜めたときに覚えていたものを使う (ECM が変わっても前の PES を壊さない)
-        if (!ReferenceEquals(key.Odd, ecm.CipherKeys?.Odd))
+        if (!ReferenceEquals(key.Odd, ecm.CipherKeys?.Odd) || !ReferenceEquals(key.Even, ecm.CipherKeys?.Even))
         {
             cipher.SetKeys(key.Odd, key.Even);
             ecm.CipherKeys = key;
         }
         var even = ecm.Even(control);
-        var check = (packet[1] & 0x40) != 0 && _pes.Contains(pid) && start + 4 <= PacketSize;
+        var check = (packet[1] & 0x40) != 0 && _pes.Contains(pid) && start + 3 <= PacketSize;
         if (!check)
         {
             cipher.Decrypt(even, packet[start..]);
+            packet[3] &= 0x3F;
+            if (count) _decoded++;
+            return null;
         }
-        else
+        // 合わなかったときに戻せるよう、掛ける前の中身を取っておく
+        Span<byte> original = stackalloc byte[PacketSize];
+        var length = PacketSize - start;
+        packet[start..].CopyTo(original[..length]);
+        cipher.Decrypt(even, packet[start..]);
+        if (!LooksLikePes(packet, start))
         {
-            // 合わなかったときに戻せるよう、掛ける前の中身を取っておく
-            Span<byte> original = stackalloc byte[PacketSize];
-            var length = PacketSize - start;
-            packet[start..].CopyTo(original[..length]);
-            cipher.Decrypt(even, packet[start..]);
+            original[..length].CopyTo(packet[start..]);
+            cipher.Decrypt(!even, packet[start..]);
             if (!LooksLikePes(packet, start))
             {
                 original[..length].CopyTo(packet[start..]);
-                cipher.Decrypt(!even, packet[start..]);
-                if (!LooksLikePes(packet, start))
-                {
-                    original[..length].CopyTo(packet[start..]);
-                    _garbled[pid] = true;
-                    if (count) _undecodable++;
-                    return;
-                }
-                ecm.Flip(control);
+                if (count) _undecodable++;
+                return false;
             }
+            ecm.Flip(control);
         }
-        _garbled[pid] = false;
         packet[3] &= 0x3F;
         if (count) _decoded++;
+        return true;
     }
 
-    /// <summary>復号した中身が PES の始まり (`00 00 01` + ストリーム ID) か</summary>
+    /// <summary>
+    /// 復号した中身が PES の始まり (`00 00 01` + ストリーム ID) か。**4 バイト目が無ければ 3 バイトで見る**
+    /// (アダプテーションで中身が 3 バイトしかない PES の始まりがある)
+    /// </summary>
     private static bool LooksLikePes(ReadOnlySpan<byte> packet, int start) =>
-        packet[start] == 0 && packet[start + 1] == 0 && packet[start + 2] == 1 && packet[start + 3] is >= 0xBC and <= 0xEF;
+        packet[start] == 0 && packet[start + 1] == 0 && packet[start + 2] == 1
+        && (start + 4 > PacketSize || packet[start + 3] is >= 0xBC and <= 0xEF);
 
     /// <summary>
     /// 溜めるのをやめてよいか。**PAT と、その PMT がみな来て、どの ECM も 1 回は答えを貰った** (libaribb25 と同じ)
@@ -496,6 +512,26 @@ public sealed class Descrambler(IKeySource source, Stopwatch? clock = null, Func
         _earlyEcms.Clear();
         _earlyPmtSections.Clear();
         _earlyPmts.Clear();
+        /*
+         * **先に PES の始まりを確かめる。** 復号は後ろから回すので、始まりを確かめた結果
+         * (`_garbled`) を先に決めておかないと、合わなかった PES の残りを化けたまま
+         * 「復号できた」として流してしまう (Take の probe と同じことを、溜めたぶんにもする)
+         */
+        var garbled = new bool[_held];
+        Span<byte> probe = stackalloc byte[PacketSize];
+        for (var at = 0; at < _held; at++)
+        {
+            var packet = _hold.AsSpan(at * PacketSize, PacketSize);
+            if ((packet[1] & 0x80) != 0 || packet[3] >> 6 == 0) continue;
+            var pid = ((packet[1] & 0x1F) << 8) | packet[2];
+            if ((packet[1] & 0x40) != 0 && _pes.Contains(pid) && Route(packet) is { } routed)
+            {
+                // 写して復号し、合うかを確かめる (数えない)。結果はこの PID の PES の状態として覚える
+                packet.CopyTo(probe);
+                _pesGarbled[pid] = Unscramble(probe, routed, usable: true, count: false, keys: routed.Keys) == false;
+            }
+            garbled[at] = _pesGarbled[pid];
+        }
         for (var at = _held - 1; at >= 0; at--)
         {
             var packet = _hold.AsSpan(at * PacketSize, PacketSize);
@@ -508,7 +544,7 @@ public sealed class Descrambler(IKeySource source, Stopwatch? clock = null, Func
                 ecm.Parity = control;
                 ecm.Next = at;
             }
-            Unscramble(packet, ecm, ecm is { Seen: >= 0 } && (at > ecm.Seen || ecm.Change > ecm.After), keys: ecm?.Keys);
+            Unscramble(packet, ecm, ecm is { Seen: >= 0 } && (at > ecm.Seen || ecm.Change > ecm.After), keys: ecm?.Keys, garbled: garbled[at]);
         }
     }
 
@@ -538,7 +574,7 @@ public sealed class Descrambler(IKeySource source, Stopwatch? clock = null, Func
          */
         _keys = true;
         _holding = true;
-        Array.Clear(_garbled);
+        Array.Clear(_pesGarbled);
         foreach (var ecm in _ecms.Values) Forget(ecm);
     }
 
@@ -897,6 +933,9 @@ public sealed class Descrambler(IKeySource source, Stopwatch? clock = null, Func
             if (!entitled)
             {
                 ecm.Unentitled = true;
+                // 古い鍵を覚えたままにしない (溜めているパケットに使わせない)
+                ecm.Keys = null;
+                ecm.CipherKeys = null;
                 Report($"カードが鍵を返しません (未契約か、別の方式の局です: 0x{answer.Code:X4})");
                 return;
             }
@@ -910,6 +949,8 @@ public sealed class Descrambler(IKeySource source, Stopwatch? clock = null, Func
         catch (Exception error)
         {
             ecm.RetryAt = _packets + RetryPackets;
+            ecm.Keys = null;
+            ecm.CipherKeys = null;
             Report(error.Message);
         }
     }
@@ -968,7 +1009,7 @@ public sealed class Descrambler(IKeySource source, Stopwatch? clock = null, Func
         /// **制御ビット (0b01/0b10/0b11) ごとに、どちらの鍵で合ったか。** ビットが 1 なら even の鍵。
         /// 既定は 0b10 が even、0b01 と 0b11 が odd (規格どおり)。PES の始まりで確かめて、合わなければ入れ替える
         /// </summary>
-        public int Map = 0b010;
+        public int Map = 0b100;
         /// <summary>いまの鍵 (カードから貰ったもの)。溜めたパケットはこれを覚えておく</summary>
         public EcmAnswer? Keys;
         /// <summary><see cref="Cipher"/> にいま入っている鍵。<see cref="Keys"/> と違うときだけ SetKeys する</summary>

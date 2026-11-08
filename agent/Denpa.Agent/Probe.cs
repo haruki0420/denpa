@@ -380,12 +380,26 @@ public static class Probe
 
             decoded.ResetWrittenCount();
             b25.Decode(buffer.AsSpan(0, read), decoded);
-            // PES を溜めているので、最後の PES は Flush で出る (出さないと 1 PES 欠ける)
+            Count(decoded.WrittenSpan);
+        }
+        /*
+         * **PES を溜めているので、最後の PES は Flush で出る。** 出さないと 1 PES ぶんが集計から抜ける。
+         * 読んだ塊ごとに呼ぶと、188 バイトに満たない尻尾を捨ててしまう (Flush は端数を捨てる) ので、
+         * ここで 1 回だけ呼ぶ
+         */
+        if (b25 is not null)
+        {
+            decoded.ResetWrittenCount();
             b25.Flush(decoded);
-            for (var at = 0; at + 188 <= decoded.WrittenCount; at += 188)
+            Count(decoded.WrittenSpan);
+        }
+
+        void Count(ReadOnlySpan<byte> data)
+        {
+            for (var at = 0; at + 188 <= data.Length; at += 188)
             {
                 outPackets++;
-                var packet = decoded.WrittenSpan[at..];
+                var packet = data[at..];
                 if (Scrambled(packet)) scrambledOut++;
                 else if (decodedAt == 0 && (packet[3] & 0x10) != 0 && scrambledPids.Contains(Pid(packet))) decodedAt = System.Diagnostics.Stopwatch.GetTimestamp();
             }
