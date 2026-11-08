@@ -277,9 +277,20 @@
   `pr/bcas-contract-management` は同じ変更を 0033_contract-notifications 1 本にまとめている。
   そのまま起動すると `table contract_notifications already exists` で落ちる。
   **DB を控えてから**、当て記録 (`__drizzle_migrations`) を今の `drizzle/` に合わせる。
-  控えは `/home/kuni/backup/denpa-20261108-before.db` と `-stopped.db` (どちらも
-  起動前のもの。`VACUUM INTO` で取った)。控えから戻すときは denpa を止めてから
-  `denpa_denpa-data` の `denpa.db` に置き換える (WAL の 3 つも消す)。
+  控えは `/home/kuni/backup/` に 3 つ (すべて `VACUUM INTO` で取った、起動前のもの):
+  - `denpa-20261108-before.db` (止める前)
+  - `denpa-20261108-stopped.db` (止めた後)
+  - `denpa-20261108-before-rebuild.db` (契約の表を作り直す前。**`card_contracts` 132 行が残っているのはこれだけ**)
+  控えから戻すときは denpa を止めてから `denpa_denpa-data` の `denpa.db` に置き換える
+  (WAL の 3 つも消す)。
+- **`card_contracts` と `contract_notifications` は 2026-11-08 に作り直した。**
+  前の枝のマイグレーションが `decoded_at` の引用符を落として作ったため、表の定義が
+  新しい枝と 1 か所だけ食い違っていた (動作は同じ)。利用者の判断で中身ごと捨てて、
+  新しい枝の定義で作り直した。**復号テストの記録 (67 行) は失われた。**
+  作り直した後、起動した契約スキャンが EIT から埋め直す (7 局が `eit_ca` で契約中、
+  残りは `unknown`)。`programs.contract_verification` は残してあるので、
+  0xCB を持つ局は次のスキャンで戻る。0xCB を持たない局は、復号テストをやり直すまで
+  「未確認」のまま。
 - 生 EIT の一時計測スクリプトは `/tmp/opencode/eit-probe.ts` に置いた。
   リポジトリには入れていない。再計測するなら同じ `EpgReader` を使う。
 - `docker compose run --rm unit bun run check` と `… bun run lint`、`… unit` (単体テスト) は
