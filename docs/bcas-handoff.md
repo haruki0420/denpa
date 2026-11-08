@@ -23,12 +23,15 @@
 ## 1. リポジトリと枝
 
 - 作業場所: `/home/kuni/dev/denpa`
-- 配備する枝: `pr/bcas-contract-management` (2026-11-08 から `origin/main` を取り込んで配備)
+- 作業する枝: `pr/bcas-contract-management` (2026-11-08 から `origin/main` を取り込んだ)
+- **kuni1 で動かしているのは、この枝ではなく公開リリースのイメージ**
+  (`ghcr.io/danything/denpa:latest`)。枝を試すときだけ自分で組む (§9)
 - remote:
   - `origin` = `danything/denpa` (push は 403 で不可)
   - `myfork` = `haruki0420/denpa` (push はここ)
-- 上流 `origin/main` の先頭: `40867a74` (v2.35.0)。`9a974398` でこの枝に取り込んだ。
-  **2026-11-08 の時点で、この枝は上流より遅れていない。**
+- 上流 `origin/main` の先頭: `990d093c` (v2.35.0 のあと 4 コミット)。
+  この枝は `40867a74` (v2.35.0) まで取り込んだ `9a974398` の上にある。
+  **未リリースの 4 コミットはまだ取り込んでいない** (EMM の #2339 が枝の実装と衝突する)
 - 上流 main には EMM・期限切れ通知・バッジ・事業者単位の管理・手動設定は入っていない。
   それらは `pr/bcas-contract-management` にある。
 - 旧配備枝の `feat/bcas-keep-emm-expiry`・`feat/bcas-integrated` は上流から 90 件以上
@@ -263,15 +266,23 @@
 - compose: `/home/kuni/denpa/compose.yml` と `compose.override.yml`
 - worktree: `/home/kuni/.cache/denpa-work` (枝は `pr/bcas-contract-management`)
 - DB: `/data/denpa.db` (コンテナ内、実体は `denpa_denpa-data` ボリューム)
-- イメージ (2026-11-08 11:20 に配備):
-  - app: `denpa:feat-bcas` (`d98c3578d4ee`。`9a974398` から組んだ)
-  - agent: `denpa-agent:feat-bcas` (`629df00334be`)
-- 組み方 (kuni1 には `bun` が無いが、イメージの組み込みは docker の中で完結する):
+- **2026-11-08 12:58 から、公開リリースのイメージで動かしている。**
+  - app: `ghcr.io/danything/denpa:latest` (いまは v2.35.0)
+  - agent: `ghcr.io/danything/denpa-agent:latest`
+  - 更新は `cd ~/denpa && docker compose pull && docker compose up -d`。
+    イメージのタグが変われば compose が作り直す (`--force-recreate` は要らない)
+  - `compose.override.yml` はこの 2 つの `image:` を指すだけにしてある。
+    `DENPA_VERSION` は書かない (イメージに焼いてある。`:latest` は v2.35.0 を返す)
+  - 切り替える前の override は `compose.override.yml.bak-20261108-1257`
+  - **枝だけの機能 (事業者別の契約管理・手動設定・一括復号・EMM の手動受信・
+    モーダル表示の設定) は、この切り替えで kuni1 からは見えなくなった。**
+    もう一度試すなら、枝を組んで `image:` を `denpa:feat-bcas` /
+    `denpa-agent:feat-bcas` に戻す
+- 枝のイメージを組むとき (kuni1 には `bun` が無いが、組み込みは docker の中で完結する):
   - `cd /home/kuni/.cache/denpa-work && docker build -t denpa:feat-bcas -f Dockerfile .`
   - `cd /home/kuni/.cache/denpa-work && docker build -t denpa-agent:feat-bcas -f agent/Dockerfile .`
-- 配備は `cd /home/kuni/denpa && docker compose up -d --force-recreate denpa tuner-agent`。
-  `docker compose restart` ではイメージが差し替わらない。
-- `DENPA_VERSION: v2.31.1` (compose.override.yml。この枝の中身は v2.35.0 相当)
+  - 配備は `docker compose up -d --force-recreate denpa tuner-agent`。
+    `docker compose restart` ではイメージが差し替わらない。
 - **マイグレーションの番号は枝をまたぐと食い違う。** `feat/bcas-integrated` は
   0032_contract-notifications・0033_contract-source・0034_contract-manual-state の 3 本、
   `pr/bcas-contract-management` は同じ変更を 0033_contract-notifications 1 本にまとめている。
@@ -291,6 +302,11 @@
   残りは `unknown`)。`programs.contract_verification` は残してあるので、
   0xCB を持つ局は次のスキャンで戻る。0xCB を持たない局は、復号テストをやり直すまで
   「未確認」のまま。
+- **DB には枝だけで使うものが残っている** (`contract_notifications` の表と、
+  `card_contracts.source`・`manual_state` の列)。公開リリースのイメージは使わないので
+  害は無いが、将来のリリースが同じ名前の表・列を足すと、当て記録の時刻が
+  こちらのほうが新しいため、そのマイグレーションが飛ばされることがある。
+  そのときは当て記録を確かめる。
 - 生 EIT の一時計測スクリプトは `/tmp/opencode/eit-probe.ts` に置いた。
   リポジトリには入れていない。再計測するなら同じ `EpgReader` を使う。
 - `docker compose run --rm unit bun run check` と `… bun run lint`、`… unit` (単体テスト) は
