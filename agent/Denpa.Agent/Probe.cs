@@ -380,6 +380,8 @@ public static class Probe
 
             decoded.ResetWrittenCount();
             b25.Decode(buffer.AsSpan(0, read), decoded);
+            // PES を溜めているので、最後の PES は Flush で出る (出さないと 1 PES 欠ける)
+            b25.Flush(decoded);
             for (var at = 0; at + 188 <= decoded.WrittenCount; at += 188)
             {
                 outPackets++;

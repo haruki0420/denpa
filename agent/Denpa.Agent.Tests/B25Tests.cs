@@ -46,19 +46,14 @@ public class B25Tests
             return 0x2100;
         }
 
-        /// <summary>ECM が変わったとき、前の世代の odd を「今の鍵」として返す (本物の ECM は今と次を持つ)</summary>
-        public bool CurrentNext { get; set; }
-
         public EcmAnswer Ecm(ReadOnlySpan<byte> ecm)
         {
             var copy = ecm.ToArray();
             Asked.Add(copy);
             if (Fail(copy) is { } error) throw error;
-            // 本物の ECM は「今の鍵」と「次の鍵」を持つ。世代が変わるたびに、前の世代の今の鍵と、
-            // その世代の次の鍵を返す (前の世代の鍵が消えると、溜めていた前の PES を復号できない)
-            var odd = CurrentNext && copy[0] > 1 ? Key((byte)(copy[0] - 1), even: (copy[0] - 1) % 2 == 0) : Key(copy[0], even: false);
-            var even = CurrentNext && copy[0] > 1 ? Key(copy[0], even: copy[0] % 2 == 0) : Key(copy[0], even: true);
-            return new EcmAnswer(odd, even, Code, Cached, WaitedMs);
+            // **本物と同じく、その世代の鍵だけを返す。** ECM が変わると前の世代の鍵は消えるので、
+            // 溜めていた前の PES は、溜めたときに覚えていた鍵でしか復号できない
+            return new EcmAnswer(Key(copy[0], even: false), Key(copy[0], even: true), Code, Cached, WaitedMs);
         }
 
         public int Confirm(ReadOnlySpan<byte> verificationData, ushort dateMjd) => Code;
@@ -151,11 +146,14 @@ public class B25Tests
                 start = 5 + adaptation;
             }
             packet[3] = (byte)((adaptation >= 0 ? 0x20 : 0) | (start < 188 ? 0x10 : 0) | Counter(pid));
-            if (pusi && start + 3 <= 188)
+            if (pusi && start + 4 <= 188)
             {
+                // 本物の PES の始まりと同じ 4 バイト (00 00 01 + ストリーム ID)。4 バイト目まで見ないと、
+                // 00 00 01 から始まるただのデータを PES の始まりと読み違える
                 packet[start] = 0;
                 packet[start + 1] = 0;
                 packet[start + 2] = 1;
+                packet[start + 3] = pid == AudioPid ? (byte)0xC0 : (byte)0xE0;
             }
             Plain.AddRange(packet);
 
@@ -292,7 +290,7 @@ public class B25Tests
             .Ecm(EcmPid, 2)
             // 次の ECM の鍵 (制御 0b11 に even)。前の PES を、この対応で復号して流す
             .Payload(VideoPid, 2, even: true, control: 3);
-        var descrambler = new Descrambler(new Cards { CurrentNext = true });
+        var descrambler = new Descrambler(new Cards());
 
         var output = Run(descrambler, ts.Wire.ToArray());
 
@@ -408,13 +406,13 @@ public class B25Tests
 
         foreach (var chunk in new[] { 1, 7, 187, 188, 189, 376, 1000 })
         {
-            var output = Run(new Descrambler(new Cards { CurrentNext = true }), wire, chunk);
+            var output = Run(new Descrambler(new Cards()), wire, chunk);
             await Assert.That(Diff(output, expected)).IsEqualTo(-1);
         }
 
         // でたらめな長さで切っても
         var random = new Random(3);
-        var descrambler = new Descrambler(new Cards { CurrentNext = true });
+        var descrambler = new Descrambler(new Cards());
         var writer = new ArrayBufferWriter<byte>();
         for (var at = 0; at < wire.Length;)
         {
@@ -467,7 +465,7 @@ public class B25Tests
             .Ecm(EcmPid, 1).Videos(5, 1, even: true).Videos(5, 1, even: false)
             .Ecm(EcmPid, 2).Videos(5, 2, even: true)
             .Ecm(EcmPid, 3).Videos(5, 3, even: false);
-        var cards = new Cards { CurrentNext = true };
+        var cards = new Cards();
         var descrambler = new Descrambler(cards);
 
         var output = Run(descrambler, ts.Wire.ToArray());
@@ -653,7 +651,7 @@ public class B25Tests
         ts.Pmt(PmtPid, 0x0400, Ca(moved), (VideoPid, []), (AudioPid, []))
             .Ecm(EcmPid, 4) // もう誰も指していない。聞かない
             .Ecm(moved, 2).Videos(5, 2);
-        var cards = new Cards { CurrentNext = true };
+        var cards = new Cards();
         var descrambler = new Descrambler(cards);
 
         var output = Run(descrambler, ts.Wire.ToArray());
@@ -1192,7 +1190,6 @@ public class B25Tests
         var cards = new Cards
         {
             Ids = [Mine],
-            CurrentNext = true,
             OnEmm = () =>
             {
                 entered.Set();
