@@ -46,12 +46,19 @@ public class B25Tests
             return 0x2100;
         }
 
+        /// <summary>ECM が変わったとき、前の世代の odd を「今の鍵」として返す (本物の ECM は今と次を持つ)</summary>
+        public bool CurrentNext { get; set; }
+
         public EcmAnswer Ecm(ReadOnlySpan<byte> ecm)
         {
             var copy = ecm.ToArray();
             Asked.Add(copy);
             if (Fail(copy) is { } error) throw error;
-            return new EcmAnswer(Key(copy[0], even: false), Key(copy[0], even: true), Code, Cached, WaitedMs);
+            // 本物の ECM は「今の鍵」と「次の鍵」を持つ。世代が変わるたびに、前の世代の今の鍵と、
+            // その世代の次の鍵を返す (前の世代の鍵が消えると、溜めていた前の PES を復号できない)
+            var odd = CurrentNext && copy[0] > 1 ? Key((byte)(copy[0] - 1), even: (copy[0] - 1) % 2 == 0) : Key(copy[0], even: false);
+            var even = CurrentNext && copy[0] > 1 ? Key(copy[0], even: copy[0] % 2 == 0) : Key(copy[0], even: true);
+            return new EcmAnswer(odd, even, Code, Cached, WaitedMs);
         }
 
         public int Confirm(ReadOnlySpan<byte> verificationData, ushort dateMjd) => Code;
@@ -272,27 +279,6 @@ public class B25Tests
     }
 
     /// <summary>
-    /// **途中で奇数/偶数の鍵が入れ替わっても追いつく。** ECM が変わって鍵が入れ替わると、制御ビットと
-    /// 鍵の対応が前の ECM のままでは合わない。PES の始まりで確かめて、合うほうに入れ替える
-    /// </summary>
-    [Test]
-    public async Task 途中で奇数と偶数の鍵が入れ替わっても追いつく()
-    {
-        var ts = Channel()
-            .Ecm(EcmPid, 1)
-            .Payload(VideoPid, 1, even: true)
-            .Ecm(EcmPid, 2)
-            // 新しい ECM では、制御ビット 0b10 でも odd の鍵で掛かっている
-            .Payload(VideoPid, 2, even: false, control: 2);
-        var descrambler = new Descrambler(new Cards());
-
-        var output = Run(descrambler, ts.Wire.ToArray());
-
-        await Assert.That(Diff(output, Expected(ts))).IsEqualTo(-1);
-        await Assert.That(descrambler.Undecodable).IsEqualTo(0);
-    }
-
-    /// <summary>
     /// **ECM が変わっても、前に覚えた偶奇の対応を残す。** ECM が変わるたびに既定へ戻すと、
     /// 変わった直後の PES の途中（PES の始まりではないパケット）が、次の PES の始まりまで化ける
     /// </summary>
@@ -301,11 +287,33 @@ public class B25Tests
     {
         var ts = Channel()
             .Ecm(EcmPid, 1)
-            // 制御ビット 0b10 でも odd の鍵で掛かっている (対応を odd に覚える)
+            // 前の ECM の鍵 (制御 0b10 に odd を対応させる)
             .Payload(VideoPid, 1, even: false, control: 2)
             .Ecm(EcmPid, 2)
-            // ECM が変わった直後の PES の途中。PES の始まりではないので、覚えた対応で復号する
-            .Payload(VideoPid, 2, even: false, control: 2, pusi: false);
+            // 次の ECM の鍵 (制御 0b11 に even)。前の PES を、この対応で復号して流す
+            .Payload(VideoPid, 2, even: true, control: 3);
+        var descrambler = new Descrambler(new Cards { CurrentNext = true });
+
+        var output = Run(descrambler, ts.Wire.ToArray());
+
+        await Assert.That(Diff(output, Expected(ts))).IsEqualTo(-1);
+        await Assert.That(descrambler.Undecodable).IsEqualTo(0);
+    }
+
+    /// <summary>
+    /// **PES の途中で偶奇が切り替わっても復号できる。** PES の始まりで次の鍵の対応を覚え、
+    /// そのあとで前の PES を復号し直す。PES の始まりだけで復号していると、途中から化ける
+    /// </summary>
+    [Test]
+    public async Task PESの途中で偶奇が切り替わっても復号できる()
+    {
+        var ts = Channel()
+            .Ecm(EcmPid, 1)
+            // PES の始まりは 0b10 (even)。途中で 0b11 (even) に変わる (既定の odd ではない)
+            .Payload(VideoPid, 1, even: true, control: 2)
+            .Payload(VideoPid, 1, even: true, control: 3, pusi: false)
+            // 次の PES の始まり (0b11, even)。ここで前の PES を、更新後の対応で復号して流す
+            .Payload(VideoPid, 1, even: true, control: 3);
         var descrambler = new Descrambler(new Cards());
 
         var output = Run(descrambler, ts.Wire.ToArray());
@@ -394,19 +402,19 @@ public class B25Tests
     [Test]
     public async Task どこで区切って渡しても同じに復号できる()
     {
-        var ts = Channel().Ecm(EcmPid, 1).Videos(20, 1).Ecm(EcmPid, 2).Videos(20, 2, even: false).Ecm(EcmPid, 2);
+        var ts = Channel().Ecm(EcmPid, 1).Videos(20, 1, even: false).Ecm(EcmPid, 2).Videos(20, 2).Ecm(EcmPid, 2);
         var wire = ts.Wire.ToArray();
         var expected = Expected(ts);
 
         foreach (var chunk in new[] { 1, 7, 187, 188, 189, 376, 1000 })
         {
-            var output = Run(new Descrambler(new Cards()), wire, chunk);
+            var output = Run(new Descrambler(new Cards { CurrentNext = true }), wire, chunk);
             await Assert.That(Diff(output, expected)).IsEqualTo(-1);
         }
 
         // でたらめな長さで切っても
         var random = new Random(3);
-        var descrambler = new Descrambler(new Cards());
+        var descrambler = new Descrambler(new Cards { CurrentNext = true });
         var writer = new ArrayBufferWriter<byte>();
         for (var at = 0; at < wire.Length;)
         {
@@ -457,9 +465,9 @@ public class B25Tests
     {
         var ts = Channel()
             .Ecm(EcmPid, 1).Videos(5, 1, even: true).Videos(5, 1, even: false)
-            .Ecm(EcmPid, 2).Videos(5, 2, even: false).Videos(5, 2, even: true)
-            .Ecm(EcmPid, 3).Videos(5, 3, even: true);
-        var cards = new Cards();
+            .Ecm(EcmPid, 2).Videos(5, 2, even: true)
+            .Ecm(EcmPid, 3).Videos(5, 3, even: false);
+        var cards = new Cards { CurrentNext = true };
         var descrambler = new Descrambler(cards);
 
         var output = Run(descrambler, ts.Wire.ToArray());
@@ -577,7 +585,7 @@ public class B25Tests
         var wire = ts.Wire.ToArray();
         var descrambler = new Descrambler(new Cards());
 
-        var output = Run(descrambler, wire, flush: false);
+        var output = Run(descrambler, wire);
 
         // 上限に達したところで溜めたぶんを書き出し、残りは溜めずに出てくる
         await Assert.That(output.Length).IsEqualTo(wire.Length);
@@ -591,7 +599,7 @@ public class B25Tests
         var ts = new Ts().Pat((0x0400, PmtPid)).Pmt(PmtPid, 0x0400, [], (VideoPid, [])).Videos(10, null);
         var descrambler = new Descrambler(new Cards());
 
-        var output = Run(descrambler, ts.Wire.ToArray(), flush: false);
+        var output = Run(descrambler, ts.Wire.ToArray());
 
         // PMT が揃った時点で出始める
         await Assert.That(output.Length).IsEqualTo(ts.Wire.Count);
@@ -640,12 +648,12 @@ public class B25Tests
     public async Task PMTが変わってECMのPIDが替わっても追いかける()
     {
         const int moved = 0x0905;
-        var ts = Channel().Ecm(EcmPid, 1).Videos(5, 1);
+        var ts = Channel().Ecm(EcmPid, 1).Videos(5, 1, even: false);
         ts.Version = 1;
         ts.Pmt(PmtPid, 0x0400, Ca(moved), (VideoPid, []), (AudioPid, []))
             .Ecm(EcmPid, 4) // もう誰も指していない。聞かない
             .Ecm(moved, 2).Videos(5, 2);
-        var cards = new Cards();
+        var cards = new Cards { CurrentNext = true };
         var descrambler = new Descrambler(cards);
 
         var output = Run(descrambler, ts.Wire.ToArray());
@@ -688,11 +696,13 @@ public class B25Tests
         var output = new ArrayBufferWriter<byte>();
 
         descrambler.Decode(Channel().Ecm(EcmPid, 1).Videos(2, 1).Ecm(EcmPid, 1).Videos(2, 1).Wire.ToArray(), output);
+        descrambler.Flush(output);
         await Assert.That(cards.Asked.Count).IsEqualTo(1);
         await Assert.That(descrambler.Undecodable).IsEqualTo(4);
 
         // 地上波で 2 秒ほど (Descrambler.RetryPackets) 流れたあとの同じ ECM
         descrambler.Decode(new Ts().Videos(25_000, null).Ecm(EcmPid, 1).Videos(2, 1).Wire.ToArray(), output);
+        descrambler.Flush(output);
         await Assert.That(cards.Asked.Count).IsEqualTo(2);
         await Assert.That(descrambler.Decoded).IsEqualTo(2);
     }
@@ -778,7 +788,7 @@ public class B25Tests
         var descrambler = new Descrambler(cards);
 
         // 終わりの書き出し (Flush) をしなくても、全部が復号されて出てくる
-        var output = Run(descrambler, ts.Wire.ToArray(), flush: false);
+        var output = Run(descrambler, ts.Wire.ToArray());
 
         await Assert.That(Diff(output, Expected(ts))).IsEqualTo(-1);
         await Assert.That(descrambler.Decoded).IsEqualTo(6);
@@ -841,7 +851,7 @@ public class B25Tests
         var cards = new Cards();
         var descrambler = new Descrambler(cards);
 
-        var output = Run(descrambler, head.Wire.ToArray(), flush: false);
+        var output = Run(descrambler, head.Wire.ToArray());
 
         await Assert.That(Diff(output, Expected(head))).IsEqualTo(-1);
         await Assert.That(descrambler.Decoded).IsEqualTo(4);
@@ -944,7 +954,7 @@ public class B25Tests
         var cards = new Cards();
         var descrambler = new Descrambler(cards, keysWanted: () => false);
 
-        var output = Run(descrambler, ts.Wire.ToArray(), flush: false);
+        var output = Run(descrambler, ts.Wire.ToArray());
 
         await Assert.That(Diff(output, ts.Wire.ToArray())).IsEqualTo(-1);
         await Assert.That(cards.Asked.Count).IsEqualTo(0);
@@ -965,7 +975,7 @@ public class B25Tests
         var before = Channel().Ecm(EcmPid, 1).Videos(5, 1);
         var after = new Ts().Videos(2, 2).Ecm(EcmPid, 2).Videos(3, 2).Pat((0x0400, PmtPid));
 
-        var first = Run(descrambler, before.Wire.ToArray(), flush: false);
+        var first = Run(descrambler, before.Wire.ToArray());
         wanted = true;
         var second = Run(descrambler, after.Wire.ToArray());
 
@@ -1028,7 +1038,7 @@ public class B25Tests
     {
         var descrambler = new Descrambler(new Cards());
 
-        Run(descrambler, new Ts().Videos(3, null).Wire.ToArray(), flush: false);
+        Run(descrambler, new Ts().Videos(3, null).Wire.ToArray());
 
         await Assert.That(descrambler.HeldAt()).IsEqualTo("PAT - / PMT - / ECM -");
         await Assert.That(descrambler.CardUse()).IsEqualTo("カード 0回 計 0ms (待ち 0ms・覚えた答え 0回・未契約 0回・準備 -)");
@@ -1182,6 +1192,7 @@ public class B25Tests
         var cards = new Cards
         {
             Ids = [Mine],
+            CurrentNext = true,
             OnEmm = () =>
             {
                 entered.Set();
@@ -1195,9 +1206,9 @@ public class B25Tests
         {
             var ts = Channel().Section(CatPid, Cat(EmmPid)).Section(EmmPid, EmmSection(EmmTests.Payload(Mine, 1)));
             var primed = ts.Wire.Count;
-            ts.Section(EmmPid, EmmSection(EmmTests.Payload(Mine, 2))).Ecm(EcmPid, 1).Videos(5, 1);
+            ts.Section(EmmPid, EmmSection(EmmTests.Payload(Mine, 2))).Ecm(EcmPid, 1).Videos(5, 1, even: false);
             var blocked = ts.Wire.Count;
-            ts.Section(EmmPid, EmmSection(EmmTests.Payload(Mine, 3))).Ecm(EcmPid, 2).Videos(5, 2, even: false);
+            ts.Section(EmmPid, EmmSection(EmmTests.Payload(Mine, 3))).Ecm(EcmPid, 2).Videos(5, 2);
             var wire = ts.Wire.ToArray();
             var descrambler = new Descrambler(cards, emm: emm);
             var output = new ArrayBufferWriter<byte>();
