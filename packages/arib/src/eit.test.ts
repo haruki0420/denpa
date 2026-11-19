@@ -57,7 +57,7 @@ describe("時刻", () => {
     expect(parseEit(data)?.events[0]?.startAt).toBe(NOON);
   });
 
-  test("全ビット1は「未定」。番組表に置けないので null", () => {
+  test("全ビット 1 は「未定」。番組表に置けないので null", () => {
     const data = Uint8Array.from([0xff, 0xff, 0xff, 0xff, 0xff]);
     expect(parseMjdTime(data, 0)).toBeNull();
     expect(parseBcdDuration(data, 0)).toBeNull();
@@ -80,7 +80,7 @@ describe("EIT の解析", () => {
     expect(parsed?.events[0]?.duration).toBe(30 * 60 * 1000);
   });
 
-  test("局とネットワークは番組にも写す。番組表の JOIN がこれで決まる", () => {
+  test("局とネットワークは番組にもコピーする。番組表の JOIN がこれで決まる", () => {
     const parsed = parseEit(section([event()]));
     expect(parsed?.events[0]?.serviceId).toBe(SERVICE);
     expect(parsed?.events[0]?.originalNetworkId).toBe(NETWORK);
@@ -91,8 +91,8 @@ describe("EIT の解析", () => {
    * **分割された項目は、繋いでからデコードする。**
    *
    * バイトは実機の放送から取ったもの (テレ東 LIAR GAME の「番組概要」)。
-   * 部分ごとにデコードして文字列を繋いでいた頃は、続きが別の文字で出ていた —
-   * 「音楽制作ずはのづ ねふびどっ」(正しくは「音楽制作:ONE MUSIC」)。
+   * 部分ごとにデコードして文字列を繋ぐと、続きが「音楽制作ずはのづ ねふびどっ」のように別の文字で出る
+   * (正しくは「音楽制作:ONE MUSIC」)。
    * 分割点が二バイト文字の途中に来ており、文字集合の状態も持ち越されるため
    */
   test("分割された詳細情報は、繋いでからデコードする", () => {
@@ -104,7 +104,7 @@ describe("EIT の解析", () => {
     const first = hex(
       "38363a6e1b7eba39434865432b47260d416d34464644ba3a3446234d3a3b300d34464644ba406e4c6e4b63487e0d2537256a213c253a393d402eba313a482a432349270d1b7cade3e9afbf213cc7b6a4f3fe416d3a6e3268344646441b7eba455a3230373d0d487e3d51405f446aba3f793b333f383b4b0d3f273a4c405f3757ba436646623e48487e0d4a543d38ba444d3e6f3f3f4d7d3b520d323b364134464644ba3e2e4074352a32700d323b3641387a324cba3b33432b3e303f4d0d4f3f323b44344030ba45374c6e4e364d4e0d323b335aba3f7b4c6e4d3438",
     );
-    /** 2 つ目。**見出しが空** = 続き。頭は前の文字の片割れから始まる */
+    /** 2 つ目。**見出しが空** = 続き。先頭は前の文字の片割れから始まる */
     const second = hex(
       "670d323b335a40293a6eba89cfcec58a2089cdd5d3c9c30d8a323b364140293a6eba1b7cd3c3c8b0eb213cd6d7ede2213cb7e7f30da2cbe1213cb7e7f340293a6e0e3adec3c9cfa6b90d",
     );
@@ -197,7 +197,13 @@ describe("EIT の解析", () => {
     const found = parsed?.events[0];
     expect(found?.genres).toEqual([{ lv1: 7, lv2: 0 }]);
     expect(found?.audios).toEqual([
-      { componentType: 3, langs: ["jpn"], samplingRate: 48000, main: true },
+      {
+        componentType: 3,
+        componentTag: 0x10,
+        langs: ["jpn"],
+        samplingRate: 48000,
+        main: true,
+      },
     ]);
     expect(found?.video).toEqual({ type: "mpeg2", resolution: "1080i" });
   });
@@ -224,6 +230,7 @@ describe("EIT の解析", () => {
     expect(parsed?.events[0]?.audios).toEqual([
       {
         componentType: 3,
+        componentTag: 0x10,
         langs: ["jpn"],
         samplingRate: 48000,
         text: "主音声ステレオ",
@@ -231,6 +238,7 @@ describe("EIT の解析", () => {
       },
       {
         componentType: 3,
+        componentTag: 0x11,
         langs: ["jpn"],
         samplingRate: 48000,
         text: "解説ステレオ",
@@ -245,6 +253,31 @@ describe("EIT の解析", () => {
     expect(parsed?.events[0]?.audios[0]).not.toHaveProperty("text");
   });
 
+  /** 短く切れた component・audio_component は読まない。読むと「480i」や言語が空の音声が出る */
+  test("短すぎる映像・音声の記述子は読まない", () => {
+    const parsed = parseEit(
+      section([
+        event({
+          audios: [{ type: 3 }],
+          rawDescriptors: [
+            0x50, 0x01, 0xf1, 0xc4, 0x05, 2, 3, 0x10, 0x0f, 0xff,
+          ],
+        }),
+      ]),
+    );
+    const found = parsed?.events[0];
+    expect(found?.video).toBeNull();
+    expect(found?.audios).toEqual([
+      {
+        componentType: 3,
+        componentTag: 0x10,
+        langs: ["jpn"],
+        samplingRate: 48000,
+        main: true,
+      },
+    ]);
+  });
+
   test("有料放送は free_CA_mode で分かる", () => {
     expect(parseEit(section([event()]))?.events[0]?.isFree).toBe(true);
     expect(
@@ -252,7 +285,7 @@ describe("EIT の解析", () => {
     ).toBe(false);
   });
 
-  test("CA契約情報記述子から契約確認情報を読む", () => {
+  test("CA 契約情報記述子から契約確認情報を読む", () => {
     // 0xCB, len=8, CA_system_id=0x0005, unit=1 & comp=0, cvi_len=4, cvi=[1,2,3,4]
     const caDesc = [0xcb, 8, 0x00, 0x05, 0x10, 0x04, 0x01, 0x02, 0x03, 0x04];
     const parsed = parseEit(
@@ -267,7 +300,7 @@ describe("EIT の解析", () => {
    * コピー禁止の番組は録らない (docs/data.md「コピー禁止の番組は録らない」)。記録制御の 2 ビットが 11 のときだけ。
    * 1 世代のみ (10) は今までどおり録る
    */
-  test("コピー禁止はデジタルコピー制御記述子の先頭2ビットで分かる", () => {
+  test("コピー禁止はデジタルコピー制御記述子の先頭 2 ビットで分かる", () => {
     const copyNever = (copyControl?: number) =>
       parseEit(
         section([event(copyControl === undefined ? {} : { copyControl })]),
@@ -290,7 +323,7 @@ describe("EIT の解析", () => {
   });
 
   /*
-   * シリーズ記述子 (ARIB STD-B10 第 2 部)。バイトは仕様の並びから手で組んだもの:
+   * シリーズ記述子 (ARIB STD-B10 第 2 部)。バイトは仕様の並びから手で組んだもので、並びは次のとおり。
    * series_id=0x1234 / repeat_label=2 program_pattern=2 (週 1 回) 有効期限あり /
    * expire_date / episode_number=300 last_episode_number=1000 / 「テスト」(JIS の 2546 2539 2548)
    */
@@ -359,7 +392,7 @@ describe("EIT の解析", () => {
     expect(parseEit(section([event()], { tableId: 0x60 }))).toBeNull();
   });
 
-  test("1セクションに複数の番組が並ぶ", () => {
+  test("1 セクションに複数の番組が並ぶ", () => {
     const events = [
       event({ eventId: 1 }),
       event({ eventId: 2, startAt: NOON + 1800_000, name: "次の番組" }),
@@ -452,9 +485,8 @@ describe("集まり具合", () => {
   /*
    * **バージョンは table_id ごとに別々に振られる。** 番組表の 1 つの表は
    * table_id + 局 + TS で決まり、`version_number` はその単位で動く。
-   * 局に 1 つだけ持っていた頃は、基本 (0x50〜) と詳細 (0x58〜) を行き来する
-   * たびに数えたものを全部捨てていて、**揃ったと分かることが二度と無かった**。
-   * どのチャンネルも上限 (`epgChannelTimeout`) まで開きっぱなしになる
+   * 局に 1 つだけ持つと、基本 (0x50〜) と詳細 (0x58〜) を行き来するたびに数えたものを
+   * 全部捨て、**揃ったと分かることが無い**。どのチャンネルも上限 (`epgChannelTimeout`) まで開いたままになる
    */
   test("別の表のバージョンが違っても、こちらの数えたものは捨てない", () => {
     const progress = progressAt();
@@ -488,7 +520,7 @@ describe("集まり具合", () => {
    */
   test("揃わなかった理由を言える", () => {
     const empty = progressAt();
-    expect(empty.report()).toContain("1つも来ていない");
+    expect(empty.report()).toContain("1 つも来ていない");
 
     // いちばん後ろの表が来ない (来ない表を待っている状態)
     const waiting = progressAt();
@@ -496,7 +528,7 @@ describe("集まり具合", () => {
     expect(waiting.report()).toContain("0x59");
     expect(waiting.report()).toContain("一度も来ない");
 
-    // 節が欠けている (電波が届いていない状態)
+    // セクションが欠けている (電波が届いていない状態)
     const holes = progressAt();
     holes.add(at(0x50, 0, 3, 3));
     holes.add(at(0x50, 2, 3, 3));
@@ -510,20 +542,18 @@ describe("集まり具合", () => {
   /*
    * **過ぎた時間帯のセグメントは流れてこない。**
    *
-   * セグメントは 0:00 から 3 時間ずつの枠で、終わった枠は放送に乗らない。
-   * 「空でも先頭の 1 本 (8 の倍数) は来る」として待っていた頃は、**実機の
-   * 14 チャンネルが 1 つ残らず上限の 600 秒を使い切って**いた — 揃って離せたのは
-   * 0 本で、早く離す仕組みがまるごと働いていなかった。
+   * セグメントは 0:00 から 3 時間ずつの枠で、終わった枠は放送されない。
+   * 「空でも先頭の 1 本 (8 の倍数) は来る」として待つと、**実機の 14 チャンネルが
+   * 1 つ残らず上限の 600 秒を使い切った**。揃って離せたのは 0 で、早く離す仕組みが働いていなかった。
    *
-   * 実機の記録がそのまま出方を教えてくれた。16:59 に閉じた回はどの局も
-   * `0x50/0x58 の 0,8,16,24,32` (= 0:00〜15:00 の 5 枠)、18:19 に閉じた回は
-   * そこに `40` が増えていた。**時計が進むと欠けが 1 つ増える** — 電波の
-   * 欠けでは起きない動き方で、待ち方のほうが誤っていると分かる。
+   * 実機の記録では、16:59 に閉じた回はどの局も `0x50/0x58 の 0,8,16,24,32`
+   * (= 0:00〜15:00 の 5 枠) が欠け、18:19 に閉じた回はそこに `40` が増えていた。
+   * **時計が進むと欠けが 1 つ増える**のは電波の欠けでは起きない動き方で、待ち方のほうが誤っていると分かる。
    *
    * 過ぎた枠のぶんの番組は、そこがまだ未来だった数日前に取り込んである。
    */
   test("もう過ぎた時間帯のセグメントは待たない", () => {
-    // 15:30 JST。0:00〜15:00 の 5 枠 (節 0,8,16,24,32) は終わっている
+    // 15:30 JST。0:00〜15:00 の 5 枠 (セクション 0,8,16,24,32) は終わっている
     const afternoon = Date.UTC(2026, 7, 3, 6, 30, 0);
     const progress = progressAt(afternoon);
 
@@ -564,7 +594,7 @@ describe("集まり具合", () => {
 describe("EpgReader", () => {
   const packets = (data: Uint8Array) => packetize(0x0012, data);
 
-  test("TS を食わせると番組が溜まる", () => {
+  test("TS を渡すと番組が溜まる", () => {
     const reader = new EpgReader();
     expect(reader.feed(packets(section([event()])))).toBe(true);
     expect(reader.all().map((e) => e.name)).toEqual(["テスト番組"]);
@@ -773,7 +803,7 @@ describe("EpgReader", () => {
 
   /*
    * **実機で踏んだところ。** running_status を 4 にしてくれない局がある
-   * (NHK は 74 節ぜんぶ 0 だった)。4 だけを見ていると、そういう局では
+   * (NHK は 74 セクションぜんぶ 0 だった)。4 だけを見ていると、そういう局では
    * 延長追従が丸ごと効かない。p/f は仕様で section 0 が現在なので、
    * 0 (未定義) のときはそちらで決める (docs/data.md)
    */
@@ -807,7 +837,7 @@ describe("EpgReader", () => {
 });
 
 describe("PresentFollowing", () => {
-  /** p/f の 1 節を 188 バイトずつ食わせる。どれかで変わったと言えば true */
+  /** p/f の 1 セクションを 188 バイトずつ渡す。どれかで変わったと言えば true */
   function feed(
     reader: PresentFollowing,
     events: SynthEvent[],
@@ -824,7 +854,7 @@ describe("PresentFollowing", () => {
     return changed;
   }
 
-  test("いまと次を節の番号で分けて読む", () => {
+  test("いまと次をセクションの番号で分けて読む", () => {
     const reader = new PresentFollowing(SERVICE);
     expect(feed(reader, [event({ runningStatus: 4 })])).toBe(true);
     const next = event({

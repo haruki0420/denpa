@@ -76,12 +76,14 @@ interface Frame {
 }
 
 /**
- * `file` (作り置きの fMP4) を `length` 秒ぶん並べて、Matroska にする。映像はトラック 1、音はトラック 2 (名前は `audioName`)
+ * `file` (作り置きの fMP4) を `length` 秒ぶん並べて、Matroska にする。映像はトラック 1、音はトラック 2 (名前は `audioName`)。
+ * `rewrite` を渡すと、映像のコマの中身をそれで書き換える (キーフレームの印はそのまま。IDR でないキーフレームを作る)
  */
 export function mkvFromClip(
   file: Uint8Array,
   length: number,
   audioName = "主音声",
+  rewrite?: (data: Uint8Array, at: number) => Uint8Array,
 ): Uint8Array {
   const clip = readClip(file);
   const data = clipFrom(clip, 0, length);
@@ -92,15 +94,19 @@ export function mkvFromClip(
     throw new Error("映像と音が要ります");
 
   const frames: Frame[] = [];
-  // 媒体ごとに読む (頭の後ろから moof + mdat が並ぶ)
+  // 媒体ごとに読む (先頭の後ろから moof + mdat が並ぶ)
   const head = clip.head.length;
   for (const sample of readFragment(data.subarray(head), tracks)) {
     const track = tracks.find((t) => t.id === sample.track)!;
+    const at = Math.round((sample.pts * 1000) / track.timescale);
     frames.push({
       track: track === video ? 1 : 2,
-      at: Math.round((sample.pts * 1000) / track.timescale),
+      at,
       key: track === video ? sample.key : true,
-      data: sample.data,
+      data:
+        track === video && rewrite !== undefined
+          ? rewrite(sample.data, at)
+          : sample.data,
     });
   }
   frames.sort((a, b) => a.at - b.at || a.track - b.track);
@@ -128,11 +134,8 @@ export function mkvFromClip(
       ),
       str(0x536e, audioName),
       str(0x22b59c, "jpn"),
-      el(
-        0xe1,
-        f64(0xb5, audio.sampleRate || 48000),
-        u(0x9f, audio.channels || 2),
-      ),
+      // 作り置きの音は 48kHz・2ch (読む側は中身から読むので、ここは形だけ)
+      el(0xe1, f64(0xb5, 48000), u(0x9f, 2)),
     ),
   );
   const info = el(
@@ -173,7 +176,7 @@ export function mkvFromClip(
   }
   flush();
 
-  // 位置は Segment の中身の頭から。SeekHead の大きさは中身で決まらない (8 バイト固定) ので、先に組める
+  // 位置は Segment の中身の先頭から。SeekHead の大きさは中身で決まらない (8 バイト固定) ので、先に組める
   const seekHead = (cuesAt: number) =>
     el(0x114d9b74, el(0x4dbb, el(0x53ab, id(0x1c53bb6b)), u(0x53ac, cuesAt)));
   const lead = seekHead(0).length + info.length + trackEntries.length;
@@ -210,4 +213,23 @@ export function mkvFromClip(
     u(0x4285, 2),
   );
   return join([ebml, segment]);
+}
+
+/**
+ * 長さ 4 バイトの NAL の並びの、IDR のスライス (5) を IDR でない P のスライスにする (`mkvFromClip` の `rewrite` に渡す)。
+ * MediaCodec のエンコーダが、intra-refresh の回復点に印を付けて返したときの形 (`server/clean-start.ts`)。
+ * x264 のスライスの先頭は `0x88` (first_mb_in_slice 0・slice_type 7 の I) なので、`0x89` (slice_type 8 の SP。I でない) にする
+ */
+export function notStartable(data: Uint8Array): Uint8Array {
+  const out = data.slice();
+  let at = 0;
+  while (at + 4 < out.length) {
+    const size = new DataView(out.buffer).getUint32(at);
+    if ((out[at + 4]! & 0x1f) === 5) {
+      out[at + 4] = (out[at + 4]! & 0xe0) | 1;
+      if (out[at + 5] === 0x88) out[at + 5] = 0x89;
+    }
+    at += 4 + size;
+  }
+  return out;
 }

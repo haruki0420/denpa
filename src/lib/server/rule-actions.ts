@@ -1,5 +1,6 @@
-import { and, eq, isNotNull, isNull, not } from "drizzle-orm";
+import { and, eq, inArray, isNotNull, isNull, not } from "drizzle-orm";
 
+import { parseId } from "../id";
 import { now, orm } from "./db";
 import {
   conditionsOf,
@@ -22,23 +23,19 @@ import { reservations, rules as ruleTable } from "./schema";
 /**
  * ルールを当て直して、チューナーの取り合いを計算し直す。
  *
- * 番組表は取り直さない。押す動機はたいてい「新しい番組に当ててほしい」だが、
- * 番組表を持っているのは denpa 自身なので、取り直す理由がない。当てるだけ。
+ * 番組表は取り直さない。番組表は denpa 自身が持っているので、いまの番組表に当てるだけで足りる。
  *
  * @param rule そのルールだけを当てる。**足したときにしか使えない。**
  *   新しいルールは他の予約を外せないので、範囲を絞れる (`rules.applyRules`)
- * @returns どのルールにも当たらなくなって消した予約の数
  */
-async function reapply(rule?: number): Promise<number> {
-  const { dropped } = applyRules(rule === undefined ? {} : { rule });
+export async function reapply(rule?: number): Promise<void> {
+  applyRules(rule === undefined ? {} : { rule });
   await resolveConflicts();
-  return dropped;
 }
 
-/** フォームの `id` (直す・消すルール)。整数でなければ null */
+/** フォームの `id` (直す・消すルール)。ID として読めなければ null (`parseId`) */
 export function idOf(form: FormData): number | null {
-  const id = Number(form.get("id"));
-  return Number.isInteger(id) ? id : null;
+  return parseId(form.get("id"));
 }
 
 /** 足したルール・直したルール */
@@ -107,11 +104,11 @@ export async function toggleRule(id: number): Promise<void> {
  * ルールを消す。
  *
  * **取り消しの記録だけ先に消す。** ルールごと無くなるので、「このルールには作り直させない」という
- * 目印を残す意味がない。残していた頃は、後から `scheduled` に戻ったときに**消したはずの
- * ルールの予約が「ルール: (削除済み)」として一覧に並んでいた** (実機で 45 件)。
+ * 目印を残す意味がない。残すと、後から `scheduled` に戻ったときに**消したはずの
+ * ルールの予約が「ルール: (削除済み)」として一覧に並ぶ** (実機で 45 件)。
  *
  * まだ立っている予約はここでは触らない。**他のルールが引き取れるかどうかを見てから決める。**
- * 消したのが「アニメ」でも、「無職転生」が残っていればその予約は生き続けるべき
+ * 消したのが「アニメ」でも、「無職転生」が残っていればその予約は残す
  * (`rules.applyRules` が付け替える)
  *
  * @returns 引き取り手が無くて消えた予約の数 (猶予は効かない = 人が押した結果なので)
@@ -135,6 +132,29 @@ export async function deleteRule(id: number): Promise<number> {
       and(eq(reservations.rule_id, id), isNotNull(reservations.started_at)),
     )
     .run();
+  // 数えるのはこのルールの予約だけ。`reapply` の答えには、同じ回で条件から外れたほかのルールの予約も入る
+  const pending = orm()
+    .select({ id: reservations.id })
+    .from(reservations)
+    .where(and(eq(reservations.rule_id, id), isNull(reservations.started_at)))
+    .all()
+    .map((row) => row.id);
   orm().delete(ruleTable).where(eq(ruleTable.id, id)).run();
-  return reapply();
+  await reapply();
+  const left =
+    pending.length === 0
+      ? 0
+      : orm()
+          .select({ id: reservations.id })
+          .from(reservations)
+          .where(inArray(reservations.id, pending))
+          .all().length;
+  const dropped = pending.length - left;
+  // 代わりに予約するルールを探したあとも消したルールを指している行 (録り逃し・番組表から消えた放送) は、紐付けを外して「(削除済み)」にする
+  orm()
+    .update(reservations)
+    .set({ rule_id: null })
+    .where(eq(reservations.rule_id, id))
+    .run();
+  return dropped;
 }

@@ -7,6 +7,7 @@ import {
   AUDIO_AFTER,
   AUDIO_SHARE,
   AUDIO_WINDOW,
+  autoValue,
   BASE_GUESS_KBPS,
   ENCODE_LAG,
   GRACE,
@@ -24,6 +25,9 @@ import {
 } from "./adapt";
 import { ENCODE_SLOW, type Pace } from "./rungs";
 
+/** HTTP の変換で、ffmpeg を待たずに済んでいるときの `speed` (`server/pace.ts` の `SPEED_MOST`) */
+const SPEED_CAP = 10;
+
 const calm: Omit<AdaptSample, "now"> = {
   route: "watch",
   current: 0,
@@ -34,6 +38,9 @@ const calm: Omit<AdaptSample, "now"> = {
   pace: null,
   baseKbps: null,
 };
+
+/** 先を使い切って詰まった (観る画面は、先が 2 秒を切っていないと詰まりを回線のせいにしない) */
+const STUCK = { waiting: true, ahead: 0 };
 
 type Over = Partial<AdaptSample> | ((now: number) => Partial<AdaptSample>);
 
@@ -73,20 +80,21 @@ describe("下げる", () => {
     const a = new RungAdapter();
     // 5 Mbit/s × 0.7 = 3.5 Mbit/s。段 1 (3 + 0.096 Mbit/s) が収まる
     expect(
-      first(a, 0, 10_000, { waiting: true, throughput: 5_000_000 }),
+      first(a, 0, 10_000, { waiting: true, ahead: 0, throughput: 5_000_000 }),
     ).toEqual({ at: GRACE, decision: { step: 1, reason: "slow" } });
 
     // 2.5 Mbit/s × 0.7 = 1.75 Mbit/s。段 2 (1.5 + 0.096) が収まる
     const b = new RungAdapter();
     expect(
-      first(b, 0, 10_000, { waiting: true, throughput: 2_500_000 })?.decision,
+      first(b, 0, 10_000, { waiting: true, ahead: 0, throughput: 2_500_000 })
+        ?.decision,
     ).toEqual({ step: 2, reason: "slow" });
 
     // どの段も収まらなければ段 3
     const c = new RungAdapter();
     expect(
-      first(c, 0, 10_000, { waiting: true, throughput: 300_000 })?.decision
-        .step,
+      first(c, 0, 10_000, { waiting: true, ahead: 0, throughput: 300_000 })
+        ?.decision.step,
     ).toBe(3);
   });
 
@@ -103,7 +111,7 @@ describe("下げる", () => {
     ).toBe(1);
   });
 
-  test("溜まりが 2 秒を切って減り続けたら、詰まる前に下げる", () => {
+  test("バッファが 2 秒を切って減り続けたら、詰まる前に下げる", () => {
     const a = new RungAdapter();
     // 1 秒に 0.5 秒ずつ減る。2 秒続いて 2 秒を切った 7 秒目に下げる
     const hit = first(a, 0, 20_000, (now) => ({
@@ -186,7 +194,7 @@ describe("下げる", () => {
 });
 
 describe("観る画面で速さが足りないとき", () => {
-  test("測った速さの 7 割がいまの段に足りない状態が 10 秒続いたら、溜まりがあっても下げる", () => {
+  test("測った速さの 7 割がいまの段に足りない状態が 10 秒続いたら、バッファがあっても下げる", () => {
     const a = new RungAdapter();
     // 16 Mbit/s の MPEG-2 に 20 Mbit/s × 0.7 = 14 Mbit/s では足りない
     expect(
@@ -251,23 +259,276 @@ describe("観る画面で速さが足りないとき", () => {
   });
 });
 
+describe("観る画面で、届く速さがエンコードに縛られているとき", () => {
+  /** 段 1 (3 + 0.096 Mbit/s) を実時間の 1.2 倍でエンコードしている。受け取りの速さもその 1.2 倍 */
+  const BOUND = 1.2 * 3_096_000;
+  const encodeBound = (wait: number | null) =>
+    paces(() => ({ backlog: 0, dropped: 0, speed: 1.2, wait }));
+
+  test("サーバが ffmpeg を待っていた割合のぶん回線は空いていたと見て、ローカルネットで下げない", () => {
+    // 割合が届かなければ、受け取りの速さ × 0.7 (2.6 Mbit/s) が段 1 に足りず、10 秒で下げる (直す前の動き)
+    const before = encodeBound(null);
+    expect(
+      first(new RungAdapter(), 0, 60_000, (now) => ({
+        current: 1,
+        throughput: BOUND,
+        ahead: 20,
+        pace: before(now),
+      })),
+    ).toEqual({ at: GRACE + THIN, decision: { step: 2, reason: "slow" } });
+    // 8 割待っていたなら、回線は受け取りの速さの 5 倍出る
+    const bound = encodeBound(0.8);
+    expect(
+      first(new RungAdapter(), 0, 60_000, (now) => ({
+        current: 1,
+        throughput: BOUND,
+        ahead: 20,
+        pace: bound(now),
+      })),
+    ).toBeNull();
+  });
+
+  test("回線が細ければ ffmpeg をほとんど待たないので、これまでどおり 10 秒で下げる", () => {
+    // 2 Mbit/s ÷ 0.95 × 0.7 ≈ 1.47 Mbit/s は段 2 (1.596 Mbit/s) にも足りない
+    const thin = paces(() => ({
+      backlog: 0,
+      dropped: 0,
+      speed: SPEED_CAP,
+      wait: 0.05,
+    }));
+    expect(
+      first(new RungAdapter(), 0, 60_000, (now) => ({
+        current: 1,
+        throughput: 2_000_000,
+        ahead: 20,
+        pace: thin(now),
+      })),
+    ).toEqual({ at: GRACE + THIN, decision: { step: 3, reason: "slow" } });
+  });
+
+  test("割合が 1 でも、受け取りの速さの 10 倍までしか見ない", () => {
+    // 0.3 Mbit/s × 10 × 0.7 = 2.1 Mbit/s は段 1 に足りない
+    const full = encodeBound(1);
+    expect(
+      first(new RungAdapter(), 0, 60_000, (now) => ({
+        current: 1,
+        throughput: 300_000,
+        ahead: 20,
+        pace: full(now),
+      }))?.at,
+    ).toBe(GRACE + THIN);
+  });
+
+  test("割合が 1 に近くても、詰まれば受け取りの速さで比べて下げる (応答を溜める中継があると、回線が細くてもサーバは待たされない)", () => {
+    // 2 Mbit/s ÷ (1 − 0.9) × 0.7 = 14 Mbit/s は段 1 に足りるが、受け取りの速さ × 0.7 = 1.4 Mbit/s は段 2 にも足りない
+    const relayed = paces(() => ({
+      backlog: 0,
+      dropped: 0,
+      speed: 1.2,
+      wait: 0.9,
+    }));
+    expect(
+      first(new RungAdapter(), 0, 60_000, (now) => ({
+        current: 1,
+        throughput: 2_000_000,
+        ...STUCK,
+        pace: relayed(now),
+      })),
+    ).toEqual({ at: GRACE, decision: { step: 3, reason: "slow" } });
+  });
+
+  test("先が埋まってサーバが測れなくなっても (wait が null)、最後に測った割合を使う", () => {
+    const paused = paces((n) => ({
+      backlog: 0,
+      dropped: 0,
+      speed: n < 3 ? 1.2 : null,
+      wait: n < 3 ? 0.8 : null,
+    }));
+    expect(
+      first(new RungAdapter(), 0, 60_000, (now) => ({
+        current: 1,
+        throughput: BOUND,
+        ahead: 20,
+        pace: paused(now),
+      })),
+    ).toBeNull();
+  });
+
+  test("シークしたら (reset) 覚えた割合を捨て、新しいストリームで測り直す", () => {
+    const a = new RungAdapter();
+    const bound = encodeBound(0.8);
+    expect(
+      first(a, 0, 9_000, (now) => ({
+        current: 1,
+        throughput: BOUND,
+        ahead: 20,
+        pace: bound(now),
+      })),
+    ).toBeNull();
+    a.reset(10_000);
+    const fresh = encodeBound(null);
+    expect(
+      first(a, 10_000, 60_000, (now) => ({
+        current: 1,
+        throughput: BOUND,
+        ahead: 20,
+        pace: fresh(now),
+      }))?.at,
+    ).toBe(10_000 + GRACE + THIN);
+  });
+
+  test("上げるときは受け取りの速さだけを見る (エンコードが縛っている間に重い段へ上げない)", () => {
+    // 4 Mbit/s は段 1 の 2 倍 (6.2 Mbit/s) に届かない。割合で割ると届くが、上げない
+    const bound = paces(() => ({
+      backlog: 0,
+      dropped: 0,
+      speed: 2.5,
+      wait: 0.9,
+    }));
+    expect(
+      first(new RungAdapter(), 0, 120_000, (now) => ({
+        current: 2,
+        throughput: 4_000_000,
+        ahead: 20,
+        pace: bound(now),
+      })),
+    ).toBeNull();
+  });
+});
+
+describe("観る画面で、回線が足りているのに詰まったとき", () => {
+  test("先にバッファがあるのに詰まったのは回線のせいにしない (ファイルの直再生で、デコードが一瞬遅れた)", () => {
+    // AV1 のファイル (1.9 Mbit/s) を `<video>` で直再生。速さは測れない。先は 25 秒あり、10 秒目に 1 刻みだけ詰まった
+    const a = new RungAdapter();
+    expect(
+      first(a, 0, 30_000, (now) => ({
+        baseKbps: 1_900,
+        ahead: 25,
+        waiting: now === 10_000,
+      })),
+    ).toBeNull();
+    // 先を使い切って詰まったのは、速さを測れなくても回線のせいと見る
+    const b = new RungAdapter();
+    expect(
+      first(b, 0, 30_000, (now) => ({
+        baseKbps: 1_900,
+        ahead: now >= 10_000 ? 0 : 25,
+        waiting: now >= 10_000,
+      })),
+    ).toEqual({ at: 10_000, decision: { step: 1, reason: "slow" } });
+  });
+
+  test("測った速さが段に足りている間は、接続が切れて先を使い切っても回線のせいにしない", () => {
+    // MPEG-2 (13.7 Mbit/s) を 300 Mbit/s で受け取っていた。10 秒目に接続が切れ、先の 20 秒を使い切って詰まった。
+    // 読んでいないので、速さは最後に測った値のまま
+    const a = new RungAdapter();
+    const cut = (now: number): Partial<AdaptSample> => {
+      const ahead =
+        now < 10_000 ? 20 : Math.max(0, 20 - (now - 10_000) / 1_000);
+      return {
+        baseKbps: 13_700,
+        throughput: 300_000_000,
+        ahead,
+        waiting: ahead === 0,
+      };
+    };
+    expect(first(a, 0, 60_000, cut)).toBeNull();
+    // 手で選んでいても、足りないとは言わない
+    const b = new RungAdapter();
+    expect(
+      first(b, 0, 60_000, (now) => ({ ...cut(now), manual: true })),
+    ).toBeNull();
+  });
+
+  test("ファイルの直再生で、ブラウザが読むのを止めていれば、終わり際にバッファが減っても回線のせいにしない", () => {
+    // 30 秒のファイルを読み終えている。先は終わりまでの長さなので、終わり際に 2 秒を切って減り続ける
+    const ending = (now: number): Partial<AdaptSample> => ({
+      baseKbps: 1_900,
+      ahead: Math.max(0, 30 - now / 1_000),
+    });
+    // 読むのを止めていることを渡さなければ、終わり際に下げてしまう (直す前の動き)
+    expect(first(new RungAdapter(), 0, 29_000, ending)).toEqual({
+      at: 29_000,
+      decision: { step: 1, reason: "slow" },
+    });
+    expect(
+      first(new RungAdapter(), 0, 29_000, (now) => ({
+        ...ending(now),
+        idle: true,
+      })),
+    ).toBeNull();
+  });
+
+  test("飛んだ先をデコードし終えるまで詰まっても、ブラウザが読むのを止めていれば回線のせいにしない", () => {
+    // AV1 のファイルを直再生。10 秒目に飛び、飛んだ先を出すまで 5 秒詰まる。先はブラウザの数え方で 1 秒しか無い
+    const seek = (idle: boolean) => {
+      const a = new RungAdapter();
+      expect(first(a, 0, 9_000, { baseKbps: 1_900, idle })).toBeNull();
+      a.reset(10_000);
+      return first(a, 10_000, 15_000, (now) => ({
+        baseKbps: 1_900,
+        ahead: 1,
+        waiting: now < 15_000,
+        idle,
+      }));
+    };
+    expect(seek(false)).toEqual({
+      at: 10_000 + GRACE,
+      decision: { step: 1, reason: "slow" },
+    });
+    expect(seek(true)).toBeNull();
+  });
+
+  test("ファイルの直再生で、ブラウザが読み続けたまま先を使い切ったら、これまでどおり下げる", () => {
+    // 回線が細く、先が埋まらないのでブラウザは読むのを止めない。先が 10 秒から減っていき、使い切って詰まる
+    const a = new RungAdapter();
+    expect(
+      first(a, 0, 30_000, (now) => {
+        const ahead = Math.max(0, 10 - now / 1_000);
+        return { baseKbps: 1_900, ahead, waiting: ahead === 0, idle: false };
+      })?.decision,
+    ).toEqual({ step: 1, reason: "slow" });
+  });
+
+  test("測った速さが段に足りなければ、これまでどおり詰まりで下げる", () => {
+    // 15 Mbit/s × 0.7 = 10.5 Mbit/s は MPEG-2 の 13.7 Mbit/s に足りない
+    const a = new RungAdapter();
+    expect(
+      first(a, 0, 30_000, {
+        baseKbps: 13_700,
+        throughput: 15_000_000,
+        ahead: 0,
+        waiting: true,
+      }),
+    ).toEqual({ at: GRACE, decision: { step: 1, reason: "slow" } });
+  });
+
+  test("ライブは先のバッファがあっても詰まりを数える (先は数秒しか溜めない)", () => {
+    const a = new RungAdapter();
+    expect(
+      first(a, 0, 30_000, {
+        route: "live",
+        current: 1,
+        ahead: 3,
+        waiting: true,
+      })?.decision,
+    ).toEqual({ step: 3, reason: "slow" });
+  });
+});
+
 describe("GRACE", () => {
   test("選局の直後 3 秒は詰まっても下げない", () => {
     const a = new RungAdapter();
-    expect(first(a, 0, GRACE - 1_000, { waiting: true })).toBeNull();
-    expect(first(a, GRACE, GRACE, { waiting: true })).not.toBeNull();
+    expect(first(a, 0, GRACE - 1_000, STUCK)).toBeNull();
+    expect(first(a, GRACE, GRACE, STUCK)).not.toBeNull();
   });
 
   test("シークした直後も 3 秒は数えない", () => {
     const a = new RungAdapter();
     expect(first(a, 0, 5_000, {})).toBeNull();
     a.reset(6_000);
-    expect(
-      first(a, 6_000, 6_000 + GRACE - 1_000, { waiting: true }),
-    ).toBeNull();
-    expect(
-      first(a, 6_000 + GRACE, 6_000 + GRACE, { waiting: true }),
-    ).not.toBeNull();
+    expect(first(a, 6_000, 6_000 + GRACE - 1_000, STUCK)).toBeNull();
+    expect(first(a, 6_000 + GRACE, 6_000 + GRACE, STUCK)).not.toBeNull();
   });
 });
 
@@ -327,7 +588,7 @@ describe("上げる", () => {
     ).toEqual({ step: 0, reason: "restored" });
   });
 
-  test("ライブは、溜まりが無い状態が 30 秒続き、測った回線の速さが次の段の 1.2 倍あれば 1 段上げる", () => {
+  test("ライブは、バッファが無い状態が 30 秒続き、測った回線の速さが次の段の 1.2 倍あれば 1 段上げる", () => {
     const a = new RungAdapter();
     const clear = paces(() => ({ backlog: 0, dropped: 0, speed: null }));
     expect(
@@ -535,6 +796,7 @@ describe("手で選んでいるとき", () => {
         current: 0,
         manual: true,
         waiting: true,
+        ahead: 0,
         throughput: 1_000_000,
       }),
     ).toEqual({ at: GRACE, decision: { step: 0, reason: "pinned" } });
@@ -550,7 +812,7 @@ describe("手で選んでいるとき", () => {
 });
 
 describe("音声だけ", () => {
-  test("段 3 でも 10 秒続けて足りなければ音声だけにする", () => {
+  test("段 3 に移って 10 秒たっても足りないままなら音声だけにする", () => {
     const a = new RungAdapter();
     expect(
       first(a, 0, 60_000, { route: "live", current: 3, waiting: true }),
@@ -624,7 +886,7 @@ describe("音声だけ", () => {
 });
 
 /**
- * **放送に対する遅れの伸び** (`lag`)。溜まりが中継・カーネル・リバースプロキシに隠れると、サーバの `backlog` は 0 のまま。
+ * **放送に対する遅れの伸び** (`lag`)。バッファが中継・カーネル・リバースプロキシに隠れると、サーバの `backlog` は 0 のまま。
  * 手元で 2 Mbit/s に絞り 3 Mbit/s の段を流したとき、`backlog` は 0 のままで、2 Mbit/s のまま段 0 まで上がっていった
  */
 describe("放送に対する遅れの伸び", () => {
@@ -762,7 +1024,7 @@ describe("上げてみている間", () => {
 describe("サーバが切り替えなかったとき", () => {
   test("refused のあと 20 秒は同じ段をリクエストし直さない", () => {
     const a = new RungAdapter();
-    const short = { waiting: true, throughput: 5_000_000 };
+    const short = { waiting: true, ahead: 0, throughput: 5_000_000 };
     expect(first(a, 0, 10_000, short)).toEqual({
       at: GRACE,
       decision: { step: 1, reason: "slow" },
@@ -775,7 +1037,7 @@ describe("サーバが切り替えなかったとき", () => {
   });
 });
 
-/** **画面に出す文** (`stepLabel`・`adaptNote`)。ライブも観る画面も同じ文 */
+/** **画面に出す文** (`stepLabel`・`autoValue`・`adaptNote`)。ライブも観る画面も同じ文 */
 describe("画面に出す文", () => {
   test("自動の行の値は、段 0 は形式だけ、下げたら高さを添える、音声だけはそう出す", () => {
     expect(stepLabel(0, "MPEG-2")).toBe("MPEG-2");
@@ -784,6 +1046,13 @@ describe("画面に出す文", () => {
     // 応答を受ける前はコーデックが分からない
     expect(stepLabel(3, "")).toBe("360p");
     expect(stepLabel("audio", "H.264")).toBe("音声だけ");
+  });
+
+  test("「自動」の行は添えるものを括弧に入れ、添えるものが無ければ「自動」だけ", () => {
+    expect(autoValue(0, "MPEG-2")).toBe("自動 (MPEG-2)");
+    expect(autoValue(2, "H.264")).toBe("自動 (H.264 540p)");
+    expect(autoValue("audio", "")).toBe("自動 (音声だけ)");
+    expect(autoValue(0, "")).toBe("自動");
   });
 
   test("段を動かしたときは、理由と替えた先を書く", () => {
@@ -810,6 +1079,52 @@ describe("画面に出す文", () => {
     );
     expect(adaptNote({ step: 0, reason: "pinned" }, 0)).toBe(
       "回線が細いため、再生が止まります。コーデックを「自動」にすると、画質を下げて再生を続けます",
+    );
+  });
+});
+
+describe("端末のデコードが追いつかない (`behind`)", () => {
+  test("「自動」なら 1 段下げ、その段から上へはもう上げない", () => {
+    const adapter = new RungAdapter();
+    expect(
+      first(adapter, 0, 2 * GRACE, {
+        route: "live",
+        current: 1,
+        behind: true,
+      }),
+    ).toEqual({ at: GRACE, decision: { step: 2, reason: "decode" } });
+    // 下げたあとは回線が十分でも、追いつかなかった段 (1) へは戻さない
+    expect(
+      first(adapter, 2 * GRACE, 2 * GRACE + UP_WAIT_MOST + HOLD, {
+        route: "live",
+        current: 2,
+        capacity: ROOMY,
+      }),
+    ).toBeNull();
+  });
+
+  test("形式を手で選んでいるときは段を動かさない", () => {
+    const adapter = new RungAdapter();
+    expect(
+      first(adapter, 0, 60_000, {
+        route: "live",
+        current: 1,
+        manual: true,
+        behind: true,
+      }),
+    ).toBeNull();
+  });
+
+  test("いちばん軽い段からは下げない (音声だけにはしない)", () => {
+    const adapter = new RungAdapter();
+    expect(
+      first(adapter, 0, 60_000, { route: "live", current: 3, behind: true }),
+    ).toBeNull();
+  });
+
+  test("断り書きは追いつかない理由と下げた先", () => {
+    expect(adaptNote({ step: 2, reason: "decode" }, 1)).toBe(
+      "再生が追いつかないため、540p に下げました",
     );
   });
 });

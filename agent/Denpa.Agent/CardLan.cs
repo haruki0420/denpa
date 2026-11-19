@@ -60,14 +60,14 @@ public sealed record CardLanPolicy(int? Port, IReadOnlyList<IPNetwork> Networks,
     public static CardLanPolicy FromEnvironment() => Parse(Environment.GetEnvironmentVariable);
 
     /// <summary>
-    /// 環境変数から読む。**読めない値は既定に戻さずに断る。** 書き間違えた範囲を黙って
+    /// 環境変数から読む。**読めない値は既定に戻さずに断る。** 書き間違えた範囲をそのまま
     /// 広げたり狭めたりしない (起動時に理由を出して止まる)
     /// </summary>
     /// <exception cref="ArgumentException">値が読めない</exception>
     public static CardLanPolicy Parse(Func<string, string?> env)
     {
         int? port = null;
-        if (Given(env("CARD_SHARE_PORT")) is { } portText)
+        if (Config.Present(env("CARD_SHARE_PORT")) is { } portText)
         {
             if (!int.TryParse(portText, CultureInfo.InvariantCulture, out var value) || value is < 1 or > 65535)
             {
@@ -77,11 +77,11 @@ public sealed record CardLanPolicy(int? Port, IReadOnlyList<IPNetwork> Networks,
         }
 
         var networks = DefaultNetworks;
-        if (Given(env("CARD_SHARE_NETWORKS")) is { } networksText)
+        if (Config.Present(env("CARD_SHARE_NETWORKS")) is { } networksText)
         {
-            networks = [.. networksText.Split([',', ' ', '\t', '\n'], StringSplitOptions.RemoveEmptyEntries).Select(Network)];
+            networks = [.. networksText.Split([',', ' ', '\t', '\r', '\n'], StringSplitOptions.RemoveEmptyEntries).Select(Network)];
             if (networks.Count == 0) throw new ArgumentException("CARD_SHARE_NETWORKS に範囲が 1 つもありません");
-            // IPNetwork は struct なので、FirstOrDefault では「無い」が 0.0.0.0/0 になる。null にできる形で探す
+            // IPNetwork は struct なので、FirstOrDefault では「無い」が 0.0.0.0/0 になる。null にできる型で探す
             if (networks.Where(network => !Inside(network)).Cast<IPNetwork?>().FirstOrDefault() is { } outside)
             {
                 throw new ArgumentException(
@@ -91,7 +91,7 @@ public sealed record CardLanPolicy(int? Port, IReadOnlyList<IPNetwork> Networks,
         }
 
         var hops = DefaultHops;
-        if (Given(env("CARD_TTL")) is { } hopsText)
+        if (Config.Present(env("CARD_TTL")) is { } hopsText)
         {
             if (!int.TryParse(hopsText, CultureInfo.InvariantCulture, out hops) || hops is < 1 or > MaxHops)
             {
@@ -100,7 +100,7 @@ public sealed record CardLanPolicy(int? Port, IReadOnlyList<IPNetwork> Networks,
         }
 
         TimeSpan? maxRoundTrip = null;
-        if (Given(env("CARD_SHARE_MAX_RTT")) is { } rttText)
+        if (Config.Present(env("CARD_SHARE_MAX_RTT")) is { } rttText)
         {
             if (!double.TryParse(rttText, NumberStyles.Float, CultureInfo.InvariantCulture, out var ms) || ms < 0 || !double.IsFinite(ms))
             {
@@ -111,8 +111,6 @@ public sealed record CardLanPolicy(int? Port, IReadOnlyList<IPNetwork> Networks,
 
         return new CardLanPolicy(port, networks, hops, maxRoundTrip);
     }
-
-    private static string? Given(string? value) => string.IsNullOrWhiteSpace(value) ? null : value.Trim();
 
     /// <summary>
     /// 範囲がまるごと既定の範囲 (<see cref="DefaultNetworks"/>) のどれかに収まるか。同じ種類のアドレスで、
@@ -186,7 +184,7 @@ public sealed record CardLanPolicy(int? Port, IReadOnlyList<IPNetwork> Networks,
     }
 
     /// <summary>
-    /// 比べる形に揃える。**IPv4 射影アドレス (::ffff:192.168.1.2) は IPv4 として**見る。
+    /// 比べられるように揃える。**IPv4 射影アドレス (::ffff:192.168.1.2) は IPv4 として**見る。
     /// そのままだと IPv4 の範囲に入らず、IPv6 の範囲 (::/0 など) には入ってしまう。スコープ (%eth0) は外す
     /// </summary>
     public static IPAddress Plain(IPAddress address)
@@ -202,12 +200,12 @@ public sealed record CardLanPolicy(int? Port, IReadOnlyList<IPNetwork> Networks,
 /// <summary>断った理由。<paramref name="Rule"/> はどの決まりか (設定の名前)</summary>
 public sealed record CardRefusal(string Rule, string Message);
 
-/// <summary>鍵をやり取りするソケットの細工。TTL と往復時間</summary>
+/// <summary>鍵をやり取りするソケットに TTL を付け、往復時間を読む</summary>
 public static class CardLan
 {
     /// <summary>
     /// TTL (IPv6 は hop limit) を <paramref name="hops"/> にする。**効いたかを読み直して確かめ、
-    /// 効いていなければ投げる** (黙って遠くまで届くより、繋がらないほうがいい)。
+    /// 効いていなければ例外を送出する** (記録を残さずに遠くまで届くより、繋がらないほうがいい)。
     /// IPv6 のソケットで IPv4 の相手と繋がっている (IPv4 射影) なら、効くのは IPv4 の TTL なのでそちらも
     /// </summary>
     /// <exception cref="IOException">設定できない・読み直すと違う</exception>
@@ -303,7 +301,7 @@ public static class CardLan
     /// <summary>
     /// TCP の往復時間を **OS から**読む (カーネルが ACK から測っている平滑化した値)。
     /// 相手が遅らせて大きく見せることはできても、小さく見せることはできない。
-    /// 測れなければ null (まだ 1 回も測っていない・OS が教えない)
+    /// 測れなければ null (まだ 1 回も測っていない・OS が返さない)
     /// </summary>
     public static TimeSpan? RoundTrip(Socket socket)
     {
@@ -320,7 +318,7 @@ public static class CardLan
             }
             if (OperatingSystem.IsMacOS())
             {
-                // struct tcp_connection_info の tcpi_srtt (ms)。刻みが 1ms なので、0 は「1ms 未満」として扱う
+                // struct tcp_connection_info の tcpi_srtt (ms)。刻みが 1 ms なので、0 は「1 ms 未満」として扱う
                 // (受けた側も SYN-ACK への ACK から測るので、たいていは繋がった時点で測ってある)
                 var length = socket.GetRawSocketOption(IpProtoTcp, MacTcpConnectionInfo, info);
                 if (length < 48) return null;

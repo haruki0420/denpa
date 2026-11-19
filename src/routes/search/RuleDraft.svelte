@@ -11,9 +11,12 @@
     earlier: "前の回",
     "copy-never": "コピー禁止",
     declined: "取り消し済み",
+    simulcast: "本チャンネルと同じ番組",
+    undecodable: "復号できない局",
     airing: "放送中",
     ignore: "除外",
     service: "局",
+    videoless: "映像の無い局",
     genre: "ジャンル",
     time: "時間帯の外",
     weekday: "曜日の外",
@@ -30,14 +33,12 @@
   import { resolve } from "$app/paths";
   import { page } from "$app/state";
   import { untrack } from "svelte";
-  import X from "~icons/lucide/x";
 
   import { submitting } from "#lib/actions.js";
   import { GENRE_TREE } from "#lib/arib.js";
   import type { Arming } from "#lib/arming.svelte.js";
   import ActionButton from "#lib/components/ActionButton.svelte";
   import ArmedDelete from "#lib/components/ArmedDelete.svelte";
-  import Icon from "#lib/components/player/Icon.svelte";
   import { SERVICE_TYPE_LABEL, WEEKDAYS } from "#lib/format.js";
   import { clockOf, minutesOf, slotSummary } from "#lib/rule-time.js";
   import {
@@ -45,6 +46,7 @@
     SEARCH_FIELD_LABEL,
     SEARCH_FIELDS,
   } from "#lib/search.js";
+  import { ALL_CHANNEL_TYPES } from "#lib/types.js";
 
   import type { PageData } from "./$types";
   import type { Preview } from "./+page.server";
@@ -71,7 +73,7 @@
     draft: PageData["draft"];
     /** 探した言葉。直していないキーワードはこれに付いていく */
     q: string;
-    /** 結果の一覧に出している番組。行ごとの「録るか」を聞く */
+    /** 結果の一覧に出している番組。行ごとの「録るか」を問い合わせる */
     ids: number[];
     /** 画面の読み直し (予約・取消・保存のあと)。変わったら数え直す */
     refresh: unknown;
@@ -241,12 +243,11 @@
         (result.data as { preview: Preview | null } | undefined)?.preview ??
         null;
     } catch (error) {
-      // 黙って空にしない。もう 1 度変えれば送り直す
+      // 失敗を空の結果に見せない。もう 1 度変えれば送り直す
       preview = {
         total: 0,
         skipped: 0,
         programs: [],
-        conflicts: 0,
         verdicts: {},
         failed: String(error),
       };
@@ -312,12 +313,10 @@
   // ---- 局とジャンル ----
   /** 局は 50 以上あるので種別ごとにまとめる */
   const grouped = $derived(
-    ["GR", "BS", "CS", "SKY"]
-      .map((type) => ({
-        type,
-        services: draft.services.filter((s) => s.type === type),
-      }))
-      .filter((g) => g.services.length > 0),
+    ALL_CHANNEL_TYPES.map((type) => ({
+      type,
+      services: draft.services.filter((s) => s.type === type),
+    })).filter((g) => g.services.length > 0),
   );
   const serviceSummary = $derived.by(() => {
     if (serviceTypes.length + serviceIds.length === 0) return "全局";
@@ -331,6 +330,13 @@
   });
 </script>
 
+<!-- スマホの形で下から出しているときは、ほかの窓と同じく Esc でも閉じる (docs/design.md の「メニュー・ダイアログ・検索の候補」) -->
+<svelte:window
+  onkeydown={(event) => {
+    if (open && event.key === "Escape" && !event.defaultPrevented) open = false;
+  }}
+/>
+
 <aside
   class="draft"
   class:open
@@ -338,29 +344,17 @@
   data-testid="rule-draft"
 >
   <div class="draft-head">
-    <div>
-      {#if draft.editing !== null}
-        <p class="eyebrow small" data-testid="rule-mode">
-          <span class="muted">編集中:</span>
-          <span class="bold">{draft.editing.name}</span>
-          {#if !draft.editing.enabled}<span class="tag">無効</span>{/if}
-        </p>
-        <h2>ルールを直す</h2>
-      {:else}
-        <p class="eyebrow small muted">この検索を</p>
-        <h2>ルールとして保存</h2>
-      {/if}
-    </div>
-    <!-- スマホの形だけ。下から出した欄を閉じる -->
-    <button
-      type="button"
-      class="ghost close"
-      aria-label="閉じる"
-      onclick={() => (open = false)}
-      data-testid="rule-draft-close"
-    >
-      <Icon icon={X} size="size-4" />
-    </button>
+    {#if draft.editing !== null}
+      <p class="eyebrow small" data-testid="rule-mode">
+        <span class="muted">編集中:</span>
+        <span class="bold">{draft.editing.name}</span>
+        {#if !draft.editing.enabled}<span class="tag">無効</span>{/if}
+      </p>
+      <h2>ルールを直す</h2>
+    {:else}
+      <p class="eyebrow small muted">この検索を</p>
+      <h2>ルールとして保存</h2>
+    {/if}
   </div>
 
   {#if draft.origin !== null}
@@ -438,7 +432,7 @@
     <!--
       同じ回・前の回のスイッチ、局・ジャンル・時間帯と曜日 (条件)、優先度は枠の無い行に (サイドバーの行と同じ形)。
       名前は左、いまの値は右。**スイッチを条件より上に置く**。同じ回を最初の放送だけにすれば局を絞らずに済むので、
-      先に目に入るように。条件は畳んでおき、閉じていても右の要約で中身が分かる
+      先に目に入るように。条件はたたんでおき、閉じていても右の要約で中身が分かる
     -->
     <div class="rows side-list">
       <label class="row side-item">
@@ -525,7 +519,7 @@
           </div>
         </div>
       </details>
-      <!-- ジャンルは畳んでおく (シリーズ名で足りる)。データとしては残している -->
+      <!-- ジャンルはたたんでおく (シリーズ名で足りる)。データとしては残している -->
       <details class="row picker">
         <summary class="side-item" data-testid="genre-summary">
           <span>ジャンル</span>
@@ -565,7 +559,7 @@
           {/each}
         </div>
       </details>
-      <!-- 時間帯と曜日も畳んでおく。見るのは番組の始まる時刻 (日本時間)。決め方は `rule-time.ts` -->
+      <!-- 時間帯と曜日もたたんでおく。見るのは番組の始まる時刻 (日本時間)。決め方は `rule-time.ts` -->
       <details class="row picker">
         <summary class="side-item" data-testid="slot-summary">
           <span>時間帯と曜日</span>
@@ -667,7 +661,8 @@
         いまの番組表では、この条件で録る番組はありません
         (これから出てくる番組に当てます)
       {:else}
-        一覧では、録る番組は明るく、録らない番組は薄く出ます。条件を変えるとすぐ変わります
+        一覧の番組に「録る」「録らない」を出します
+        (録らない番組は薄い字)。条件を変えるとすぐ変わります
       {/if}
     </p>
     {#if saved !== null}
@@ -699,19 +694,31 @@
         />
       </div>
     {/if}
-    <button
-      type="submit"
-      form="rule-draft-form"
-      class="save"
-      disabled={empty || slotError !== null}
-      data-testid={draft.editing !== null ? "rule-update" : "rule-submit"}
-    >
-      {draft.editing !== null
-        ? "更新"
-        : recordable === null || recordable === 0
-          ? "ルールを保存"
-          : `${recordable} 件を録るルールを保存`}
-    </button>
+    <!--
+      スマホの形で下から出しているときは、ほかの窓と同じく左下に「閉じる」、主の保存は右端
+      (右上の ✕ は置かない。docs/design.md の「メニュー・ダイアログ・検索の候補」)
+    -->
+    <div class="foot-actions">
+      <button
+        type="button"
+        class="secondary close"
+        onclick={() => (open = false)}
+        data-testid="rule-draft-close">閉じる</button
+      >
+      <button
+        type="submit"
+        form="rule-draft-form"
+        class="save"
+        disabled={empty || slotError !== null}
+        data-testid={draft.editing !== null ? "rule-update" : "rule-submit"}
+      >
+        {draft.editing !== null
+          ? "更新"
+          : recordable === null || recordable === 0
+            ? "ルールを保存"
+            : `${recordable} 件を録るルールを保存`}
+      </button>
+    </div>
   </div>
 </aside>
 <!-- スマホの形で下から出しているときの後ろの幕。押すと閉じる -->
@@ -727,9 +734,9 @@
 
 <style>
   /*
-     * **広い形では右の列** (広い形とスマホの形は `#lib/phone-form.ts`。`<html data-phone>`)。画面の右端に付け、ヘッダーの下に貼り付けて、
-     * 結果の一覧を下ろしても書く欄と保存のボタンは見えたまま。一覧とは線でも地の色でも分けず、余白だけで分ける (ほかの画面のサイドバーと同じ)。スマホの形で下から出すときだけ `--dp-surface` で塗る
-     */
+   * **広い形では右の列** (広い形とスマホの形は `#lib/phone-form.ts`。`<html data-phone>`)。画面の右端に付け、ヘッダーの下に貼り付けて、
+   * 結果の一覧を下ろしても書く欄と保存のボタンは見えたまま。一覧とは線でも地の色でも分けず、余白だけで分ける (ほかの画面のサイドバーと同じ)。スマホの形で下から出すときだけ `--dp-surface` で塗る
+   */
   .draft {
     display: flex;
     flex-direction: column;
@@ -751,10 +758,10 @@
     display: none;
   }
   /*
-     * **スマホの形では下から出す** (`open`)。結果の一覧の上半分は見えたままなので、条件を変えると
-     * 行の「録る / 録らない」が変わるのも見える。下のタブより上に重ねる。
-     * 浮いている一枚なので、中の主のボタン (保存) は浮かせず太字だけ (`app.css` の「ボタン」。浮きの上に浮きを重ねない)
-     */
+   * **スマホの形では下から出す** (`open`)。結果の一覧の上半分は見えたままなので、条件を変えると
+   * 行の「録る / 録らない」が変わるのも見える。下のタブより上に重ねる。
+   * 浮いている一枚なので、中の主のボタン (保存) は浮かせず太字だけ (`app.css` の「ボタン」。浮きの上に浮きを重ねない)
+   */
   :global(:where(html[data-phone])) .draft {
     --dp-btn-solid: transparent;
     --dp-btn-solid-hover: var(--dp-btn-tonal-hover);
@@ -788,23 +795,12 @@
     border-radius: 0;
     background: var(--dp-backdrop);
   }
-  .draft-head {
-    display: flex;
-    align-items: flex-start;
-    justify-content: space-between;
-    gap: var(--dp-space-3);
-  }
   .draft-head h2 {
     margin: 0;
   }
   .eyebrow {
     margin: 0 0 0.125rem;
     overflow-wrap: anywhere;
-  }
-  .close {
-    width: auto;
-    margin: 0;
-    padding: var(--dp-space-1);
   }
   .draft-body {
     display: flex;
@@ -816,11 +812,11 @@
     margin: 0;
   }
   /*
-     * 同じ回・前の回・局・ジャンル・時間帯と曜日・優先度。枠の箱にも線にもせず、サイドバーの行 (`app.css` の `.side-item`) と同じ形。
-     * 行の塗りは左右に字の余白ぶんはみ出し、字の左端は上の欄の左端にそろえる
-     */
+   * 同じ回・前の回・局・ジャンル・時間帯と曜日・優先度。枠の箱にも線にもせず、サイドバーの行 (`app.css` の `.side-item`) と同じ形。
+   * 行の塗りは左右に字の余白ぶんはみ出し、字の左端は上の欄の左端にそろえる
+   */
   .rows {
-    margin-inline: -0.75rem;
+    margin-inline: calc(-1 * var(--dp-space-3));
     padding: 0;
   }
   .row {
@@ -846,7 +842,7 @@
   label.row select {
     width: auto;
     margin: 0;
-    padding-block: 0.25rem;
+    padding-block: var(--dp-space-1);
     border: 0;
     background-color: transparent;
     color: var(--dp-muted);
@@ -856,7 +852,7 @@
     display: flex;
     flex-direction: column;
     gap: var(--dp-space-2);
-    padding: var(--dp-space-1) 0.75rem var(--dp-space-3);
+    padding: var(--dp-space-1) var(--dp-space-3) var(--dp-space-3);
   }
   .group-title {
     font-size: var(--dp-text-xs);
@@ -872,7 +868,7 @@
     margin: 0.125rem 0;
   }
   .children {
-    margin-inline-start: 1.5rem;
+    margin-inline-start: var(--dp-space-5);
   }
   /* 時刻の欄は「19:00 から 20:00 まで」と 1 行に。狭い幅では「から」の後ろで折り返す */
   .times {
@@ -898,7 +894,7 @@
     width: auto;
     margin: 0;
   }
-  /* 保存は列の下に貼り付ける。条件が長くても探して降りずに済む */
+  /* 保存は列の下に貼り付ける。条件が長くても下までスクロールして探さずに済む */
   .draft-foot {
     position: sticky;
     bottom: 0;
@@ -913,11 +909,9 @@
     background: var(--dp-bg);
   }
   /*
-     * **数えている間 (`aria-busy`) も形を変えない。** Pico の `aria-busy` は 1 行の字にスピナーを付ける前提で、
-     * `white-space: nowrap` と `::before` のスピナーを足す。ここは字の段落とボタンを縦に並べた箱なので、
-     * 案内の字が 1 行に伸びて列の幅からはみ出し (列が横にスクロールできてしまう)、スピナーも 1 行ぶん場所を取る。
-     * 開いた直後の 1 回目の下見でも、数え終わるまでの一瞬だけ崩れて見えていた
-     */
+   * **数えている間 (`aria-busy`) も形を変えない。** Pico の `aria-busy` は 1 行の字に付ける前提で、
+   * `white-space: nowrap` と `::before` のスピナーを足す。この箱では案内の字が列の幅からはみ出し、スピナーも 1 行ぶん場所を取る
+   */
   .draft-foot[aria-busy="true"] {
     white-space: normal;
   }
@@ -932,8 +926,18 @@
     flex-wrap: wrap;
     gap: var(--dp-space-2);
   }
-  .save {
-    width: 100%;
+  /* 広い形 (右の列) は保存だけを列の幅いっぱいに。スマホの形は「閉じる」を左端、保存を右端に置き、全幅にしない */
+  .foot-actions {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--dp-space-2);
+  }
+  .foot-actions > button {
+    width: auto;
     margin: 0;
+  }
+  :global(:where(html:not([data-phone]))) .save {
+    flex: 1 1 0%;
   }
 </style>

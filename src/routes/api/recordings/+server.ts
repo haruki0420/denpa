@@ -7,9 +7,11 @@ import { logoUnusable } from "#lib/format.js";
 import { orm } from "#lib/server/db.js";
 import { encodedFiles } from "#lib/server/library.js";
 import { rulerOf } from "#lib/server/playback.js";
-import { recordings } from "#lib/server/schema.js";
+import { recordings, services } from "#lib/server/schema.js";
 import { displayTitle } from "#lib/server/title.js";
+import { recordedTransport, tsPathOf } from "#lib/source.js";
 import { fromTsTime } from "#lib/ts/watch.js";
+import { hasVideo } from "#lib/types.js";
 
 /**
  * **観られる録画の一覧** (画面の外のもの向けの API。docs/api.md)。新しい順。
@@ -49,8 +51,10 @@ export function GET({ url }) {
       cmNote: recordings.cm_note,
       audio_type: recordings.audio_type,
       audios: recordings.audios,
+      serviceType: services.service_type,
     })
     .from(recordings)
+    .leftJoin(services, eq(services.id, recordings.service_id))
     .where(
       and(
         ne(recordings.state, "deleted"),
@@ -82,25 +86,31 @@ export function GET({ url }) {
         hevc_path: row.hevc,
         alt_path: row.alt,
       });
-      const present = new Set(encoded.map((entry) => entry.path));
-      const files = (
-        [
-          ["encoded", row.library],
-          ["hevc", row.hevc],
-          ["alt", row.alt],
-          ["ts", row.ts],
-        ] as const
-      ).flatMap(([source, path]) =>
-        path === null || (path.endsWith(".mkv") && !present.has(path))
+      /*
+       * 元の TS は、エンコードしない録画なら置き場の TS (`tsPathOf`)。4K の局の元の録画 (`.mmts`。TLV) は
+       * アプリがそのまま読めないので並べない。観るのは `playback` の `auto` から
+       */
+      const ts = tsPathOf({ ts_path: row.ts, library_path: row.library });
+      const files = [
+        ...encoded.map(({ source, path }) => ({
+          source,
+          codec: encodedCodec(path),
+          url: file(source),
+        })),
+        ...(ts === null || recordedTransport(ts) === "tlv"
           ? []
           : [
               {
-                source,
-                codec: source === "ts" ? "mpeg2" : encodedCodec(path),
-                url: file(source),
+                source: "ts" as const,
+                // 映像の無い局 (ラジオ・データ放送) の録画は映像が無い。局が分からなければ今までどおり MPEG-2
+                codec:
+                  row.serviceType !== null && !hasVideo(row.serviceType)
+                    ? "none"
+                    : "mpeg2",
+                url: file("ts"),
               },
-            ],
-      );
+            ]),
+      ];
       return {
         id: row.id,
         title: displayTitle(row.name),
@@ -133,8 +143,8 @@ export function GET({ url }) {
         // 末尾まで観た時刻 (ms)。まだなら null。null かつ resumeMs も null なら未視聴 (画面の印と同じ)
         watchedAt: row.watchedAt,
         recording: row.state === "recording",
-        // 元の TS がある間 (録画中・エンコードする前) は追っかけで観られる
-        chase: row.ts === null ? null : `api/recordings/${row.id}/chase`,
+        // 元の TS がある間 (録画中・エンコードする前・「エンコードしない」録画) は追っかけで観られる
+        chase: ts === null ? null : `api/recordings/${row.id}/chase`,
         cmReliable: !logoUnusable(row.cmNote),
         poster: `api/recordings/${row.id}/poster`,
         files,

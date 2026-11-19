@@ -7,7 +7,7 @@
  * web-bml は MIT で、著作権表示と許諾の文は [LICENSE](../LICENSE) に置いてある。
  *
  * 載せるのは denpa が実際に作るものだけ (PMT・モジュール一覧・揃ったモジュール・
- * ストリーム記述子のイベント・番組の名乗り・放送の時刻)。web-bml が自前の
+ * ストリーム記述子のイベント・番組の情報・放送の時刻)。web-bml が自前の
  * TS 解析のために持っていた PCR・PES・BIT・映像の URL は作らないので持たない。
  */
 
@@ -77,6 +77,13 @@ export interface ModuleFile {
 export interface PMTMessage {
   type: "pmt";
   components: ComponentPMT[];
+  /**
+   * PMT にある音声 (stream_type 0x0f の AAC) の ES の部品タグを、PMT の順に並べたもの。**部品タグの無い ES は null で並ぶ**
+   * (bml.ts の `pmtAudios`)。`components` は部品タグの無い ES を落とすので、何本目の音声かはこちらで数える。
+   * 画面の再生 (pes.ts の `readPmt`) と ffmpeg の `0:a:<n>` も、部品タグに関係なく PMT の順に数える。
+   * これを足す前に録った `.bml.jsonl` の PMT には無い
+   */
+  audios?: (number | null)[];
 }
 
 export interface ModuleDownloadedMessage {
@@ -140,7 +147,7 @@ export interface ESEventUpdatedMessage {
   dataEventId: number;
 }
 
-/** 番組の名乗り。TS からではなく DB から組む (denpa の `server/live.ts`・`server/recorded-bml.ts`) */
+/** 番組の情報。TS からではなく DB から組む (denpa の `server/live.ts`・`server/recorded-bml.ts`) */
 export interface ProgramInfoMessage {
   type: "programInfo";
   originalNetworkId: number | null;

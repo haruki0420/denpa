@@ -22,6 +22,7 @@ import { join } from "node:path";
 import { RETURN_PATH } from "../niconico";
 import { config, userAgent } from "./config";
 import { now, orm } from "./db";
+import { pruneExpired } from "./expiring";
 import { randomToken } from "./oidc";
 import { niconicoLink } from "./schema";
 
@@ -55,15 +56,6 @@ function base64url(bytes: Uint8Array): string {
   return Buffer.from(bytes).toString("base64url");
 }
 
-function prune(at: number): void {
-  for (const [id, flow] of flows) if (flow.expiresAt <= at) flows.delete(id);
-  while (flows.size >= MAX_FLOWS) {
-    const oldest = flows.keys().next().value;
-    if (oldest === undefined) break;
-    flows.delete(oldest);
-  }
-}
-
 /**
  * 連携を始める。`origin` は画面を開いているオリジン (`http://192.168.1.20:3000`)。
  * 返す `flow` は Cookie に入れて、戻ってきたときに同じブラウザかを見る。`url` へ画面ごと移る
@@ -72,7 +64,7 @@ export async function startLink(
   origin: string,
   at = now(),
 ): Promise<{ flow: string; url: string }> {
-  prune(at);
+  pruneExpired(flows, (flow) => flow.expiresAt, at, MAX_FLOWS);
   const pair = (await crypto.subtle.generateKey(
     { name: "ECDH", namedCurve: "P-256" },
     false,
@@ -81,7 +73,7 @@ export async function startLink(
   const publicKey = new Uint8Array(
     await crypto.subtle.exportKey("raw", pair.publicKey),
   );
-  // hub は組み直した形 (スキーム・ホスト・既定でないポート・パス) を AAD に使うので、同じ形で渡す
+  // hub は組み直した URL (スキーム・ホスト・既定でないポート・パス) を AAD に使うので、同じ形式で渡す
   const returnUrl = `${new URL(origin).origin}${RETURN_PATH}`;
   const flow = randomToken();
   flows.set(flow, {
@@ -97,7 +89,7 @@ export async function startLink(
   return { flow, url: `${config.hubUrl}/niconico/authorize?${query}` };
 }
 
-/** hub の結果 (`base64url(使い捨ての公開鍵 65 ‖ nonce 12 ‖ 暗号文 ‖ tag 16)`) を開く。開けなければ投げる */
+/** hub の結果 (`base64url(使い捨ての公開鍵 65 ‖ nonce 12 ‖ 暗号文 ‖ tag 16)`) を開く。開けなければ例外を送出する */
 async function open(flow: Flow, sealed: string): Promise<Uint8Array> {
   const data = new Uint8Array(Buffer.from(sealed, "base64url"));
   if (data.length < 65 + 12 + 16) throw new Error("結果が短すぎます");
@@ -150,7 +142,7 @@ interface Tokens {
 
 /**
  * トークンの応答 (RFC 6749 5.1) を読む。hub は手を加えずに渡すので、読むものだけ読む。
- * `access_token` が無ければ投げる。期限が無い・数でないときは短めに見て、`warn` を呼ぶ
+ * `access_token` が無ければ例外を送出する。期限が無い・数でないときは短めに見て、`warn` を呼ぶ
  */
 export function readTokens(
   body: unknown,
@@ -224,7 +216,7 @@ export async function finishLink(
   try {
     tokens = readTokens(
       JSON.parse(new TextDecoder().decode(await open(flow, sealed))),
-      warn,
+      warnShape,
     );
   } catch {
     return { ok: false, message: FINISH_ERRORS.unreadable };
@@ -328,10 +320,11 @@ function markLost(linkedAt: number, reason: string): void {
   console.warn(`[niconico] 連携が切れました: ${reason}`);
 }
 
-let warnedShape = false;
-function warn(message: string): void {
-  if (warnedShape) return;
-  warnedShape = true;
+/** 応答の形式の警告。同じ警告は 1 度だけ出す (違う警告はそれぞれ 1 度ずつ) */
+const warned = new Set<string>();
+export function warnShape(message: string): void {
+  if (warned.has(message)) return;
+  warned.add(message);
   console.warn(`[niconico] ${message}`);
 }
 
@@ -340,7 +333,7 @@ let refreshing: Promise<string | null> | null = null;
 
 /**
  * **使えるアクセストークン。** 連携していない・切れたなら null。期限が `REFRESH_BEFORE` を切っていれば更新してから返す。
- * hub に届かないときは投げる (連携はそのまま。次に使うときにまた試す)
+ * hub に届かないときは例外を送出する (連携はそのまま。次に使うときにまた試す)
  */
 export async function accessToken(): Promise<string | null> {
   const link = row();
@@ -407,7 +400,7 @@ async function refresh(): Promise<string | null> {
       `トークンを更新できません (HTTP ${res.status}${typeof error === "string" ? ` ${error}` : ""})`,
     );
   }
-  const tokens = readTokens(body, warn);
+  const tokens = readTokens(body, warnShape);
   // 待っている間に外された・連携し直された。受けたものは捨てる (今の行を古いトークンで上書きしない)
   const still = row();
   if (still === undefined || still.linked_at !== link.linked_at) return null;
@@ -416,7 +409,7 @@ async function refresh(): Promise<string | null> {
     .update(niconicoLink)
     .set({
       access_token: seal(tokens.access, "access_token"),
-      // 新しいものが来なかったら前のものを使い続ける (来るのが決まりだが、形が変わっても止めない)
+      // 新しいものが来なかったら前のものを使い続ける (来るのが決まりだが、形式が変わっても止めない)
       ...(tokens.refresh === null
         ? {}
         : { refresh_token: seal(tokens.refresh, "refresh_token") }),
@@ -424,14 +417,14 @@ async function refresh(): Promise<string | null> {
     })
     .run();
   if (tokens.refresh === null)
-    warn(
+    warnShape(
       "更新の応答に新しい更新用のトークンがありません。ニコニコの応答の形式が変わったかもしれません",
     );
   return tokens.access;
 }
 
-/** 連携を外す。手元のトークンを消すだけ (ニコニコの側の許可は、ニコニコのアカウント設定から取り消す) */
+/** 連携を解除する。手元のトークンを消すだけ (ニコニコの側の許可は、ニコニコのアカウント設定から取り消す) */
 export function unlink(): void {
   orm().delete(niconicoLink).run();
-  console.log("[niconico] ニコニコのアカウントとの連携を外しました");
+  console.log("[niconico] ニコニコのアカウントとの連携を解除しました");
 }

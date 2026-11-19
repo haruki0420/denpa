@@ -52,7 +52,7 @@ export class Connection {
    * 時刻は受け側の物差し (エンコードの経路は mp4 の 0 起点、放送そのままの経路は放送の PTS)。運ぶのは
    * 字幕だけで、映像・データ放送・制御は 0 を渡す。字幕を映像と同じ物差しに乗せるため。
    *
-   * @param droppable 詰まっているときに捨ててよいか。fMP4 とライブの元の TS だけ true (追っかけの元の TS は捨てずに読むのを止める)
+   * @param droppable 詰まっているときに捨ててよいか。fMP4 の中身 (init は除く) とライブの元の TS だけ true (追っかけの元の TS は捨てずに読むのを止める)
    */
   send(
     kind: number,
@@ -72,14 +72,14 @@ export class Connection {
   }
 
   /**
-   * 溜まりが捨て始める量 (`BACKLOG_LIMIT`) を超えているか。捨てられないもの (追っかけの元の TS) は、
+   * バッファが捨て始める量 (`BACKLOG_LIMIT`) を超えているか。捨てられないもの (追っかけの元の TS) は、
    * これを見て読むほうを止める (live.ts の `openChase`)
    */
   get congested(): boolean {
     return this.backlog > BACKLOG_LIMIT;
   }
 
-  /** bun から渡されたものをデコードする。**JSON 以外は黙って捨てる** */
+  /** bun から渡されたものをデコードする。**JSON 以外は捨てる** */
   receive(message: string | Buffer): void {
     if (typeof message !== "string") return;
     try {
@@ -110,6 +110,14 @@ interface Route {
 }
 
 const routes = new Map<string, Route>();
+
+/** 開いている接続。止まる前に全部へ知らせる (`live.announceRestart`) */
+const opened = new Set<Connection>();
+
+/** 開いている接続の全部 */
+export function openConnections(): ReadonlySet<Connection> {
+  return opened;
+}
 
 /** このパスに来た接続を受け持つ。ライブ視聴が `/api/live/socket` で登録する */
 export function serve(pathname: string, route: Route): void {
@@ -147,13 +155,17 @@ const entry: LiveEntry = {
       }
       const connection = new Connection(ws);
       ws.data.connection = connection;
+      opened.add(connection);
       route.open(connection);
     },
     message(ws, message) {
       ws.data.connection?.receive(message);
     },
     close(ws) {
-      ws.data.connection?.finish();
+      const connection = ws.data.connection;
+      if (connection === null) return;
+      opened.delete(connection);
+      connection.finish();
     },
   },
 };

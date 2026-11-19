@@ -18,16 +18,18 @@ import {
   framer,
   level,
   type LogoModel,
-  logoSpans,
+  type LogoReading,
   makeTemplate,
   mergeModel,
   type Orientation,
+  readLogo,
   score,
   type Span,
   texture,
 } from "../ts/logo-detect";
 import type { ScanLogo } from "./cm-scan";
 import { config } from "./config";
+import { recordingInput } from "./recording-io";
 import { run } from "./stream";
 
 /**
@@ -158,8 +160,7 @@ async function learn(
       // キーフレームしかデコードしない。散らして見るだけなので全部は要らない
       "-skip_frame",
       "nokey",
-      "-i",
-      input,
+      ...recordingInput(input),
       "-an",
       "-sn",
       "-dn",
@@ -203,8 +204,8 @@ async function learn(
 /** 当てる段。CM 検出のデコードに枠を渡し、届いたコマに点を付ける */
 interface Tracker {
   scan: ScanLogo;
-  /** 届いたコマから区間を出す (コマ番号) */
-  spans(fps: number): Span[];
+  /** 届いたコマから区間と、区間の外で判断できなかった所を出す (コマ番号) */
+  read(fps: number): LogoReading;
   /** コマごとの点 */
   scores(): Float32Array;
   frames(): number;
@@ -234,8 +235,8 @@ function tracker(model: LogoModel, video: Video): Tracker | string {
           addFrame(grow, bytes, growAt, crop.width);
       },
     },
-    spans: (fps) =>
-      logoSpans(
+    read: (fps) =>
+      readLogo(
         {
           scores: Float32Array.from(scores),
           levels: Uint8Array.from(levels),
@@ -257,6 +258,8 @@ interface LogoResult {
   spans: Span[];
   /** コマごとの点 (同じ並び)。境目でロゴが替わったかを見る (`cm-decide`) */
   scores: Float32Array;
+  /** ロゴの区間の外で、後ろが見えずに判断できなかった所 (同じ並び。`logo-detect.readLogo`) */
+  blind: Span[];
   /**
    * この回に覚えて持ち帰ったもの (同じ映像の局へ配る合図。`logo-data.share`)。
    * `again` は覚えていたものが当たらず覚え直した (局がロゴを替えた) とき
@@ -264,12 +267,14 @@ interface LogoResult {
   learned: { file: string; again: boolean } | null;
   /** 覚え書き (落ちたときの理由 / 通ったときの要約) */
   note: string;
+  /** 当てた型の在り処と大きさ (`枠 x,y,幅,高さ、型 N 画素`)。落ちたときは空 */
+  model: string;
 }
 
 /**
  * ロゴの判定を始める。覚えていれば読み、無ければこの録画から覚える。
- * `scan()` を CM 検出のデコードに渡し、読み終えたら `finish` を呼ぶ。デコードをやり直すとき (エンコードの
- * 再エンコード) は `scan()` をもう一度呼ぶ。点は読むたびに一から数える
+ * `scan()` を CM 検出のデコードに渡し、読み終えたら `finish` を呼ぶ。デコードをやり直すとき (エンコードを
+ * 別の方式でやり直すとき) は `scan()` をもう一度呼ぶ。点は読むたびに一から数える
  */
 export async function openLogo(
   input: string,
@@ -310,17 +315,19 @@ export async function openLogo(
       const fail = (note: string, code = 1): LogoResult => ({
         code,
         spans: [],
+        blind: [],
         scores: new Float32Array(),
         learned: null,
         note,
+        model: "",
       });
       let current = first;
-      let spans = current.spans(fps);
+      let reading = current.read(fps);
       /** 覚えていたものが当たらず、この録画から覚え直した */
       let relearned = false;
       /** 覚えたものを持ち帰るか。前のロゴと違う所で覚えたなら、この回だけ使って持ち帰らない */
       let keep = true;
-      if (!learnedNow && spans.length === 0 && current.frames() > 0) {
+      if (!learnedNow && reading.spans.length === 0 && current.frames() > 0) {
         if (options.signal?.aborted === true)
           return fail("中止されました", 143);
         console.warn(
@@ -343,9 +350,9 @@ export async function openLogo(
         if (code !== 0)
           return fail(`コマを取り出せませんでした (code ${code})`, code);
         current = next;
-        spans = current.spans(fps);
+        reading = current.read(fps);
       }
-      if (spans.length === 0)
+      if (reading.spans.length === 0)
         return fail("ロゴの写っているコマがありませんでした");
 
       // 写っていたなら育てる。この回に覚えたものは、覚えるときに足したぶんで足りている
@@ -353,14 +360,21 @@ export async function openLogo(
         save(repo, learnedNow ? model : mergeModel(model, current.grow));
 
       const { rect } = model;
-      const lit = spans.reduce(
+      const lit = reading.spans.reduce(
         (sum, span) => sum + span.end - span.start + 1,
         0,
       );
       const share = Math.round((lit / Math.max(1, current.frames())) * 100);
+      const where = `枠 ${rect.x},${rect.y},${rect.width},${rect.height}、型 ${current.points} 画素`;
+      const how = learnedNow
+        ? keep
+          ? " (この録画で覚えた)"
+          : " (この録画だけで覚えた。前の型は残す)"
+        : "";
       return {
         code: 0,
-        spans,
+        spans: reading.spans,
+        blind: reading.blind,
         scores: current.scores(),
         learned:
           learnedNow && keep
@@ -369,7 +383,8 @@ export async function openLogo(
                 again: relearned,
               }
             : null,
-        note: `枠 ${rect.x},${rect.y},${rect.width},${rect.height} 型 ${current.points} 画素 / ロゴ ${share}%${learnedNow ? (keep ? " (この録画で覚えた)" : " (この録画だけで覚えた。前の型は残す)") : ""}`,
+        note: `${where} / ロゴ ${share}%${how}`,
+        model: `${where}${how}`,
       };
     },
   };

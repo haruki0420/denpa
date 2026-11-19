@@ -3,7 +3,7 @@
  * STD-B24 第二編 付属 2 の ECMAScript で使えるもの。
  *
  * - 文字の符号は EUC-JP (`charCodeAt` / `fromCharCode`。[euc.ts](euc.ts))
- * - Date は**日本の時刻**で年月日を返す (端末の時間帯に引きずられない)。引数無しの
+ * - Date は**日本の時刻**で年月日を返す (端末の時間帯によらない)。引数無しの
  *   `new Date()` は放送の時刻 (`now`)
  * - Math・eval・escape・小数は無い (web-bml も外している)
  */
@@ -177,8 +177,8 @@ export function createRealm(options: RealmOptions): Realm {
   method(realm.arrayProto, "shift", (self) => items(self).shift());
   method(realm.arrayProto, "unshift", (self, args) => {
     const list = items(self);
-    (self as JSArray).setLength(list.length + args.length);
-    list.splice(list.length - args.length, args.length);
+    if (list.length + args.length > MAX_ARRAY)
+      throw new ScriptError("配列が大きすぎます");
     list.unshift(...args);
     return list.length;
   });

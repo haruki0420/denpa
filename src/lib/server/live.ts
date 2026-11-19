@@ -10,8 +10,8 @@
  * ## 同じチャンネルは 1 本でエンコードする
  *
  * 2 人が同じチャンネルを見ても、チューナーも ffmpeg も 1 つで足りる。
- * **数えているのは見ている人の数**で、0 になったら畳む。エージェント側でも
- * 同じチャンネルは選局を共有するが、こちらで畳まないと ffmpeg が残り続ける。
+ * **数えているのは見ている人の数**で、0 になったら終える。エージェント側でも
+ * 同じチャンネルは選局を共有するが、こちらで終えないと ffmpeg が残り続ける。
  *
  * ## 途中から入ってきた人
  *
@@ -25,11 +25,15 @@ import {
   APPLICATION_TYPE_HTML5,
   CONTROL,
 } from "@danything/arib/ait";
+import { pmtAudios } from "@danything/arib/bml";
+import type { ResponseMessage } from "@danything/arib/bml-protocol";
 import {
   CAPTION_TEXT_VERSION,
   type CaptionLanguage,
 } from "@danything/arib/caption-text";
 import { PresentFollowing } from "@danything/arib/eit";
+import { MmtPresentFollowing } from "@danything/arib/mh-eit";
+import { MmtServiceFilter } from "@danything/arib/mmt-service-filter";
 import { PacketStream } from "@danything/arib/psi";
 import { ServiceFilter, StreamsWatch } from "@danything/arib/service-filter";
 import { and, eq, gt, lte } from "drizzle-orm";
@@ -38,11 +42,17 @@ import {
   type Audio,
   type AudioTrack,
   audioTracks,
+  broadcastTrack,
   parseAudios,
   pickTrack,
 } from "#lib/arib.js";
 import { LIGHT_NOTE } from "#lib/live-adapt.js";
-import { autoOrder } from "#lib/live-choice.js";
+import {
+  autoOrder,
+  type BroadcastCodec,
+  broadcastCodec,
+  type LiveFormat,
+} from "#lib/live-choice.js";
 import {
   type CaptionTrack,
   CHANNEL,
@@ -51,19 +61,30 @@ import {
   type LiveCodec,
   type Notice,
 } from "#lib/live.js";
+import type { Fmp4Segment } from "#lib/mp4/fmp4.js";
 import {
+  busyNote,
   ENCODE_SLOW,
   parseRung,
   type Rung,
   RUNG_AUDIO_KBPS,
   RUNG_SPECS,
 } from "#lib/rungs.js";
-import { BroadcastClock, parseStart } from "#lib/ts/clock.js";
+import { recordedTransport, tsPathOf } from "#lib/source.js";
+import { type Anchor, BroadcastClock, parseStart } from "#lib/ts/clock.js";
 import { Fmp4Splitter } from "#lib/ts/fmp4.js";
 import { KeyGate } from "#lib/ts/key-gate.js";
 import { MkvSplitter } from "#lib/ts/mkv.js";
-import { BUSY } from "#lib/ts/playback.js";
+import { BUSY, NO_FORMAT } from "#lib/ts/playback.js";
+import {
+  type ServiceVideo,
+  type Transport,
+  undecodableReason,
+} from "#lib/types.js";
 
+import { cardIdOf } from "./agent-cards";
+import { placesOfService, serviceChannel } from "./agent-channels";
+import type { Place } from "./agent-order";
 import {
   captionFeed,
   type CaptionOut,
@@ -71,7 +92,7 @@ import {
   type CaptionShown,
   CaptionText,
   NO_SUBTITLE,
-  peekCaptions,
+  peekPmt,
   PMT_WAIT,
   programSpec,
   rawCaptionArgs,
@@ -83,18 +104,21 @@ import {
   chasePlan,
   chaseReadHeld,
   type ChaseResume,
-  fileSize,
   followFile,
+  recordedSec,
   resumeFrom,
   resumePlan,
+  tlvStart,
   tsFileHead,
 } from "./chase";
 import { config } from "./config";
-import { DataBroadcast, type ResponseMessage } from "./databroadcast";
+import { scrambledLiveNotice } from "./contracts";
+import { AutoStartWatch, DataBroadcast } from "./databroadcast";
 import { orm } from "./db";
-import { deinterlace } from "./encoder";
+import { aribServiceId, deinterlace } from "./encoder";
 import { followOnAir } from "./epg";
 import { emit, type Yielded } from "./events";
+import { pruneExpired } from "./expiring";
 import {
   type HwDevice,
   hwEncode,
@@ -103,14 +127,33 @@ import {
   liveHwArgs,
   nvencBusy,
 } from "./hwenc";
+import { MmtLive, type MmtOut } from "./live-mmt";
 import { tunerOf, yieldedTo } from "./live-yield";
 import { PACE_CHECK, PaceMeter, SpeedMeter, VideoLength } from "./pace";
-import { programs, recordings, services } from "./schema";
+import { PmtWatch } from "./pmt-watch";
+import {
+  broadcastDecided,
+  learnBroadcast,
+  recordedBroadcast,
+  recordedMedia,
+} from "./recorded-broadcast";
+import { recordingSize } from "./recording-io";
+import { hasVideo, programs, recordings, services } from "./schema";
+import { LastingScramble, mediaPids } from "./scramble";
 import { settings } from "./settings";
 import { chunks, endInput, lines, sideOutput } from "./stream";
 import { holdTranscode, transcodeRoom } from "./transcode";
-import { getTuners, openWhenFree, type StreamUse } from "./tuner";
-import type { Connection } from "./ws";
+import {
+  openWhenFree,
+  pinGone,
+  type StreamUse,
+  TransportChangedError,
+  TuneError,
+  TunerBusyError,
+  tunersOf,
+} from "./tuner";
+import { HLG_TO_SDR, UHD_HEIGHT } from "./uhd";
+import { type Connection, openConnections } from "./ws";
 
 /**
  * セッションのエンコード方式。画面が選ぶのは LiveCodec だけで、`audio` は外から使う API
@@ -123,7 +166,7 @@ type StreamCodec = LiveCodec | "audio";
  *
  * どのエンコード方式でも共通なのはここ。それぞれの中身は `videoArgs` / `audioArgs`。
  *
- * - `-fflags nobuffer` は**付けない** (下の「入口の解析で読んだぶんを捨てさせない」)
+ * - `-fflags nobuffer` は**付けない** (下の「入力の解析で読んだぶんを捨てさせない」)
  * - `-probesize` … **開いてから映像が出るまでの待ちの、削れる部分。**
  *   渡す前に 1 局へ絞ってあるが、**字幕まで見つけさせる**ので 100KB 採る
  *   (下の「局を名指しで選ぶ」に実測)
@@ -131,7 +174,7 @@ type StreamCodec = LiveCodec | "audio";
  *   数秒溜めてから出すので、その場でライブでなくなる
  * - `-copyts` は**付けない**。付けると放送の絶対時刻が mp4 の muxer まで届き、
  *   あれが 0 に詰め直すので受け側から見た 0 の意味が分からなくなる。
- *   付けないと ffmpeg が入口で 1 回だけ 0 に寄せ、**その寄せが字幕の出口にも
+ *   付けないと ffmpeg が入力で 1 回だけ 0 に寄せ、**その寄せが字幕の出力にも
  *   同じだけ効く**。映像と字幕が同じ物差しに乗る (`captions.ts` に実測)
  *
  * ## コマごとに切らない
@@ -152,15 +195,15 @@ type StreamCodec = LiveCodec | "audio";
  *
  * 0.05 秒を採る。0.033 秒でも保つが、音声のコマ (21ms) に近すぎる。
  *
- * ## 入口の解析で読んだぶんを捨てさせない
+ * ## 入力の解析で読んだぶんを捨てさせない
  *
- * `-fflags nobuffer` を付けると、ffmpeg は入口の解析 (`-probesize`) の間に読んだパケットを
+ * `-fflags nobuffer` を付けると、ffmpeg は入力の解析 (`-probesize`) の間に読んだパケットを
  * 取っておかずに捨てる。**その間に放送の I フレームが来ていると、それも捨てて次の GOP
  * (約 0.5 秒先) を待つ。** 解析は 100KB 読むので、開いた位置によっては (調べたときは約 1 割の回)
  * 最初の映像が 0.45〜0.5 秒遅れていた。
  *
  * 合成の TS (1080i の MPEG-2・GOP 0.5 秒) を実時間で流し込み、最初の moof が出るまでを
- * 8 回ずつ測ったもの:
+ * 8 回ずつ測った。
  *
  *     I フレームが先頭から 40ms     付けると 781〜803ms   外すと 270〜291ms
  *     I フレームの位置がばらばら  どちらも約 300〜710ms (I フレームまでの距離 + 約 240ms)
@@ -172,24 +215,24 @@ type StreamCodec = LiveCodec | "audio";
  * ## `-flags low_delay` は付けない
  *
  * `-i` より前に書くと**エンコーダではなくデコーダに効く**。放送の MPEG-2 には
- * B フレームがあるので、この指定を受けたデコーダは表示順ではなく**復号順**で
+ * B フレームがあるので、この指定を受けたデコーダは表示順ではなく**デコード順**で
  * フレームを出す。結果、1 枚進んでは戻るように見える。
  *
  * 実測 (NHK総合の高校野球・本物の 60i): 隣り合うコマの差が交互に大小し、
  * その比は 2.17。外すと 1.11 に落ち、元の素材のフィールドを直に測った
- * 値 (1.02) に並ぶ。エンコーダ側の遅れは `-tune zerolatency` が見ている。
+ * 値 (1.02) に並ぶ。エンコーダ側の遅れは `-tune zerolatency` で抑える。
  *
  * **インタレ解除には録画と同じフィルタを使う** (`encoder.deinterlace`)。放送は 1080i
  * なので、デコードせずにブラウザへ渡すと動きのある場面が櫛状になる。録画と違って
  * コマ数は 60 から始める (下の `-vf` の説明)。
  *
- * ## 字幕も同じ ffmpeg から受ける。**出口を 2 つ持つ**
+ * ## 字幕も同じ ffmpeg から受ける。**出力を 2 つ持つ**
  *
  * 映像は `pipe:1` に fMP4、字幕は `pipe:3` に Matroska (デコードせずに写したもの。
  * [captions.ts](captions.ts) の `captionOutput`)。**時刻を揃えるにはこうするしか
  * なかった**。理由と実測は captions.ts の冒頭。引き換えに、字幕を選び直すと映像ごと起こし直しになる。
  *
- * **`-loglevel` は下げない。** 選べる字幕は入口の見出しから読み取っていて
+ * **`-loglevel` は下げない。** 選べる字幕は入力の見出しから読み取っていて
  * (`TrackList`)、あれは info で出る。騒がしいぶんは読む側で落とす (`watch`)。
  * 数字の進み具合だけは要らないので `-nostats` で止める。
  *
@@ -203,7 +246,7 @@ type StreamCodec = LiveCodec | "audio";
  * **名指しだけでは足りない。** ffmpeg はその局を `-probesize` のぶん読む間に
  * 見つけられなければ、**そのまま終了する**。実機の tvk (T15) は tvk1/2/3 +
  * ワンセグ + データで、局ごとに 14 本以上のストリームがあり、400KB では
- * 読み切れずに降りていた:
+ * 読み切れずに失敗して終了していた。
  *
  *     Failed to set value '0:p:24632:v:0' for option 'map': Invalid argument
  *
@@ -217,7 +260,7 @@ type StreamCodec = LiveCodec | "audio";
  * **渡す前に 1 局へ絞れば 20KB でも通る。** 録画と同じ `ServiceFilter` を通すだけで、
  * ffmpeg が受け取るのは局が 1 つだけの TS になる。局を探す仕事が消える。
  *
- * 映像だけをエンコードしていた頃は 20KB まで下げてあった。6 回ずつ測った差:
+ * 映像だけをエンコードしていた頃は 20KB まで下げてあった。6 回ずつ測った差は次のとおり。
  *
  *     100KB   最短 474ms  中央 839ms  (6/6 通る)
  *      20KB   最短 441ms  中央 752ms  (6/6 通る)
@@ -248,13 +291,18 @@ type StreamCodec = LiveCodec | "audio";
  * @param program 放送が名乗っている番号 (`NowPlaying.program`)。0 以下なら
  *   最初に見つけた映像
  * @param audio どの音声を、どちら側で出すか
- * @param caption 何本目の字幕を出すか。**null なら字幕の出口を付けない**。
- *   字幕を持たない放送で字幕を求めると ffmpeg は組み立ての時点で降りるので、
- *   そうと分かったらこちらで再エンコードする (`Session.run`)
+ * @param caption 何本目の字幕を出すか。**null なら字幕の出力を付けない**。
+ *   字幕を持たない放送で字幕を求めると ffmpeg は組み立ての時点で失敗して終了するので、
+ *   そうと分かったらこちらで再エンコードする (`Session.runEncode`)
  * @param hw GPU でエンコードするならその経路 (`hwenc.liveHw`)。null ならソフトウェア (`videoArgs`)
  * @param rung 回線に合わせて下げた段 (`#lib/rungs.ts`)。0 なら下げない
  * @param half エンコードが遅れたので 30 コマにするか (`videoArgs` の `half`。`Session` の `lighten`)
  * @param side 字幕を書き出す先 (`stream.sideOutput` の `url`)
+ * @param transport 伝送の形式。`tlv` (4K の局) の入力は denpa が詰め替えた fMP4 (`live-mmt.ts`) で、局は 1 つ、字幕は入っていない
+ *   (字幕は denpa が TTML から作る)。映像は縮めて SDR にする (`uhdVideoArgs`)
+ * @param video 放送の映像のコーデック (`#lib/live-choice.ts` の `BroadcastCodec`)。`hevc` の TS (TS に HEVC を入れて送る 4K の局) は、
+ *   `hevc` なら映像を写し (`HEVC_COPY`)、ほかのコーデックなら 4K の局と同じく縮めて SDR にする (`uhdVideoArgs`)
+ * @param silent 映像も音声も無い局 (データ放送だけの局) か (`Session.silent`)。true なら TS を読まずに無音を流す (`silentArgs`)
  */
 export function encodeArgs(
   program: number,
@@ -265,21 +313,34 @@ export function encodeArgs(
   rung: Rung = 0,
   half = false,
   side = "pipe:3",
+  transport: Transport = "ts",
+  video: BroadcastCodec = broadcastCodec(transport),
+  silent = false,
 ): string[] {
+  if (silent) return silentArgs(rung);
+  const uhd = transport === "tlv";
+  const copy = copiesVideo(transport, video, codec);
   const picture =
-    codec === "audio" ? null : videoArgs(codec, hw, true, rung, null, half);
-  const from = programSpec(program);
+    codec === "audio"
+      ? null
+      : copy
+        ? HEVC_COPY
+        : video === "hevc"
+          ? uhdVideoArgs(codec, hw, rung, half)
+          : videoArgs(codec, hw, true, rung, null, half);
+  // 4K の局の fMP4 には番組の番号が無い (局は 1 つだけ)
+  const from = uhd ? "0" : programSpec(program);
   return [
     "-hide_banner",
-    // 字幕の出口が名前付きパイプ (Windows) でも、あるかを確かめさせない (`stream.sideOutput`)
+    // 字幕の出力が名前付きパイプ (Windows) でも、あるかを確かめさせない (`stream.sideOutput`)
     "-y",
     // 数字の進み具合だけ止める。`-loglevel` は下げられない (上の説明)
     "-nostats",
     // `-fflags nobuffer` は付けない。解析の間に読んだ I フレームを捨てて次の GOP を待つ (上の説明)
-    // 1 局に絞ってあるが、字幕まで見つけさせるぶん要る (上の説明)
+    // 1 局に絞ってあるが、字幕まで見つけさせるぶん要る (上の説明)。映像を写すときは多く読む (`HEVC_COPY_PROBE`)
     "-probesize",
-    "100000",
-    // GPU デバイスを開く。復号から GPU なら `-hwaccel` もここ (入力より前でないと効かない)
+    copy ? HEVC_COPY_PROBE : "100000",
+    // GPU デバイスを開く。デコードから GPU なら `-hwaccel` もここ (入力より前でないと効かない)
     ...(picture?.input ?? []),
     "-i",
     "pipe:0",
@@ -290,17 +351,16 @@ export function encodeArgs(
            * インタレ解除 (上の説明)。**ライブは 60 コマから始める。** エンコードが遅れたとき (`half`) と
            * 段 1〜3 は 30 コマ (`videoArgs`)。録画は本編映像から実測して 30 に落とすことがあるが
            * (`encoder.measureSmoothMotion`)、ライブは映像が来る前に決めないといけない。60 に倒しておけば
-           * 動きは落ちない (アニメで無駄が出るだけ)
+           * 動きは落ちない (アニメで無駄が出るだけ)。映像を写すときはフィルタを付けない (ffmpeg は写す映像にフィルタを指定すると止まる)
            */
-          "-vf",
-          picture.filter,
+          ...(copy ? [] : ["-vf", picture.filter]),
           "-map",
           `${from}:v:0`,
           /*
-           * **コマ数の上限を言っておく。**
+           * **コマ数の上限を指定しておく。**
            *
-           * `-probesize` を大きくは取らないので、ffmpeg は入口でコマ数を読み切れず、
-           * 時間の刻み (90kHz) から**でたらめな値**を起こすことがある。x264 は黙って
+           * `-probesize` を大きくは取らないので、ffmpeg は入力でコマ数を読み切れず、
+           * 時間の刻み (90kHz) から**でたらめな値**を起こすことがある。x264 はそのまま
            * 受けるが、**SVT-AV1 はエラーにする**。
            *
            *     Svt[error]: Instance 1: The maximum allowed frame rate is 240 fps
@@ -313,34 +373,105 @@ export function encodeArgs(
            * まともな値のときは何も起きず、でたらめな値のときだけ抑える。
            *
            * 値はインタレ解除の出方そのままで、29.97 のインタレのフィールドを
-           * 起こすので 59.94
+           * 起こすので 59.94。映像を写すときはエンコーダが無いので付けない
            */
-          "-fpsmax",
-          "60000/1001",
+          ...(copy ? [] : ["-fpsmax", "60000/1001"]),
           ...picture.encoder,
         ]
       : []),
-    // 何本目の音声か。複数入っている放送では 0 が主とは限らない
+    // 何本目の音声か。複数入っている放送では 0 が主とは限らない。データ放送が選んだ音声 (`N:es`) は PMT を見ずに受けるので、
+    // 無い ES なら音声無しで続ける (`?`。番組が替わって ES が減った直後など。ffmpeg を落とさない)
     "-map",
-    `${from}:a:${audio.stream}`,
+    `${from}:a:${audio.stream}${broadcastTrack(audio.id) === undefined ? "" : "?"}`,
     ...panArgs(audio),
     ...audioArgs(codec, rung),
     "-f",
     "mp4",
     "-movflags",
-    "+empty_moov+default_base_moof",
+    // 映像を写すときは、moov を最初の映像のパケットを見てから書く (`HEVC_COPY_PROBE`)
+    copy
+      ? "+empty_moov+default_base_moof+delay_moov"
+      : "+empty_moov+default_base_moof",
     // 0.05 秒ぶんずつ。これ以上細かくすると音声の入らない塊が出る (上の説明)
     "-frag_duration",
     "50000",
     "-flush_packets",
     "1",
     "pipe:1",
-    // **2 つ目の出口。** 字幕をそのまま、映像と同じ物差しの時刻付きで出す
-    ...(caption === null || picture === null
+    // **2 つ目の出力。** 字幕をそのまま、映像と同じ物差しの時刻付きで出す
+    ...(caption === null || picture === null || uhd
       ? []
       : captionOutput(from, caption, side)),
   ];
 }
+
+/**
+ * **無音の音声を作る lavfi の入力** (`silentArgs`・観る画面の `playback.audioOnlyArgs`)。周波数 0 の `sine` は 0 だけを出す。
+ * `anullsrc` はイメージの ffmpeg に組んでいないので、組んである `sine` を使う (Dockerfile の `--enable-filter`)
+ */
+export const SILENCE = "sine=frequency=0:sample_rate=48000";
+
+/**
+ * **映像も音声も無い局 (データ放送だけの局) のライブの ffmpeg** (`encodeArgs` の `silent`)。TS は読まず、無音の AAC を実時間で
+ * (`-re`) 音声だけの fMP4 にする。画面は音声だけの局と同じく受け取り (黒い画面のまま)、データ放送は TS から denpa が分けて送る (`Session.tap`)。
+ * 無音の時刻は放送の時刻と結び付かないが、データ放送は時刻を合わせずに描く (docs/stream.md)
+ */
+function silentArgs(rung: Rung = 0): string[] {
+  return [
+    "-hide_banner",
+    "-y",
+    "-nostats",
+    "-re",
+    "-f",
+    "lavfi",
+    "-i",
+    SILENCE,
+    "-map",
+    "0:a",
+    ...audioArgs("audio", rung),
+    "-f",
+    "mp4",
+    "-movflags",
+    "+empty_moov+default_base_moof",
+    "-frag_duration",
+    "50000",
+    "-flush_packets",
+    "1",
+    "pipe:1",
+  ];
+}
+
+/**
+ * **ffmpeg で映像を写すか** (`encodeArgs`)。TS に HEVC を入れて送る 4K の局 (`video` が `hevc`) の `hevc` だけ。
+ * 4K の局 (`tlv`) の `hevc` も写すが、ffmpeg を通さずに denpa が詰め替える (`Session.runMmt`)
+ */
+export function copiesVideo(
+  transport: Transport,
+  video: BroadcastCodec,
+  codec: StreamCodec,
+): boolean {
+  return transport === "ts" && video === "hevc" && codec === "hevc";
+}
+
+/**
+ * **TS に HEVC を入れて送る 4K の局の `hevc`。映像はエンコードせずに写す** (docs/stream.md「TS で送る 4K の局」)。
+ * コンテナ内のタグは `hvc1` (Safari は `hev1` を受け取らない)。音声は AAC の LATM で、MSE は受け取らないので
+ * H.265 と同じ AAC にエンコードする (`audioArgs`)。GPU も、その場で変換する本数の枠も使わない
+ */
+const HEVC_COPY: { input: string[]; filter: string; encoder: string[] } = {
+  input: [],
+  filter: "",
+  encoder: ["-c:v", "copy", "-tag:v", "hvc1"],
+};
+
+/**
+ * 映像を写すときの `-probesize` (バイト)。ffmpeg の既定と同じ 5MB。
+ * 写すときは、mp4 のマルチプレクサが映像の大きさと VPS・SPS・PPS (`hvcC`) を読んでから書き始める必要がある。
+ * 4K の HEVC は 1 局で約 33Mbit/s あり、エンコードするときの 100KB では 30ms ぶんにも足りず、頭出しできるコマを見ないまま
+ * 読み終える (推定。実際の放送では測っていない)。5MB は 1 秒ぶんほどで、ffmpeg は映像の大きさが分かったところで読むのをやめる。
+ * 読み切れなかったときのために、moov は最初の映像のパケットを見てから書く (`delay_moov`)
+ */
+const HEVC_COPY_PROBE = "5000000";
 
 /** デュアルモノは片側だけを両耳へ。そのままだと左右から別の言語が同時に鳴る */
 export function panArgs(audio: AudioTrack): string[] {
@@ -375,11 +506,11 @@ function broadcastFilters(smooth: boolean): string[] {
  *     x264 veryfast   1 バイト目 729ms   エンコードできた尺 38.5 秒/41 秒
  *     AV1 preset 12   1 バイト目 1177ms  エンコードできた尺 39.1 秒/41 秒
  *
- * **確かなのは「落ちこぼれない」ことだけ** (エンコードできた尺が実時間に付いていっている)。
+ * **確かなのは「実時間から遅れない」ことだけ** (エンコードできた尺が実時間に付いていっている)。
  * 立ち上がりは 0.45 秒ぶん遅い。
  *
  * **量は中身次第で、まだ何とも言えない。** どちらも品質を指定してエンコードしている
- * (ビットレートを決めていない) ので、出てくる量は場面で動く。実測も揃わなかった:
+ * (ビットレートを決めていない) ので、出てくる量は場面で動く。実測も揃わなかった。
  *
  *     ある 40 秒   x264 3.3 Mbit/s   AV1 2.8 Mbit/s   ← AV1 が 15% 小さい
  *     別の 25 秒   x264 11.6 Mbit/s  AV1 11.4 Mbit/s  ← ほぼ同じ
@@ -387,7 +518,7 @@ function broadcastFilters(smooth: boolean): string[] {
  * 音声は Opus に替える (`audioArgs`)。
  *
  * `lookahead=0` が要る。SVT-AV1 は既定で先を読むぶん貯めるので、付けないと
- * その貯めがそのまま遅れになる。preset は 12。これより速い 13 はもう
+ * そのぶんの待ちがそのまま遅れになる。preset は 12。これより速い 13 はもう
  * 目に見えて粗く、遅い 10 は間に合わなくなる。
  *
  * **付けてもまだ溜め込む。** 電波が届いてから塊が出るまで H.264 の 0.24〜0.49 秒
@@ -400,25 +531,25 @@ function broadcastFilters(smooth: boolean): string[] {
  * 設定でそのコーデックのエンコーダに GPU を選んであれば、**録画と同じ GPU でエンコードする**
  * (`hwenc.liveHw`。低遅延の引数とインタレ解除まで GPU に寄せる話は `hwenc.liveHwArgs`)。
  * 非力な機材 (Celeron J4125) では x264 ultrafast で 2 本目から追いつかなくなるため (issue #417)。
- * GPU が映像を 1 つも出さずに降りたら、ソフトウェアで再エンコードする (`Session.run`)
+ * GPU が映像を 1 つも出さずに失敗したら、ソフトウェアで再エンコードする (`Session.runEncode`)
  *
  * ## H.265
  *
  * **GPU でだけエンコードする** (ソフトウェアのエンコーダを組んでいない。`#lib/hw.ts` の `SOFTWARE_CODECS`)。
- * GPU が無いのにリクエストされたら投げる。選局の指示を受けるところで H.264 に替えてあるので (`attend`)、ふつうは来ない。
- * 入れ物の中の名前は `hvc1` にする。ffmpeg の既定の `hev1` は Safari が受け取らない (`#lib/live.ts` の `codecsFor`)。
+ * GPU が無いのにリクエストされたら例外にする。選局の指示を受けるところで H.264 に替えてあるので (`attend`)、ふつうは来ない。
+ * コンテナ内のタグは `hvc1` にする。ffmpeg の既定の `hev1` は Safari が受け取らない (`#lib/live.ts` の `codecsFor`)。
  * 音声は H.264 と同じ AAC (`audioArgs`)
  *
  * ## 録画をその場で変換するときも同じエンコード方法
  *
  * `/api/recordings/<id>/stream` (`server/playback.ts`) もここを使う。元がエンコード済み
  * (インタレ解除が済んでいる) なら `interlaced` を false にする。インタレ解除を挟まず、
- * GPU も復号からは載せない (`full` は放送の MPEG-2 を GPU でデコードする経路)
+ * GPU もデコードからは載せない (`full` は放送の MPEG-2 を GPU でデコードする経路)
  *
  * ## 回線に合わせて下げた段
  *
  * `rung` が 1〜3 なら、段の表 (`#lib/rungs.ts`) の高さ・30 コマ以下・ビットレートの上限で変換する (`rungVideo`)。
- * 0 なら上のとおりで、今までと同じ引数になる
+ * 0 なら上のとおり
  *
  * ## エンコードが遅れたときの 30 コマ (`half`)
  *
@@ -440,7 +571,8 @@ export function videoArgs(
 ): { input: string[]; filter: string; encoder: string[] } {
   if (rung !== 0) return rungVideo(codec, hw, interlaced, rung, fps);
   const smooth = !(half && interlaced);
-  // キーフレームは 1 秒ごと。合流の待ちはキーフレームの間隔で決まる
+  // キーフレームは放送 (60 コマ。半分に間引けば 30 コマ) で 1 秒ごと。合流の待ちはキーフレームの間隔で決まる。
+  // エンコード済みの録画の変換 (`interlaced` が false) は元のコマ数に関係なく 60 コマごと
   const gop = smooth ? "60" : "30";
   if (hw !== null) {
     const gpu = liveHwArgs(
@@ -451,7 +583,7 @@ export function videoArgs(
     );
     return {
       input: gpu.input,
-      // 復号から GPU なら CPU のインタレ解除は挟まない (挟むとフレームを降ろすことになる)
+      // デコードから GPU なら CPU のインタレ解除は挟まない (挟むとフレームを GPU から CPU へ移すことになる)
       filter: (hw.full && interlaced
         ? gpu.filter
         : [...(interlaced ? broadcastFilters(smooth) : []), ...gpu.filter]
@@ -493,11 +625,11 @@ function softwareArgs(codec: Exclude<LiveCodec, "hevc">, gop = "60"): string[] {
    * **H.264 は量を捨てて速さを採る。** AV1 と役割を分けてあり、あちらが
    * 「小さく」、こちらが「速く」。
    *
-   * `ultrafast` は x264 がいちばん手を抜く設定。**画質は据え置き** (`-crf` を
+   * `ultrafast` は x264 がいちばん処理を省く設定。**画質は据え置き** (`-crf` を
    * 付けない = 既定の 23) なので、**出てくる映像は今までと同じ**で、量だけ増える。
    *
    * 実機で 6 回ずつ測ったもの。ばらつきは放送の GOP 待ち (0〜501ms) なので、
-   * **短いほうの 2 つ**を見る:
+   * **短いほうの 2 つ**を見る。
    *
    *     veryfast  既定      最短 438ms  2 番目 535ms   2.5 Mbit/s  ← 前
    *     ultrafast 既定      最短 386ms  2 番目 429ms   8.2 Mbit/s  ← これ
@@ -523,7 +655,7 @@ function softwareArgs(codec: Exclude<LiveCodec, "hevc">, gop = "60"): string[] {
    * **一度入れて、外して、戻して、また外した。** 「一瞬止まって遅延が増えて
    * いく」を流量の話だと見立てて入れたが、原因は受け側の貯め方だった
    * ([stream.md](../../../docs/stream.md#一瞬止まって遅延が増えていく))。そのあと実機で「映像だけ遅れる」が
-   * 出たので流量を疑って戻したが、そちらは**復号**の話で
+   * 出たので流量を疑って戻したが、そちらは**デコード**の話で
    * (`live-player.svelte.ts` の `unslip`)、やはり山とは関係が無かった。
    * **2 回とも、症状から流量を疑ったのが外れている**
    */
@@ -596,24 +728,82 @@ function rungVideo(
   }
   if (!softwareEncodes(codec, rung))
     throw new Error("段を下げた変換のソフトウェアは H.264 だけです");
+  return { input: [], filter: cpu.join(","), encoder: rungX264(bps, gop) };
+}
+
+/** 段を下げた変換のソフトウェアの H.264 (`rungVideo` の説明。上限つきの crf) */
+function rungX264(bps: number, gop: string[]): string[] {
+  return [
+    "-c:v",
+    "libx264",
+    "-preset",
+    "veryfast",
+    "-tune",
+    "zerolatency",
+    "-crf",
+    "23",
+    "-maxrate:v",
+    String(bps),
+    "-bufsize:v",
+    String(bps),
+    ...gop,
+  ];
+}
+
+/**
+ * **4K の局の映像** (`encodeArgs` の `video` が `hevc`)。入力は放送の HEVC (2160p・59.94 コマ・10 ビット・HLG) を詰め替えた fMP4 (`tlv`) か、
+ * HEVC が入った TS (TS で送る 4K の局)。
+ *
+ * - **TS で送る 4K の局も、MPEG-2 の局のインタレ解除と GPU のデコードを通さない。** 通していた頃は、VA-API の経路が
+ *   `Error reinitializing filters` で止まり、ソフトウェアに切り替わっていた (issue #2729。10 ビットのコマを `deinterlace_vaapi` と
+ *   8 ビットのエンコーダに渡していたためと見ている。推定)
+ * - **縮めてから SDR に直す** (`HLG_TO_SDR`)。段 0 は 1080p、段 1〜3 は段の高さ。色を直すのは縮めたあと (画素が 1/4 で済む)。
+ *   ライブは 8 ビットで出す決まり (`softwareArgs`・GPU) のまま
+ * - インタレ解除は要らない (プログレッシブ)。段 0 は 60 コマ、遅れたとき (`half`) と段 1〜3 は 29.97 コマに間引く
+ * - デコードは CPU。GPU でエンコードするときも、縮めて直したものを渡す (`liveHwArgs` の `full` を外す)。
+ *   HEVC 10 ビットの 4K を実時間でデコードできるかはサーバの CPU で決まり、遅れたら今の決まり (`lighten`) で軽くする
+ * - エンコーダは TS の局と同じ (段 0 はソフトウェアの x264 か SVT-AV1、段 1〜3 は上限つきの x264)。H.265 にはエンコードしない
+ *   (4K の局の `hevc` は詰め替えだけ。`#lib/live-choice.ts` の `BroadcastCodec`)
+ */
+export function uhdVideoArgs(
+  codec: LiveCodec,
+  hw: LiveHw | null,
+  rung: Rung,
+  half: boolean,
+): { input: string[]; filter: string; encoder: string[] } {
+  if (codec === "hevc")
+    throw new Error("4K の局の映像は H.265 にエンコードしません");
+  const spec = rung === 0 ? null : RUNG_SPECS[rung];
+  const smooth = spec === null && !half;
+  const gop = smooth ? "60" : "30";
+  const cpu = [
+    ...(smooth ? [] : ["fps=30000/1001"]),
+    `scale=-2:${spec?.height ?? UHD_HEIGHT}`,
+    ...HLG_TO_SDR,
+  ];
+  const cap =
+    spec === null ? null : { height: spec.height, bps: spec.videoKbps * 1000 };
+  if (hw !== null) {
+    const gpu = liveHwArgs({ ...hw, full: false }, codec, cap, !smooth);
+    return {
+      input: gpu.input,
+      filter: [...cpu, ...gpu.filter].join(","),
+      encoder: ["-c:v", ...gpu.encoder, "-g", gop],
+    };
+  }
+  if (cap !== null) {
+    if (!softwareEncodes(codec, rung))
+      throw new Error("段を下げた変換のソフトウェアは H.264 だけです");
+    return {
+      input: [],
+      filter: cpu.join(","),
+      encoder: rungX264(cap.bps, ["-g", gop]),
+    };
+  }
   return {
     input: [],
     filter: cpu.join(","),
-    encoder: [
-      "-c:v",
-      "libx264",
-      "-preset",
-      "veryfast",
-      "-tune",
-      "zerolatency",
-      "-crf",
-      "23",
-      "-maxrate:v",
-      String(bps),
-      "-bufsize:v",
-      String(bps),
-      ...gop,
-    ],
+    encoder: softwareArgs(codec, gop),
   };
 }
 
@@ -640,8 +830,47 @@ export function rungCodec(
 }
 
 /**
+ * **ライブで段を下げるときのコーデック** (選局の `attend`、HTTP の `viewing.askedFormat`)。MPEG-2 の局は放送 (インタレ) の `rungCodec`。
+ * 4K の局 (`broadcast` が `hevc`。TLV と、TS で送る局) は H.265 にエンコードしないので `playable` から外し (`uhdVideoArgs`)、
+ * プログレッシブとして選ぶ。端末が 4K の HEVC を再生できても、段を下げるなら AV1 か H.264 に移る
+ */
+export function liveRungCodec(
+  playable: readonly LiveCodec[],
+  broadcast: BroadcastCodec,
+  pick?: Parameters<typeof rungCodec>[2],
+): LiveCodec {
+  return broadcast === "hevc"
+    ? rungCodec(
+        playable.filter((codec) => codec !== "hevc"),
+        false,
+        pick,
+      )
+    : rungCodec(playable, true, pick);
+}
+
+/**
+ * **TS で送る 4K の局と PMT で分かったあとのコーデック** (`Session.runEncode`)。ライブの段を下げた H.265 だけを、4K の局として
+ * 段を下げるコーデックに選び直す (`liveRungCodec`)。4K の局の H.265 は放送の HEVC を写すもので、段を下げられない。
+ * `playable` が null (端末が送っていない) なら H.264。追っかけ (`live` が false) とほかの形式はそのまま
+ */
+export function hevcTsCodec(
+  codec: StreamCodec,
+  rung: Rung,
+  live: boolean,
+  playable: readonly LiveFormat[] | null,
+  pick?: Parameters<typeof rungCodec>[2],
+): StreamCodec {
+  if (!live || codec !== "hevc" || rung === 0) return codec;
+  return liveRungCodec(
+    (playable ?? []).filter((format): format is LiveCodec => format !== "raw"),
+    "hevc",
+    pick,
+  );
+}
+
+/**
  * 端末が再生できるコーデック (`tune`・`chase` の `playable`、HTTP の `?playable=`)。配列でも `,` 区切りでもよい。
- * 知らない値は捨てる。**省かれたら、リクエストされたコーデックと H.264** (H.264 はどの端末でも再生できる)
+ * ほかの値は捨てる。**省かれたら、リクエストされたコーデックと H.264** (H.264 はどの端末でも再生できる)
  */
 export function parsePlayable(value: unknown, codec: LiveCodec): LiveCodec[] {
   const listed = Array.isArray(value)
@@ -692,8 +921,8 @@ export function rungPlan(o: {
 
 /**
  * **このコーデックをソフトウェアでエンコードしてよいか。** H.264 はいつも、AV1 は段 0 だけ (SVT-AV1 は段を下げても重い)、
- * H.265 はいつも駄目 (ソフトウェアのエンコーダを組んでいない)。駄目なものは GPU が降りてもソフトウェアに降りず、
- * そこで止めて降りた方式を覚える (`Session.run`・`server/playback.ts` の `withFallback`)
+ * H.265 はいつも駄目 (ソフトウェアのエンコーダを組んでいない)。駄目なものは GPU が失敗してもソフトウェアに切り替えず、
+ * そこで止めて失敗した方式を覚える (`Session.runEncode`・`server/playback.ts` の `withFallback`)
  */
 export function softwareEncodes(codec: LiveCodec, rung: Rung): boolean {
   return codec === "h264" || (codec === "av1" && rung === 0);
@@ -727,7 +956,7 @@ export function audioArgs(codec: StreamCodec, rung: Rung = 0): string[] {
 /**
  * 「放送休止」と読める番組名。
  *
- * 番組表がそう言っている局は、**電波そのものを止めていることがある**。
+ * 番組表にそう書いてある局は、**電波そのものを止めていることがある**。
  * 実機の NHK総合 (T27) は保守の晩に停波していて、その間の選局は必ず
  * 同期しない。同じ NHK でも Eテレ (T26) は休止中も搬送波を出したままで、
  * 一度も同期に失敗していない (48 時間の記録)
@@ -737,7 +966,7 @@ const RESTING = /休止|停波|放送終了/;
 /**
  * いま放送休止なら、明ける時刻 (ms)。そうでなければ null。
  *
- * **番組表が言っていることしか見ない。** 電波の有無は測れないので、
+ * **番組表に書いてあることしか見ない。** 電波の有無は測れないので、
  * 使えなかったときの言い換えにだけ使う (`whyNotTuned`)
  */
 function resting(serviceId: number): number | null {
@@ -755,12 +984,12 @@ function resting(serviceId: number): number | null {
  * 使えなかったことを、**画面に出す言葉にする。**
  *
  * エージェントが返した理由 (「電波が来ていないか、その周波数に放送がありません」) は
- * 言い切りとしては正しいが、**アンテナや配線を疑う文面**になる。放送そのものが
+ * 言い切りとしては正しいが、**アンテナや配線を疑わせる文面**になる。放送そのものが
  * 止まっているだけのときは、そうと言えるほうがいい。denpa は番組表を持っていて、
  * エージェントは持っていないので、言い換えられるのはこちらだけ。
  *
  * **言い換えるのは「同期しなかった」ときだけ。** チューナーが塞がっていたときや
- * ffmpeg が降りたときに「放送休止です」と出すと、今度は誤った理由を出すことになる
+ * ffmpeg が失敗して終了したときに「放送休止です」と出すと、今度は誤った理由を出すことになる
  *
  * @param why エージェントから返ってきた理由
  * @param until 放送休止が明ける時刻 (ms)。休止でなければ null
@@ -768,7 +997,7 @@ function resting(serviceId: number): number | null {
 export function whyNotTuned(why: string, until: number | null): string {
   if (until === null || !why.includes("同期しませんでした"))
     return "選局できませんでした";
-  // コンテナの時計は Asia/Tokyo (`server/library.ts`)
+  // プロセスの TZ は Asia/Tokyo (`server/library.ts`)
   const clock = new Date(until).toLocaleTimeString("ja-JP", {
     hour: "2-digit",
     minute: "2-digit",
@@ -776,19 +1005,43 @@ export function whyNotTuned(why: string, until: number | null): string {
   return `いまは放送休止です (${clock} まで)`;
 }
 
+/**
+ * **名指し (デバッグ用。docs/agent.md「デバッグ用の名指し」) の選局を断られたときの文面。** ほかのチューナーに替えないので、
+ * エージェントの理由と、自動に戻す場所を出す。名指しのチューナーが一覧にもう無ければ、画面が自動に戻す (`unpin`)
+ *
+ * @param reason エージェントが返した理由。読めなければ `whyNotTuned` の文面
+ * @param gone 名指しのチューナーがエージェントの一覧に無い
+ */
+export function pinnedNotTuned(
+  pin: string,
+  reason: string,
+  gone: boolean,
+): string {
+  return gone
+    ? `ライブのチューナーに選んだ ${pin} が見つからないため、自動に戻しました`
+    : `ライブのチューナーに選んだ ${pin} で選局できませんでした。${reason}。設定の「その他」で「自動」に戻せます`;
+}
+
+/**
+ * **ライブの選局で、エージェントの答えを待つ上限 (ms)。** エージェントは TS が 30 秒届かなければ自分で選局を終えて理由を返す
+ * (`TunerPool.FirstTsWait`)。同期しなかったときに別のチューナーで選局し直すぶん (同期の待ちは機材によって 5〜15 秒) を足しても収まる長さ。
+ * エージェントが答えを返さないまま止まっても、画面を「読み込み中」のままにしない
+ */
+const LIVE_ANSWER_WAIT = 60_000;
+
 interface Viewer {
   /** 送り先。WebSocket の視聴者は Connection、HTTP の視聴者は映像か字幕だけを流すエンドポイント (`sessionStream`・`liveCaptions`) */
   connection: Pick<Connection, "send"> & Partial<Pick<Connection, "congested">>;
   /** init を渡したか。渡す前に中身を送っても MSE は捨てる */
   ready: boolean;
-  /** 送るのを止めてと言われているか (`{ type: 'hold' }`。追っかけを元の TS で受けているときだけ効く) */
+  /** 画面から送るのを止める指示を受けているか (`{ type: 'hold' }`。追っかけを元の TS で受けているときだけ効く) */
   held?: boolean;
   /** データ放送を出しているか。**求めた人にだけ配る** */
   wantsData: boolean;
   /**
    * **脇から字幕だけ受け取っている** (アプリ向けの字幕のエンドポイント。`liveCaptions`)。
-   * いても畳む判断には数えない。映像を観ている人がいなくなったら、字幕のためだけに
-   * チューナーを使い続けない。畳んだら `ended` を伝えて閉じさせる
+   * いてもセッションを終える判断には数えない。映像を観ている人がいなくなったら、字幕のためだけに
+   * チューナーを使い続けない。終えたら `ended` を伝えて閉じさせる
    */
   side?: boolean;
   /** 字幕の第何言語を出すか (1〜8)。省けば第 1 言語。**その人の選んだもの**で、局を変えても続く */
@@ -802,8 +1055,8 @@ interface Viewer {
 /**
  * 字幕を持っていないと分かった局。**同じ間違いを繰り返さないため。**
  *
- * 字幕を出させた ffmpeg は、その放送に字幕が無いと**組み立ての時点で降りる**。
- * 映像も出ない。1 回目は字幕なしで再エンコードして繋ぐが (`Session.run`)、覚えて
+ * 字幕を出させた ffmpeg は、その放送に字幕が無いと**組み立ての時点で失敗して終了する**。
+ * 映像も出ない。1 回目は字幕なしで再エンコードして繋ぐが (`Session.runEncode`)、覚えて
  * おかないと選局のたびに 2 回起こすことになる。
  *
  * **番組が変われば付くことがある**ので、しばらくしたら忘れる
@@ -822,7 +1075,7 @@ function remembered<K>(memo: Map<K, number>, key: K): boolean {
  * **エンコードが遅れたので軽くしたもの** (`Session` の `lighten`)。
  *
  * - `half` … 段 0 の放送を 30 コマにした (`videoArgs` の `half`)
- * - `gpu` … ソフトウェアから GPU に移した (GPU を 1 回試した。また降りてソフトウェアに戻っても、もう試さない)
+ * - `gpu` … ソフトウェアから GPU に移した (GPU を 1 回試した。また失敗してソフトウェアに戻っても、もう試さない)
  */
 export interface Light {
   half: boolean;
@@ -834,11 +1087,15 @@ type LightStep = keyof Light;
 export const LIGHT_LAG = 5_000;
 /** 軽くしたものを、作り直した次のセッションへ受け継ぐ期限 (ms)。画面がリクエストし直すまでの間 */
 const LIGHT_CARRY = 30_000;
-/** セッションの目印 (`key`) → 軽くしたもの。次のセッションが作られたら消す */
+/**
+ * セッションの目印 (`key`) → 軽くしたもの。次のセッションが作られたら消す。
+ * 受け取られないまま期限を過ぎたもの (作り直す前に観る人がいなくなった) は、次に預けるときに捨てる
+ */
 const lightened = new Map<string, { light: Light; at: number }>();
 
 /** 作り直す前のセッションが、軽くしたものを次のセッションへ預ける */
 export function keepLight(id: string, light: Light, now = Date.now()): void {
+  pruneExpired(lightened, (held) => held.at + LIGHT_CARRY, now);
   lightened.set(id, { light, at: now });
 }
 
@@ -852,7 +1109,7 @@ export function takeLight(id: string, now = Date.now()): Light | null {
 /**
  * **次に何を軽くするか。** 順に 60 コマ → 30 コマ (段 0 だけ。段 1〜3 はもう 30 コマ)、ソフトウェア → GPU (同じコーデックを
  * GPU でエンコードできるときだけ)。どれも済んでいれば null (断り書きだけ)。
- * 30 コマを先にするのは、コーデックとエンコーダを替えずに済み、GPU が降りる心配が無いため。
+ * 30 コマを先にするのは、コーデックとエンコーダを替えずに済み、GPU が失敗する心配が無いため。
  * `gpuReady` は GPU でエンコードできるか (`liveHwAvailable`。振り分けの順は進めない)。GPU に移せるときだけ呼ぶ
  */
 export function nextLight(o: {
@@ -926,7 +1183,7 @@ export class EncodeLag {
 /**
  * GPU でライブをエンコードできなかった経路と、その時刻。**しばらくはソフトウェアでエンコードする** (`pickLiveHw`)。
  *
- * 落ちる GPU は選局のたびに落ちるので、覚えておかないと毎回「GPU で起こして降りて
+ * 落ちる GPU は選局のたびに落ちるので、覚えておかないと毎回「GPU で起こして失敗して
  * 再エンコードする」ぶん待たせ、毎回断り書きを出すことになる。ドライバや素材が変われば
  * 通ることもあるので、字幕と同じくしばらくしたら忘れる
  */
@@ -934,28 +1191,67 @@ const gpuFailed = new Map<string, number>();
 /** GPU デバイスを使う順番。録画と同じく、セッションごとに先頭のデバイスを入れ替える (`hwenc.hwChain`) */
 let liveTurn = 0;
 
-/** GPU からソフトウェアに降りたときに画面へ出す一行 */
+/** GPU からソフトウェアに切り替えたときに画面へ出す一行 */
 const GPU_GAVE_UP =
   "GPU でエンコードできないため、ソフトウェアでエンコードしています";
-/** NVENC の同時に開ける数を超えて降りたとき (`hwenc.nvencBusy`)。覚えないので、次の選局はまた GPU から試す */
+/** NVENC の同時に開ける数を超えて失敗したとき (`hwenc.nvencBusy`)。覚えないので、次の選局はまた GPU から試す */
 const GPU_BUSY =
   "GPU が同時にエンコードできる数を超えたため、ソフトウェアでエンコードしています";
 
 /**
- * H.265 を GPU でエンコードできずに降りたときの文面。画面はこれを受けると H.265 を諦めて次の形式に替える
- * (`live-player.svelte.ts`。文面は見ず、H.265 をリクエストしていて降りたことで決める)
+ * H.265 を GPU でエンコードできずに失敗したときの文面。画面はこれを受けると H.265 をやめて次の形式に替える
+ * (`live-player.svelte.ts`。文面は見ず、H.265 をリクエストしていて失敗したことで決める)
  */
 const HEVC_GAVE_UP = "H.265 を GPU でエンコードできませんでした";
-/** 段を下げた AV1 を GPU でエンコードできずに降りたときの文面 (`Session.run`) */
+/** 段を下げた AV1 を GPU でエンコードできずに失敗したときの文面 (`Session.runEncode`) */
 const AV1_GAVE_UP = "AV1 を GPU でエンコードできませんでした";
 /**
- * 段を下げようとしたが、その場で変換する本数の枠 (`transcode.ts`) が埋まっていて下げられなかったときの断り書き (`attend`)。
- * 段は下げずに今のまま観られる
+ * 追っかけの段を下げた H.265 を、開いたあとで 4K の局の録画と分かって止めたときの文面 (`Session.runEncode`)。
+ * 画面は「。ほかの形式に切り替えました」を足して出し、H.265 を外してリクエストし直す
  */
-const RUNG_BUSY = "サーバが混んでいるため、画質を下げられませんでした";
+const UHD_RUNG_HEVC = "4K の録画は H.265 のまま画質を下げられません";
+
+/** 映像も音声も無い録画 (データ放送だけの局) の追っかけを断る文面 (`openChase`)。録り終えれば観る画面で観られる */
+const NO_MEDIA_CHASE =
+  "映像も音声も無い録画は追っかけ再生できません。録画が終わると観られます";
 /** H.265 をリクエストされたが出せないので H.264 にしたときの断り書き (`attend`) */
 const HEVC_TO_H264 =
   "H.265 を GPU でエンコードできないため、H.264 に切り替えました";
+
+/**
+ * **局の映像・音声・字幕がスクランブルされたまま届いていないかを、これだけのパケットずつ数えて決める** (`Session.tap`。`LastingScramble`)。
+ *
+ * カードが鍵を返さない局 (未契約) は、ずっとスクランブルされたまま届く。それを ffmpeg に渡すと、局の ES を読み取れずに
+ * `Failed to set value '0:p:201:s:0' for option 'map'` で失敗して終了する (BS10プレミアムをケーブルで受けたときに実機で出た)。
+ * 復号できる局でも、選局したての数百パケットはスクランブルされたまま届くことがあるので、先頭の 500 個だけでは決めない
+ * (本番の地上波で、無料の局を「契約されていない」として止めた)。500 個は BS の 1 局で 0.05 秒ほど
+ */
+const SCRAMBLE_PACKETS = 500;
+/**
+ * スクランブルされたまま届くのがこれだけ続いたら、スクランブルされたままと決める (ミリ秒)。エージェントは鍵を受け取れなかった ECM を
+ * 2 秒ほど流れてから問い合わせ直す (`Descrambler.RetryPackets`) ので、それより長くする。未契約の局は、たいてい ffmpeg がこれより先に失敗して終了し、
+ * そこで決まる (`SCRAMBLE_LEAST`)。ffmpeg を通さない放送のままの経路では、未契約の局を止めるまでにこの長さがかかる
+ */
+const SCRAMBLE_LASTING_MS = 3000;
+/** ffmpeg が決まる前に終了したら、いちばん新しく数えたぶんがここまであれば決める (契約の復号テストと同じ 50 個) */
+const SCRAMBLE_LEAST = 50;
+
+/** ffmpeg が局の映像・音声を指定できなかったときの行 (`Failed to set value '0:p:1032:v:0' for option 'map'`) */
+const MAP_FAILED = /Failed to set value '[^']*:([va]):\d+\??' for option 'map'/;
+
+/**
+ * **ffmpeg が局の映像か音声を見つけられずに失敗した行か。** 見つけられなかったほうを返す。字幕 (`:s:`) は
+ * 字幕なしで起こし直すので、ここでは見ない (`NO_SUBTITLE`)
+ */
+export function missingMedia(line: string): "映像" | "音声" | null {
+  const kind = MAP_FAILED.exec(line)?.[1];
+  return kind === "v" ? "映像" : kind === "a" ? "音声" : null;
+}
+
+/** `missingMedia` のときに画面へ出す文 */
+export function missingMediaMessage(kind: "映像" | "音声"): string {
+  return `この局の放送から${kind}を見つけられなかったため、映像を出せませんでした`;
+}
 
 function hwKey(codec: StreamCodec, hw: LiveHw): string {
   return `${codec}:${hw.way.device}:${hw.way.kind}:${hw.full}`;
@@ -965,7 +1261,7 @@ function hwKey(codec: StreamCodec, hw: LiveHw): string {
  * このセッションを GPU でエンコードするか。ライブの印 (`liveHwAllow`。録画の `hwAllow` は見ない) と
  * 試しのエンコード (`hwenc.liveHw`)、最近落ちたか。
  * 追っかけと録画のその場の変換 (`server/playback.ts`) も使う。元がエンコード済みなら `interlaced` を false
- * (復号からは GPU に載せない。`videoArgs`)。`devices` は試験で差し替えるときだけ渡す
+ * (デコードからは GPU に載せない。`videoArgs`)。`devices` はテストで差し替えるときだけ渡す
  */
 export function pickLiveHw(
   codec: LiveCodec,
@@ -982,6 +1278,28 @@ export function pickLiveHw(
  */
 export function liveHevc(devices: HwDevice[] = hwEncode().devices): boolean {
   return liveHwAvailable("hevc", true, devices) !== null;
+}
+
+/**
+ * ソフトウェアでもライブに間に合うコーデック。**H.264 (x264) だけ。** SVT-AV1 は小さな CPU では
+ * 1080i のライブに追いつかないので数えない (「自動」が AV1 を選ぶのは今までどおり。`autoCodec`)
+ */
+const REALTIME_SOFTWARE: LiveCodec = "h264";
+
+/**
+ * **ライブでその場でエンコードできるコーデック。** エンコード済みの順 (`autoOrder("encoded")`。AV1 → H.265 → H.264) のうち、
+ * ライブの印 (`liveHwAllow`) で GPU に載って最近落ちていないもの (`liveHevc` と同じ決め方) と、ソフトウェアの H.264。
+ * 先頭がコーデックのメニューに並ぶ候補 (`#lib/live-choice.ts` の `shownCodec`・`hiddenCodecs`。`viewing.viewingOptions` が渡す)。
+ * 順番 (`liveTurn`) は進めない。`devices` はテストで差し替えるときだけ渡す
+ */
+export function liveRealtime(
+  devices: HwDevice[] = hwEncode().devices,
+): LiveCodec[] {
+  return autoOrder("encoded").filter(
+    (codec) =>
+      codec === REALTIME_SOFTWARE ||
+      liveHwAvailable(codec, true, devices) !== null,
+  );
 }
 
 /**
@@ -1017,8 +1335,8 @@ export function liveHwFailed(codec: StreamCodec, hw: LiveHw): boolean {
 /**
  * GPU でエンコードできなかった経路を覚える。しばらくは `pickLiveHw` がソフトウェアを返す。
  *
- * **同時に開ける数を超えて降りただけ (`busy`。`hwenc.nvencBusy`) なら覚えない。** GPU は壊れておらず、
- * 空けば通る。覚えると、ほかの選局まで 15 分ソフトウェアになる。降りた 1 本だけがソフトウェアで続く。
+ * **同時に開ける数を超えて失敗しただけ (`busy`。`hwenc.nvencBusy`) なら覚えない。** GPU は壊れておらず、
+ * 空けば通る。覚えると、ほかの選局まで 15 分ソフトウェアになる。失敗した 1 本だけがソフトウェアで続く。
  * 覚えたら true
  */
 export function blameLiveHw(
@@ -1077,7 +1395,7 @@ function captionsNotice(
 }
 
 /**
- * 字幕だけを写す ffmpeg を起こす (`rawCaptionArgs`)。字幕は 4 本目の出口 (`stream.sideOutput`) に出て、`pipe` で受ける。
+ * 字幕だけを写す ffmpeg を起こす (`rawCaptionArgs`)。字幕は 4 本目の出力 (`stream.sideOutput`) に出て、`pipe` で受ける。
  * 標準出力には何も出さないはずだが、**汲まずに放っておくと詰まったときに止まる**ので読み捨てる
  */
 function spawnCaptioner(
@@ -1100,6 +1418,7 @@ function spawnCaptioner(
 
 /**
  * **開くまでの内訳** (セッションを作ってからのミリ秒)。最初の fMP4 が出たときに 1 行残す (`openingLine`)。
+ * 放送のままの経路は、最初の TS を画面へ送ったときに残す (`rawOpeningLine`)。
  * エージェントの「送り出し」の行と合わせると、選局からブラウザに渡すまでを本番の記録で割れる
  * (docs/stream.md「開いてから映像が出るまでの内訳」)
  */
@@ -1114,7 +1433,17 @@ type Opening = {
   init?: number;
   /** その ffmpeg が最初の moof+mdat を出した */
   media?: number;
+  /** 放送のままの経路で、局に絞った TS を最初に画面へ送った (`runRaw`) */
+  sent?: number;
 };
+
+/** `Opening` の時刻を 1 項目にする。まだ来ていないものは `-` */
+const openingMs = (ms: number | undefined) =>
+  ms === undefined ? "-" : `${Math.round(ms)}ms`;
+
+/** 開くまでの内訳の 1 行の、どの経路でも同じ前半 (選局と最初のバイト) */
+const openingHead = (label: string, marks: Opening) =>
+  `[live] ${label}: 開くまで 選局 ${openingMs(marks.tuned)} / 最初のバイト ${openingMs(marks.firstByte)} / `;
 
 /** 開くまでの内訳の 1 行。`way` はエンコード方式 (`h264` / `hevc` / `av1` / `audio`、GPU ならその種類) */
 export function openingLine(
@@ -1122,12 +1451,50 @@ export function openingLine(
   marks: Opening,
   way: string,
 ): string {
-  const at = (ms: number | undefined) =>
-    ms === undefined ? "-" : `${Math.round(ms)}ms`;
   return (
-    `[live] ${label}: 開くまで 選局 ${at(marks.tuned)} / 最初のバイト ${at(marks.firstByte)} / ` +
-    `ffmpeg ${at(marks.spawned)} / init ${at(marks.init)} / 最初の fMP4 ${at(marks.media)} (${way})`
+    openingHead(label, marks) +
+    `ffmpeg ${openingMs(marks.spawned)} / init ${openingMs(marks.init)} / 最初の fMP4 ${openingMs(marks.media)} (${way})`
   );
+}
+
+/** 放送のままの経路の、開くまでの内訳の 1 行 (ffmpeg を起こさないので、映像の項目は最初の送信だけ) */
+export function rawOpeningLine(label: string, marks: Opening): string {
+  return `${openingHead(label, marks)}最初の送信 ${openingMs(marks.sent)} (放送のまま)`;
+}
+
+/**
+ * **選局したエージェントのカードの番号を覚えて、観ている人に知らせる** (`Notice` の `card`。`Session.learnCard`)。
+ * データ放送の `getIRDID` に渡すもの。待たずに選局を進め、分かったら知らせる
+ */
+export class CardNumber {
+  /** いまのエージェントが復号に使うカードの番号。分からなければ null */
+  id: string | null = null;
+
+  constructor(
+    /** エージェントにカードの番号を問い合わせる (`cardIdOf`) */
+    private readonly lookup: (agent: number) => Promise<string | null>,
+    /** 双方向がオンか (`settings().bmlNetwork`) */
+    private readonly network: () => boolean,
+    /** いま選局しているエージェント (`Session.agent`) */
+    private readonly current: () => number | null,
+    private readonly tell: (id: string) => void,
+  ) {}
+
+  /** エージェント `agent` で選局した。返す Promise は、応答を受けて知らせるか捨てるかを決めたところで解決する */
+  learn(agent: number): Promise<void> {
+    // 別のエージェントで選局し直したら、前のカードの番号は渡さない (取れなければ渡さないまま)
+    this.id = null;
+    // 双方向がオフなら知らせない。データ放送に渡すのは双方向がオンのときだけ (`DataBroadcast.svelte` の `cardId`)
+    if (!this.network()) return Promise.resolve();
+    return this.lookup(agent)
+      .then((id) => {
+        // 応答を待つ間に別のエージェントで選局し直していたら、古いほうは捨てる
+        if (id === null || this.current() !== agent || id === this.id) return;
+        this.id = id;
+        this.tell(id);
+      })
+      .catch(() => undefined);
+  }
 }
 
 class Session {
@@ -1140,29 +1507,44 @@ class Session {
    * ので、ここより手前で溜めると、そのぶん遅れて見える
    */
   private readonly clock = new BroadcastClock();
-  /** 絞ったあとを 188 バイトに切るもの。データ放送・時計・Hybridcast・EIT[p/f] で分け合う (`tap`) */
+  /**
+   * 4K の局の時計 (`clockNotice`)。`pcr` は詰め替えた fMP4 の時刻 (秒)、`unixMs` は放送がそのコマを出す時刻 (MPU の提示時刻。NTP)。
+   * ffmpeg に渡すときも同じ fMP4 なので、`start:` を引けばエンコードしたものの物差しになる
+   */
+  private mmtAnchor: Anchor | null = null;
+  /** 絞ったあとを 188 バイトに切るもの。データ放送・時計・Hybridcast・EIT[p/f]・自動起動の指定・PMT の音声・スクランブルの判定で分け合う (`tap`) */
   private readonly packets = new PacketStream();
-  /** ffmpeg が入口で 0 に寄せたぶん (秒)。`start:` から読み取る */
+  /**
+   * 入口の部品に自動起動の指定があるか (`tap`。ライブだけ)。PMT だけ読み、決まったときと変わったときに `autoStart` で知らせる。
+   * 途中から入ってきた人には `add` で渡す
+   */
+  private autoStart: AutoStartWatch | null = null;
+  /**
+   * PMT の音声の ES の部品タグ (`tap`。ライブだけ)。**選べる音声の並びと本数はこれで決める** (`arib.audioTracks` の `pmt`)。
+   * 番組表には載っていない副音声の ES が、PMT にだけあることがある。読むまでは null
+   */
+  private audioWatch: PmtAudioWatch | null = null;
+  /** ffmpeg が入力で 0 に寄せたぶん (秒)。`start:` から読み取る */
   private startPts = Number.NaN;
   /** 最後に時計を配った時刻 (`tellClock`) */
   private toldClockAt = 0;
   /**
    * いまの ffmpeg が映像の中身 (init の次の塊) を 1 つでも出したか。
-   * **GPU から降りてよいのは出す前だけ** (`run`)。出したあとで落ちたのは GPU のせいとは限らない
+   * **GPU からソフトウェアに切り替えてよいのは出す前だけ** (`runEncode`)。出したあとで落ちたのは GPU のせいとは限らない
    */
   private produced = false;
   /**
-   * GPU からソフトウェアに降りたときの断り書き。**途中から入ってきた人にも渡す** (`add`)
+   * GPU からソフトウェアに切り替えたときの断り書き。**途中から入ってきた人にも渡す** (`add`)
    */
   private note: Notice | null = null;
   /**
-   * ソフトウェアで再エンコードしている GPU の経路と、同時に開ける数を超えて降りたか (`busy`)。
+   * ソフトウェアで再エンコードしている GPU の経路と、同時に開ける数を超えて失敗したか (`busy`)。
    * **ソフトウェアで映像が出たら** GPU のせいだったと決めて覚え、断り書きを出す (`blameGpu`)
    */
   private blame: { hw: LiveHw; busy: boolean } | null = null;
-  /** いまの ffmpeg が、NVENC の同時に開ける数を超えたと言ったか (`hwenc.nvencBusy`) */
+  /** いまの ffmpeg が、NVENC の同時に開ける数を超えたと出力したか (`hwenc.nvencBusy`) */
   private busy = false;
-  /** 選べる字幕 (ffmpeg の入口の見出しから)。放送そのままの経路で字幕の ffmpeg を起こし直したら作り直す (`captions`) */
+  /** 選べる字幕 (ffmpeg の入力の見出しから)。放送そのままの経路で字幕の ffmpeg を起こし直したら作り直す (`captions`) */
   private list: TrackList;
   private readonly aborter = new AbortController();
   private proc: ReturnType<typeof Bun.spawn> | null = null;
@@ -1177,10 +1559,22 @@ class Session {
   private readonly showing = new Map<number, CaptionShown>();
   /** いまの字幕のストリームに載っている言語 (`CaptionText.languages`)。届くまでは空 */
   private languages: CaptionLanguage[] = [];
-  /** 字幕が無いと言われたか。言われたら字幕なしで再エンコードする */
+  /** ffmpeg が字幕が無いと出力したか (`NO_SUBTITLE`)。出力したら字幕なしで再エンコードする */
   private noSubtitle = false;
+  /** いまの ffmpeg が、局の映像か音声を見つけられずに失敗したか (`missingMedia`) */
+  private noMedia: "映像" | "音声" | null = null;
+  /** 局の映像・音声・字幕がスクランブルされたまま届いていないかを数える (`tap`。ライブだけ)。決めたら null */
+  private scramble: LastingScramble | null = new LastingScramble(
+    SCRAMBLE_PACKETS,
+    SCRAMBLE_LASTING_MS,
+  );
   /**
-   * データ放送をデコードする側。**求められてから作り、誰も出していなければ畳む**
+   * スクランブルされたまま届いたので、理由を伝えて終えている最中 (`endScrambled`)。
+   * そのあいだに ffmpeg が終了しても、ほかの理由 (`died`) は伝えない
+   */
+  private ending: Promise<void> | null = null;
+  /**
+   * データ放送をデコードする側。**求められてから作り、誰も出していなければ破棄する**
    * (理由と引き換えは databroadcast.ts の冒頭)
    */
   private data: DataBroadcast | null = null;
@@ -1194,13 +1588,15 @@ class Session {
    */
   private ait: AitReader | null = null;
   /**
-   * 放送が言う「いま」と「次」(EIT[p/f]) を読む側 (`packages/arib/src/eit.ts`)。**ライブのときだけ。**
+   * 放送が送る「いま」と「次」(EIT[p/f]) を読む側 (`packages/arib/src/eit.ts`)。**ライブのときだけ。**
    *
    * 番組が切り替わった・延びたのを番組表に写し、画面に読み直させる (`epg.followOnAir`)。
    * 予定の時刻だけで追うと、延長・繰り下げで取り違える。追っかけ (`source`) は録画の
    * ファイルを読んでいて、流れている p/f は過去のものなので読まない
    */
   private onAir: PresentFollowing | null = null;
+  /** 4K の局 (`tlv`) の「いま」と「次」(MH-EIT[p/f]) を読む側 (`packages/arib/src/mh-eit.ts`)。読み方のほかは `onAir` と同じ (`followTlv`) */
+  private mmtOnAir: MmtPresentFollowing | null = null;
   /** 最後に番組表と突き合わせた時刻 (`ON_AIR_EVERY`) */
   private followedAt = 0;
   /** 最後に伝えた Hybridcast。**同じものを伝え直さない** */
@@ -1216,16 +1612,16 @@ class Session {
   private tsid: number | null = null;
   private stopped = false;
   /**
-   * 自分の利用者がいるチューナー (`GET /denpa/tuners` の `index`)。使えたら覚える (`locate`)。
+   * 自分の利用者がいるチューナー (エージェントと、その一覧の `index`)。使えたら覚える (`locate`)。
    * **取り上げられたら、このチューナーにいる録画が取り上げた相手** (`live-yield.ts`)。取り上げられたあとでは自分の利用者が
    * 一覧から消えているので、前に覚えておくしかない
    */
-  private tuner: number | null = null;
+  private tuner: { agent: number; index: number } | null = null;
   /** チューナーを調べている最中 (`locate`)。外されたときは、調べ終わるのを待ってから読む (`lose`) */
   private locating: Promise<void> = Promise.resolve();
   /** チューナーから 1 塊でも届いたか。届く前に途切れたのは選局の失敗で、届いたあとなら外された (`lose`) */
   private fed = false;
-  /** チューナーからのストリームが、こちらが畳む前に途切れた (取り上げられた・繋ぎが切れた) */
+  /** チューナーからのストリームが、こちらが終える前に途切れた (取り上げられた・繋ぎが切れた) */
   private cut = false;
   /** 開くまでの内訳の物差しの 0 (セッションを作った = 選局を求められた時刻。`Opening`) */
   private readonly began = performance.now();
@@ -1247,15 +1643,18 @@ class Session {
     readonly program: number,
     /** どの音声を、どちら側で出すか */
     readonly audio: AudioTrack,
-    /** どの方式でエンコードするか。**見ている人が選ぶ** */
-    readonly codec: StreamCodec,
+    /**
+     * どの方式でエンコードするか。**見ている人が選ぶ**。TS で送る 4K の局の放送のまま (`raw`) は、PMT を読んでから HEVC の詰め替えなどに
+     * 替える (`servedFormat`。替えたら `tuned` で知らせる)。リクエストされたもの (共有の目印) は `asked`
+     */
+    public codec: StreamCodec,
     /** その局の中で何本目の字幕を出すか */
     readonly track: number,
     /**
      * **エンコードせずに放送そのままの TS を配るか** (stream.md#放送そのままmpeg-2を送る。`runRaw`)。音声もエンコード方式も画面が
      * 決めるので、共有の目印からも外れる (`key`)
      */
-    readonly raw: boolean,
+    public raw: boolean,
     /**
      * 入力の差し替え。無ければチューナーから (ライブ)。
      * 追っかけ再生はこれで録画中のファイルを渡す (`openChase`)。
@@ -1274,6 +1673,21 @@ class Session {
     readonly pin: string | null = null,
     /** 回線に合わせて下げた段 (`#lib/rungs.ts`)。0 なら下げない。放送そのまま (`raw`) は 0 */
     readonly rung: Rung = 0,
+    /**
+     * 伝送の形式 (`services.transport`)。`tlv` は 4K の局で、TS を経由せずに読む (`live-mmt.ts`)。`hevc` は放送の HEVC の
+     * 詰め替え (`runMmt`)、ほかのコーデックは詰め替えた fMP4 を ffmpeg でエンコードする (`runEncode`)、`raw` は 1 局に絞った TLV (`runRaw`)
+     */
+    readonly transport: Transport = "ts",
+    /**
+     * **放送のままを元の TS のまま送るか** (HTTP の `codec=raw` で `?playable=` が無いもの。`httpWant`)。TS で送る 4K の局でも
+     * HEVC の詰め替えに替えない (`readsVideo`)。替えるセッションと共有しないように、目印も分ける (`key`)
+     */
+    readonly keepsTs = false,
+    /**
+     * 開く前に分かっている放送の映像のコーデック。TS の局は PMT を読んだら決め直す (`runEncode`)。
+     * 追っかけは録画の PMT を読んでから開くので (`recorded-broadcast.ts`)、TS で送る 4K の局の録画は初めから `hevc`
+     */
+    private readonly broadcast: BroadcastCodec = broadcastCodec(transport),
   ) {
     this.list = new TrackList(program);
     this.id = key(
@@ -1285,10 +1699,55 @@ class Session {
       track,
       pin,
       rung,
+      keepsTs,
     );
+    this.asked = { codec, raw };
     // エンコードが遅れて作り直した前のセッションから、軽くしたものを受け継ぐ (`lighten`)
     this.light = takeLight(this.id) ?? this.light;
   }
+
+  /** リクエストされた形式 (共有の目印 `id` と同じもの)。送っている形式 (`codec`・`raw`) と違うことがある (`servedFormat`) */
+  readonly asked: { codec: StreamCodec; raw: boolean };
+
+  /** 選べる音声 (`NowPlaying.audios`)。形式を替えたときの `tuned` に入れる (`switchFormat`) */
+  audios: AudioTrack[] = [];
+
+  /**
+   * 最初にリクエストした人の端末が再生できると送ってきたもの (`servedFormat`)。送っていなければ null。
+   * TS で送る 4K の局の放送のままを、HEVC の詰め替えにするかエンコードするかを決めるのに使う
+   */
+  playable: readonly LiveFormat[] | null = null;
+
+  /**
+   * PMT を読んで、TS に HEVC を入れて送る 4K の局と分かったか。分かったあとの `tuned` に `broadcast` を付ける
+   * (画面はそれで「放送のまま」を HEVC と読む)
+   */
+  hevcVideo = false;
+
+  /**
+   * 映像のある局 (と録画) か。false なら音声だけ (`AUDIO_FORM`) で送っていて、`tuned` に `video: false` を付ける
+   * (画面は段を動かさない)。作ったところ (`begin`・`openChase`) が決める
+   */
+  video = true;
+
+  /**
+   * **映像も音声も無い局 (データ放送だけの局) の無音を流しているか** (`encodeArgs` の `silent`)。映像の無い局の PMT に
+   * 音声が無ければ立てる (`runEncode`)。立っている間は TS を ffmpeg に渡さず、データ放送などへ分けるだけ (`pump`)
+   */
+  private silent = false;
+
+  /**
+   * **映像の無い局で、ffmpeg が音声を見つけられずに失敗した** (`runEncode`)。PMT に音声の ES が載っていても中身が流れていない局がある
+   * (BS 朝日のデータ放送の局)。立ったら無音を流して起こし直し、このセッションの間は立てたままにする
+   */
+  private audioAbsent = false;
+
+  /**
+   * **追っかけを元の TS で送る前に、録画のストリームから PMT を読むか** (`readsVideo`)。読むときは、読めた放送のコーデックを受け取るもの。
+   * 録り始めたばかりで開く前に録画の PMT を読めなかった追っかけだけ (`openChase`。`recorded-broadcast.broadcastDecided`)。
+   * 映像が HEVC なら、4K の局の録画と同じく放送の HEVC を写したものに替える (`chaseRawServed`)
+   */
+  learnsBroadcast: ((broadcast: BroadcastCodec) => void) | null = null;
 
   /** エンコードが遅れたので軽くしたもの (`lighten`)。作ったときに前のセッションから受け継ぐ */
   private light: Light = { half: false, gpu: false };
@@ -1299,7 +1758,7 @@ class Session {
 
   /** 出した映像の長さ (`pace` の `speed`)。ffmpeg ごとに init から読み直す (`drain`) */
   private readonly length = new VideoLength();
-  /** 速さを測る点。ffmpeg ごとに作り直す (`run`。起こし直すまでの空きを遅れに数えない) */
+  /** 速さを測る点。ffmpeg ごとに作り直す (`runEncode`。起こし直すまでの空きを遅れに数えない) */
   private meter = new SpeedMeter();
   /** 出した映像の長さの合計 (秒) */
   private media = 0;
@@ -1307,15 +1766,28 @@ class Session {
   /**
    * **エンコードの速さ** (出した映像の時刻の進み ÷ 実時間。`#lib/rungs.ts` の `Pace`)。ライブは実時間で届くので、
    * 追いついていれば 1 前後で、`ENCODE_SLOW` (0.95) を下回り続けたらエンコードが遅れている。追っかけは倍速で読むので 2 前後まで出る。
-   * 放送そのまま (エンコードしない)・音声だけ・測れるまでは null (`encodeSpeed`)
+   * 放送そのまま (エンコードしない。4K の局の詰め替えと、映像を写す `copied` も)・音声だけ・測れるまでは null (`encodeSpeed`)
    */
   get speed(): number | null {
-    return encodeSpeed(this.raw, this.codec, () =>
-      this.meter.speed(Date.now()),
+    return encodeSpeed(
+      this.raw || this.passthrough || this.copied,
+      this.codec,
+      () => this.meter.speed(Date.now()),
     );
   }
 
-  /** 一覧 (`sessions`) での目印。**作ったときに決めて、畳むときも同じものを消す** */
+  /**
+   * いまの ffmpeg が映像をエンコードせずに写しているか (TS で送る 4K の局の `hevc`。`copiesVideo`)。
+   * 映像のコーデックは PMT を読んでから決まるので、ffmpeg を起こすたびに決め直す (`runEncode`)
+   */
+  private copied = false;
+
+  /** 4K の局の放送の HEVC を、エンコードせずに詰め替えて配るか (`runMmt`)。4K の局の `hevc` はこれだけを指す */
+  get passthrough(): boolean {
+    return this.transport === "tlv" && this.codec === "hevc";
+  }
+
+  /** 一覧 (`sessions`) での目印。**作ったときに決めて、終えるときも同じものを消す** */
   readonly id: string;
 
   get empty(): boolean {
@@ -1324,7 +1796,7 @@ class Session {
     return true;
   }
 
-  /** 映像を観ているのがこの人だけか (`empty` と同じく字幕だけの人は数えない)。抜ければ畳まれる */
+  /** 映像を観ているのがこの人だけか (`empty` と同じく字幕だけの人は数えない)。抜ければ終わる */
   alone(viewer: Viewer): boolean {
     for (const other of this.viewers)
       if (other !== viewer && other.side !== true) return false;
@@ -1332,11 +1804,11 @@ class Session {
   }
 
   /**
-   * まだエンコードしているか。**畳んだものを持ったままにしないため。**
+   * まだエンコードしているか。**終えたものを持ったままにしないため。**
    *
-   * ffmpeg が降りると畳まれて一覧からも消えるが、**繋いでいる側は同じものを
+   * ffmpeg が終了するとセッションも終わって一覧から消えるが、**繋いでいる側は同じものを
    * 指したまま**になる。同じ局を選び直しても「もう見ている」と見なされて
-   * 何も起きず、**「やり直す」を押しても直らない**
+   * 何も起きず、**「再試行」を押しても直らない**
    */
   get alive(): boolean {
     return !this.stopped;
@@ -1359,26 +1831,34 @@ class Session {
         apps: JSON.parse(this.toldApps),
       });
     }
+    // 自動で受信する端末は、これを見て受信をリクエストする (`data-receive.ts` の `wantsData`)
+    const autoStart = this.autoStart?.value ?? null;
+    if (autoStart !== null)
+      this.tellOne(viewer, { type: "autoStart", on: autoStart });
     // **出したままの人は、局を変えても出したまま** (`refreshData`)
     if (viewer.wantsData) this.refreshData(viewer);
     const clock = this.clockNotice();
     if (clock !== null) this.tellOne(viewer, clock);
     if (this.note !== null) this.tellOne(viewer, this.note);
+    if (this.card.id !== null)
+      this.tellOne(viewer, { type: "card", id: this.card.id });
   }
 
   /**
    * 受け取った時刻と、エンコードしたものの物差しの対応。**両方そろってから。**
    *
-   * `start:` は ffmpeg が入口を読み終えるまで出ないので、選局してすぐは
+   * `start:` は ffmpeg が入力を読み終えるまで出ないので、選局してすぐは
    * `null` です。画面は届いてから出す作りにしてあります
    */
   private clockNotice(): Notice | null {
-    const anchor = this.clock.anchor;
+    // 4K の局は放送の時計 (PCR) を持たない。映像のコマの時刻と提示時刻 (NTP) の組を使う (`live-mmt.ts` の `anchor`)
+    const anchor =
+      this.transport === "tlv" ? this.mmtAnchor : this.clock.anchor;
     /*
      * **放送そのままの経路では寄せない。** 受け側の物差しは放送の PTS そのもの (自分で PES から読む)
      * なので、PCR をそのまま渡せば比べられる。ffmpeg の `start:` を待つ必要も無い
      */
-    const shift = this.raw ? 0 : this.startPts;
+    const shift = this.raw || this.passthrough ? 0 : this.startPts;
     if (anchor === null || !Number.isFinite(shift)) return null;
     return {
       type: "clock",
@@ -1411,7 +1891,7 @@ class Session {
   }
 
   /**
-   * いまデコードする必要があるかを見直す。**誰も出していなければ畳む。**
+   * いまデコードする必要があるかを見直す。**誰も出していなければ破棄する。**
    *
    * `Viewer.wantsData` は**その人の意思**で、局を変えても消えない
    * (セッションは作り直しになるが、押した本人にとっては同じ「出したまま」)。
@@ -1460,7 +1940,7 @@ class Session {
    * **そのままの TS も捨ててよい。** 欠けた PES は受け側のデコーダが次の I フレームで立ち直る。
    * 1 局 15Mbit/s を積み続けると、詰まった客 1 人でサーバの手元が数秒で数十 MB 太る。
    * **ただし追っかけの TS は捨てない。** 欠けたら観ていない先が飛ぶ。詰まったら録画のファイルを読むほうを止める
-   * (`openChase` の `held`)
+   * (`openChase` の `stopReading`)
    */
   private hand(viewer: Viewer, kind: number, data: Uint8Array): void {
     if (kind === CHANNEL.videoInit) {
@@ -1492,52 +1972,183 @@ class Session {
     );
   }
 
-  /** エンコードし始める。**畳むまで戻らない** */
+  /** エンコードし始める。**終えるまで戻らない** */
   async run(): Promise<void> {
     const label = `${this.channelType}:${this.channel}`;
+    // ケーブルの TS の局のライブの放送のままは、PMT を読んでから形式を決める (`runRaw`)
+    if (!this.readsVideo()) this.formatKnown();
     if (this.raw) return this.runRaw(label);
+    if (this.passthrough) return this.runMmt(label);
+    return this.runEncode(label);
+  }
+
+  /**
+   * 送る形式を PMT で映像のコーデックを見てから決めるか。ケーブル (`CATV`) の TS の局のライブで、次のどちらかのときだけ。
+   *
+   * - 放送のまま (`runRaw`)。元の TS のまま送るもの (`keepsTs`) は除く
+   * - 段を下げた H.265 (`runEncode`)。4K の局と分かったら、段を下げるコーデックを選び直す (`liveRungCodec`)
+   *
+   * TS に HEVC を入れて送る 4K の局はケーブルにしか無く、ほかの局は HTTP の応答ヘッダを PMT まで待たせない (`liveServed`)
+   *
+   * 追っかけは、元の TS で送るもののうち、開く前に録画の PMT を読めなかったものだけ (`learnsBroadcast`)
+   */
+  private readsVideo(): boolean {
+    if (this.source !== undefined)
+      return (
+        this.learnsBroadcast !== null &&
+        this.raw &&
+        this.transport === "ts" &&
+        this.program > 0
+      );
+    return (
+      ((this.raw && !this.keepsTs) ||
+        (!this.raw && this.codec === "hevc" && this.rung !== 0)) &&
+      this.channelType === "CATV" &&
+      this.transport === "ts" &&
+      this.program > 0
+    );
+  }
+
+  /** 送る形式が決まったら呼ぶもの (`decided` を解決する) */
+  private formatKnown: () => void = () => undefined;
+
+  /**
+   * **送る形式が決まった。** ケーブルの TS の局のライブの放送のままは、PMT を読んでから決まる (`readsVideo`・`servedFormat`)。
+   * ほかは作ったときに決まっている。HTTP のライブはこれを待ってから応答ヘッダ (`X-Denpa-Codec`・Content-Type) を返す (`liveServed`)。
+   * 終えたときも解決する
+   */
+  readonly decided: Promise<void> = new Promise((resolve) => {
+    this.formatKnown = resolve;
+  });
+
+  /**
+   * **送る形式を替えて、観ている人に `tuned` で知らせ直す** (`runRaw`。TS で送る 4K の局の放送のまま)。
+   * 画面は答えの形式で受け取り直す (MPEG-2 のデコーダから MSE へ)。まだ何も送っていないので、init から渡す
+   */
+  private switchFormat(served: { codec: StreamCodec; raw: boolean }): void {
+    this.codec = served.codec;
+    this.raw = served.raw;
+    this.hevcVideo = true;
+    console.log(
+      `[live] ${this.id}: TS に HEVC が入っているので、放送のままを ${served.codec} で送ります`,
+    );
+    this.retell();
+    this.formatKnown();
+  }
+
+  /** 観ている人に、いま送っている形式の `tuned` を送り直す。次の init から受け取らせる (`switchFormat`・`runEncode`) */
+  private retell(): void {
+    const notice = this.tunedNotice();
+    for (const viewer of this.viewers) {
+      if (viewer.side === true) continue;
+      viewer.ready = false;
+      this.tellOne(viewer, notice);
+    }
+  }
+
+  /** いま送っている形式の `tuned` (`switchFormat`。形式を替えたセッションに入る人へは `attend`) */
+  tunedNotice(): Extract<Notice, { type: "tuned" }> {
+    return {
+      type: "tuned",
+      channelType: this.channelType,
+      // 追っかけの目印は `<録画の ID>@<開いた位置>` (`openChase`)。答えには録画の ID だけを入れる
+      channel:
+        this.source === undefined
+          ? this.channel
+          : (this.channel.split("@")[0] ?? this.channel),
+      // 受けた局はライブの答えだけに載せる (追っかけには付けない)
+      ...(this.source === undefined ? { serviceId: this.serviceId } : {}),
+      codecs: codecsFor(this.codec, this.hevcVideo ? "hevc" : "mpeg2"),
+      codec: this.codec,
+      raw: this.raw,
+      rung: this.rung,
+      audio: this.audio.id,
+      audios: this.audios,
+      ...(this.hevcVideo ? { broadcast: "hevc" as const } : {}),
+      ...(this.video ? {} : { video: false as const }),
+    };
+  }
+
+  /**
+   * ffmpeg でエンコードする (映像を写すときも)。**終えるまで戻らない。**
+   * @param opened 選局して PMT まで読んだチューナーの TS (`runRaw` が形式を替えたとき)。無ければここで選局する
+   */
+  private async runEncode(
+    label: string,
+    opened?: AsyncGenerator<Uint8Array>,
+  ): Promise<void> {
     try {
       // 追っかけ (`source`) はチューナーを使わない。電波は録画が受けている
-      const tuned = this.source !== undefined ? null : await this.tune();
+      const tuned =
+        this.source !== undefined || opened !== undefined
+          ? null
+          : await this.tune();
       if (tuned !== null) this.opening.tuned = this.since();
 
       /*
        * **字幕なしで再エンコードできるようにしておく。**
        *
        * 字幕を持たない放送に `[0:p:X:s:0]` を指定すると、ffmpeg は組み立ての
-       * 時点で降りる。**映像も出ない**。そうと分かったら字幕を外して
+       * 時点で失敗して終了する。**映像も出ない**。そうと分かったら字幕を外して
        * もう一度起こす。TS は流れ続けているので、取り直しは要らない。
-       * ふだんは起こす前に PMT で字幕の有無を見るので (下の `peekCaptions`)、ここへ来るのは
+       * ふだんは起こす前に PMT で字幕の有無を見るので (下の `peekPmt`)、ここへ来るのは
        * 読めなかったときと、ffmpeg が字幕とみなさなかったとき
        */
-      // 音声だけなら字幕は出さない
+      // 音声だけなら字幕は出さない。4K の局の字幕は ffmpeg を通さない (TTML を denpa が読む。`pump`)
       let wanted =
-        this.codec === "audio" || remembered(captionless, this.serviceId)
+        this.codec === "audio" ||
+        this.transport === "tlv" ||
+        remembered(captionless, this.serviceId)
           ? null
           : this.track;
-      // GPU でエンコードするか (`pickLiveHw`)。降りたらソフトウェアで再エンコードする (下)
-      let hw = this.codec === "audio" ? null : pickLiveHw(this.codec);
       /*
-       * H.265 と段を下げた AV1 はソフトウェアに降りられない (`softwareEncodes`)。画面は諦めて次の形式をリクエストし直す
+       * 放送の映像のコーデック。開く前に分かっているもの (ライブの TS の局は MPEG-2、追っかけは録画の PMT から) で始め、
+       * PMT を読んだら決め直す (下の `peekPmt`)。
+       * TS で送る 4K の局 (`hevc`) は、`hevc` なら映像を写し、ほかは 4K の局と同じく縮めて SDR にする
+       */
+      let video = this.broadcast;
+      /**
+       * PMT を読むか (`peekPmt`)。4K の局 (`tlv`) の入力は TS ではなく、字幕も映像も別に読む。
+       * 音声だけでも、映像の無い局は読む (音声も無ければ無音を流す。`silent`)
+       */
+      const peeks =
+        this.program > 0 &&
+        this.transport === "ts" &&
+        (this.codec !== "audio" || !this.video);
+      // GPU でエンコードするか (`pickLiveHw`)。失敗したらソフトウェアで再エンコードする (下)。
+      // 4K の局はデコードを GPU に載せない (`uhdVideoArgs`) ので、失敗したときに覚える経路もそれに合わせる。映像を写すなら GPU は使わない
+      const pickHw = () =>
+        this.codec === "audio" || copiesVideo(this.transport, video, this.codec)
+          ? null
+          : pickLiveHw(this.codec, video !== "hevc");
+      let hw = pickHw();
+      /*
+       * H.265 と段を下げた AV1 はソフトウェアに切り替えられない (`softwareEncodes`)。画面はその形式をやめて次の形式をリクエストし直す
        * (`live-player.svelte.ts`)。段を下げたときは、同じ段をリクエストし直すと次のコーデックになる (`rungCodec`)
        */
-      const gpuOnly =
+      // コーデックは PMT を読んだあとで替わることがある (下の 4K の局の段を下げた H.265) ので、そのつど見る
+      const gpuOnly = () =>
         this.codec !== "audio" && !softwareEncodes(this.codec, this.rung);
-      const gaveUp = this.codec === "hevc" ? HEVC_GAVE_UP : AV1_GAVE_UP;
-      if (gpuOnly && hw === null) {
-        this.died(label, `${this.codec} を GPU でエンコードできない`, gaveUp);
+      const gaveUp = () => (this.codec === "hevc" ? HEVC_GAVE_UP : AV1_GAVE_UP);
+      const noGpu = () =>
+        gpuOnly() &&
+        hw === null &&
+        !copiesVideo(this.transport, video, this.codec);
+      // PMT を読むなら、映像のコーデックが分かってから決める (下。TS で送る 4K の局の `hevc` は GPU を使わない)
+      if (!peeks && noGpu()) {
+        this.died(label, `${this.codec} を GPU でエンコードできない`, gaveUp());
         return;
       }
       /*
        * **ライブの TS はリーダーを 1 つだけ作って、起こし直しても使い回す。**
        *
        * リーダー (`getReader`) は 1 人しか持てない。ffmpeg ごとに作ると、前の流し込みが
-       * 手放すまで次が読めない。手放すのは相手が降りたあと次の塊の書き込みが失敗したとき
+       * 手放すまで次が読めない。手放すのは相手が終了したあと次の塊の書き込みが失敗したとき
        * だが、書き込みは返ってこないこともある (下の「終わりは ffmpeg の終了で見る」)。
        * 使い回せば前の流し込みは何も握っていない。追っかけは読み直すので毎回作る
        */
-      let feed = tuned === null ? null : chunks(tuned);
-      /** PMT を読んで字幕の本数を見たか (`peekCaptions`)。見るのは最初の 1 回だけ */
+      let feed = opened ?? (tuned === null ? null : chunks(tuned));
+      /** PMT を読んで字幕の本数と映像のコーデックを見たか (`peekPmt`)。見るのは最初の 1 回だけ */
       let peeked = false;
       for (;;) {
         // ライブは同じ TS が流れ続けている。追っかけは再エンコードのたびに読み直す
@@ -1546,14 +2157,14 @@ class Session {
           (this.source === undefined ? undefined : chunks(this.source()));
         if (stream === undefined) return;
         /*
-         * **字幕があるかは起こす前に PMT で見る。** 無い放送に字幕の出口を指定すると、ffmpeg が入口を
-         * 探り終えてから降りて、起こし直すぶん映像が 1.5 秒ほど遅れる。読めなければ今までどおり指定して、
-         * 降りたら字幕なしで起こし直す (下)
+         * **字幕があるかは起こす前に PMT で見る。** 無い放送に字幕の出力を指定すると、ffmpeg が入力を
+         * 探り終えてから失敗して終了し、起こし直すぶん映像が 1.5 秒ほど遅れる。読めなければ今までどおり指定して、
+         * 失敗したら字幕なしで起こし直す (下)。映像のコーデックも同じ PMT で見る
          */
-        if (wanted !== null && !peeked && this.program > 0) {
+        if (!peeked && peeks) {
           peeked = true;
           const read = stream;
-          const head = await peekCaptions(
+          const head = await peekPmt(
             stream,
             this.program,
             PMT_WAIT,
@@ -1567,23 +2178,94 @@ class Session {
           // 読んだぶんは返ってきたストリームの先頭にある。ライブは起こし直してもこちらを使う
           if (feed !== null) feed = head.stream;
           /*
+           * 映像の無い局の PMT に音声も無い (データ放送だけの局)。ffmpeg に TS を渡さず、無音を流す (`encodeArgs` の `silent`)。
+           * PMT が変われば作り直す (`restart`) ので、音声が付けば次のセッションで下ろす。読めなかった (`null`) なら音声があるものとして渡す
+           */
+          const silent =
+            !this.video && (head.audio === false || this.audioAbsent);
+          if (silent && !this.silent)
+            console.log(
+              `[live] ${this.id}: 映像も音声も無い局なので、無音を流します`,
+            );
+          this.silent = silent;
+          /*
            * 指定した本数目が無ければ指定しない。`captionless` には覚えない。毎回 PMT を読むので、
            * 番組が替わって字幕が付けばすぐ出せる
            */
-          if (head.count !== null && head.count <= wanted) wanted = null;
-          if (this.stopped) {
+          if (head.count !== null && wanted !== null && head.count <= wanted)
+            wanted = null;
+          if (head.video === "hevc") {
+            video = "hevc";
+            /*
+             * **ライブの段を下げた H.265 は、4K の局として段を下げるコーデックを選び直す** (`liveRungCodec`)。4K の局の H.265 は
+             * 放送の HEVC を写すもので段を下げられず、そのままだと 4K の HEVC を送ってしまう。選局の時点では MPEG-2 の局として
+             * 選んでいる (画面に HEVC と分かっていない初回と、HTTP の `?codec=hevc&rung=`)。追っかけは選局の答えを出さないので替えない。
+             * 端末が再生できる形式を送っていなければ (画面の WebSocket・`?playable=` の無い HTTP)、どの端末でも再生できる H.264
+             */
+            const was = this.codec;
+            this.codec = hevcTsCodec(
+              this.codec,
+              this.rung,
+              this.source === undefined,
+              this.playable,
+            );
+            const lowered = this.codec !== was;
+            if (lowered) {
+              console.log(
+                `[live] ${this.id}: TS に HEVC が入っているので、段 ${this.rung} を ${this.codec} でエンコードします`,
+              );
+            }
+            // デコードを GPU に載せない経路で選び直す。映像を写すなら GPU は使わない
+            hw = pickHw();
+            /*
+             * 選局の答えを MPEG-2 の局として出していたら、答え直す (`tuned` の `broadcast`。H.265 なら codecs も
+             * 放送の HEVC のものになる)。まだ何も送っていない。追っかけは選局の答えを出さない
+             */
+            const found = !this.hevcVideo;
+            this.hevcVideo = true;
+            if ((found || lowered) && this.source === undefined) this.retell();
+          }
+          // HTTP のライブは、段を下げた H.265 の形式が決まるまで応答ヘッダを待っている (`readsVideo`)
+          this.formatKnown();
+          /*
+           * **追っかけの段を下げた H.265 は、映像を写さない** (写すと段を見ずに 4K の HEVC を送る)。追っかけは開く前に録画の PMT を読んで
+           * 4K の局と分かれば H.265 を選ばない (`chaseForm`) ので、ここへ来るのは録り始めたばかりで開く前に PMT を読めなかったときだけ。
+           * 選局の答えを出し直す仕組みは持たないので止める。画面は段を下げた H.265 が失敗したときと同じく、H.265 を外して
+           * 同じ段をリクエストし直す (`live-player.svelte.ts` の `rungOff`)
+           */
+          const lateHevc =
+            this.source !== undefined &&
+            this.rung !== 0 &&
+            copiesVideo(this.transport, video, this.codec);
+          if (this.stopped || noGpu() || lateHevc) {
             /*
              * 追っかけは読み元を閉じる (`stream.chunks` が cancel する)。返ってきた `head.stream` はまだ読み始めて
              * いないので、閉じても中の finally が走らない。元の `read` を閉じる。読みかけがあると
              * それが届くまで閉じられないので、待たない
              */
             if (feed === null) void read.return(undefined);
+            if (this.stopped) return;
+            if (lateHevc)
+              this.died(
+                label,
+                "開いたあとで録画の映像が HEVC と分かり、段を下げた H.265 を写せない",
+                UHD_RUNG_HEVC,
+              );
+            // GPU でしかエンコードできない形式 (H.265・段を下げた AV1) を、GPU で出せない
+            else
+              this.died(
+                label,
+                `${this.codec} を GPU でエンコードできない`,
+                gaveUp(),
+              );
             return;
           }
         }
         this.produced = false;
         this.busy = false;
-        this.software = hw === null;
+        this.noMedia = null;
+        this.copied = copiesVideo(this.transport, video, this.codec);
+        this.software = hw === null && !this.copied;
         // 遅れと速さは ffmpeg ごとに数え直す (前の ffmpeg の遅れと、起こし直した直後の速さを合わせない)
         this.lag.reset();
         this.meter = new SpeedMeter();
@@ -1609,9 +2291,12 @@ class Session {
               this.rung,
               this.light.half,
               side?.url,
+              this.transport,
+              video,
+              this.silent,
             ),
           ],
-          // 字幕は 4 本目の出口 (stream.sideOutput) へ出させる。**stdio の配列でしか増やせない**
+          // 字幕は 4 本目の出力 (stream.sideOutput) へ出させる。**stdio の配列でしか増やせない**
           {
             stdio: ["pipe", "pipe", "pipe", ...(side?.stdio ?? [])] as never,
           },
@@ -1621,7 +2306,9 @@ class Session {
         if (this.opening.media === undefined) {
           this.opening.spawned = this.since();
           delete this.opening.init;
-          this.way = `${this.codec}${hw === null ? "" : `・GPU ${hw.way.kind}`}${this.light.half ? "・30 コマ" : ""}`;
+          this.way = this.copied
+            ? `${this.codec}・詰め替え`
+            : `${this.codec}${hw === null ? "" : `・GPU ${hw.way.kind}`}${this.light.half ? "・30 コマ" : ""}`;
         }
 
         /*
@@ -1643,21 +2330,31 @@ class Session {
           watching,
           side === null ? Promise.resolve() : this.subtitles(side.read(proc)),
         ]).catch((error: unknown) => {
-          // 相手が降りたあとの EPIPE。**ここで受け止めないと再エンコードに来られない**
+          // 相手が終了したあとの EPIPE。**ここで受け止めないと再エンコードに来られない**
           trouble = error;
         });
         await Promise.race([running, proc.exited]);
         if (this.stopped) return;
-        // チューナーから外された。ffmpeg が降りたのは入口が尽きたからで、エンコード方式のせいではない
+        // チューナーから外された。ffmpeg が終了したのは入力が尽きたからで、エンコード方式のせいではない
         if (this.cut && this.fed) return await this.lose(label);
         /*
-         * **降りた理由を読み終えてから決める。** `proc.exited` は最後の
+         * **局の映像・音声がスクランブルされたまま届いていたら、それが失敗した理由。** エンコード方式のせいでも
+         * 字幕のせいでもないので、起こし直さない (`SCRAMBLE_LEAST`。伝えるのは `endScrambled`)
+         */
+        if (
+          this.ending !== null ||
+          (!this.produced && this.judgeScrambled(SCRAMBLE_LEAST))
+        )
+          return;
+        /*
+         * **終了した理由を読み終えてから決める。** `proc.exited` は最後の
          * 行より先に来るので、待たずに見ると「字幕が無い」を取り
          * こぼして、**再エンコードに来られない**。標準エラーは相手が終了すれば
          * 必ず閉じるので、ここで待つのは安全 (流し込みのほうは閉じても
-         * 例外にならないことがあるので待てない)
+         * 例外にならないことがあるので待てない)。映像を出す前に終了したときは、局の映像・音声を
+         * 見つけられなかった行 (`missingMedia`) も取りこぼさないように待つ
          */
-        if (wanted !== null || hw !== null)
+        if (wanted !== null || hw !== null || !this.produced)
           await watching.catch(() => undefined);
         /*
          * 追っかけが**録れているところまで読み切った** (ffmpeg が入力を
@@ -1669,42 +2366,64 @@ class Session {
           return;
         }
         /*
-         * **GPU が映像を 1 つも出さずに降りたら、ソフトウェアで再エンコードする。**
+         * **GPU が映像を 1 つも出さずに失敗したら、ソフトウェアで再エンコードする。**
          *
          * 試しのエンコードが通っても、放送の素材 (大きさ・途中の切り替わり) で GPU が
-         * 降りることはある。出す前なら見ている人はまだ何も受け取っていないので、
-         * 経路を替えて起こし直すだけで済む。字幕が無くて降りたのなら GPU のせいではない
-         * ので先にそちらを直す (下)。**黙って替えず、一行だけ伝える**。遅れ・CPU の重さが
+         * 失敗することはある。出す前なら見ている人はまだ何も受け取っていないので、
+         * 経路を替えて起こし直すだけで済む。字幕が無くて失敗したのなら GPU のせいではない
+         * ので先にそちらを直す (下)。**替えたことは一行で伝える**。遅れ・CPU の重さが
          * 変わるので、設定の印を外すかどうか決める手がかりになる
          */
         if (
           hw !== null &&
           !this.produced &&
+          this.noMedia === null &&
           !(wanted !== null && this.noSubtitle)
         ) {
           /*
-           * H.265 と段を下げた AV1 はソフトウェアに降りられない (`softwareEncodes`)。覚えて (同時に開ける数を超えただけなら
-           * 覚えない) 降りる。画面は次の形式をリクエストし直し、覚えている間は H.265 の指示を H.264 にする (`liveHevc`)。
+           * H.265 と段を下げた AV1 はソフトウェアに切り替えられない (`softwareEncodes`)。覚えて (同時に開ける数を超えただけなら
+           * 覚えない) 止める。画面は次の形式をリクエストし直し、覚えている間は H.265 の指示を H.264 にする (`liveHevc`)。
            * 段を下げたときは、同じ段をリクエストし直すと次のコーデックになる (`rungCodec`)
            */
-          if (gpuOnly) {
+          if (gpuOnly()) {
             blameLiveHw(this.codec, hw, this.busy);
             this.died(
               label,
               `GPU (${hw.way.device} の ${hw.way.kind}) で ${this.codec} (段 ${this.rung}) をエンコードできなかった`,
-              gaveUp,
+              gaveUp(),
             );
             return;
           }
           console.warn(
-            `[live] ${label}: GPU (${hw.way.device} の ${hw.way.kind}${hw.full ? "・復号から" : ""}) でエンコードできなかったので、ソフトウェアで再エンコードします${this.busy ? " (同時に開ける数を超えた。方式は覚えない)" : ""}`,
+            `[live] ${label}: GPU (${hw.way.device} の ${hw.way.kind}${hw.full ? "・デコードから" : ""}) でエンコードできなかったので、ソフトウェアで再エンコードします${this.busy ? " (同時に開ける数を超えた。方式は覚えない)" : ""}`,
           );
           this.blame = { hw, busy: this.busy };
           hw = null;
           continue;
         }
+        /*
+         * **局の映像か音声を指定できずに失敗した。** 字幕を外しても、エンコード方式を替えても同じところで失敗するので、
+         * 起こし直さずに理由を伝える (映像の無い局・`-probesize` のうちに見つけられなかった局)
+         */
+        if (this.noMedia === "音声" && !this.video && !this.audioAbsent) {
+          console.log(
+            `[live] ${label}: 映像の無い局の音声が流れていないので、無音を流して起こし直します`,
+          );
+          this.audioAbsent = true;
+          // PMT を読んで決めるのは最初の 1 回だけ (`peeked`) なので、ここで立てる。次の周の `encodeArgs` が無音にする
+          this.silent = true;
+          continue;
+        }
+        if (this.noMedia !== null) {
+          this.died(
+            label,
+            `ffmpeg が局の${this.noMedia}を指定できずに終了しました`,
+            missingMediaMessage(this.noMedia),
+          );
+          return;
+        }
         if (wanted === null || !this.noSubtitle) {
-          // ここまで来たのは ffmpeg が自分で降りたとき
+          // ここまで来たのは ffmpeg が自分で終了したとき
           this.died(
             label,
             trouble === null
@@ -1721,27 +2440,100 @@ class Session {
         wanted = null;
       }
     } catch (error) {
-      this.died(
-        label,
-        String(error),
-        this.source === undefined
-          ? whyNotTuned(String(error), resting(this.serviceId))
-          : "録画を読めませんでした",
-      );
+      if (this.source === undefined) await this.notTuned(label, error);
+      else this.died(label, String(error), "録画を読めませんでした");
     } finally {
+      // スクランブルの理由を伝え終えてから終える (`endScrambled`)
+      await this.ending;
       this.stop();
     }
   }
 
   /**
-   * エンコードできなくなったことを、**見ている人に伝える。** 黙って消えると前の映像が
+   * エンコードできなくなったことを、**見ている人に伝える。** 何も伝えずに終えると前の映像が
    * `HOLD_MOST` (6 秒) 貼られて黒くなるだけで、失敗に見えなかった (tvk T15 で
-   * `-map 0:p:…` を解決できずに ffmpeg が降りていた)。こちらから畳んだとき (`stop`) は言わない
+   * `-map 0:p:…` を解決できずに ffmpeg が失敗して終了していた)。こちらから終えたとき (`stop`) は言わない
    */
-  private died(label: string, why: string, message: string): void {
-    if (this.stopped) return;
+  private died(
+    label: string,
+    why: string,
+    message: string,
+    unpin = false,
+  ): void {
+    if (this.stopped || this.ending !== null) return;
     console.warn(`[live] ${label}: ${why}`);
+    this.tell(
+      unpin
+        ? { type: "error", message, unpin: true }
+        : { type: "error", message },
+    );
+  }
+
+  /**
+   * 選局できなかったことを伝える (`died`)。**名指し (`pin`) の選局でエージェントが断ったなら、その理由を出す**
+   * (docs/watch.md「使えないときは、ほかのチューナーに替えずに理由を出します」)。
+   * 名指しのチューナーがエージェントの一覧にもう無ければ、画面に自動へ戻させる (`unpin`)。
+   * 一覧を取得できなければ、無くなったとはみなさない
+   */
+  private async notTuned(label: string, error: unknown): Promise<void> {
+    const why = String(error);
+    // 形式が変わったのはスキャンし直せば直るので、そう伝える (番組表の取得・録画と同じ文)
+    const plain =
+      error instanceof TransportChangedError
+        ? error.message
+        : whyNotTuned(why, resting(this.serviceId));
+    const pin = this.pin;
+    if (
+      pin === null ||
+      !(error instanceof TuneError || error instanceof TunerBusyError)
+    ) {
+      this.died(label, why, plain);
+      return;
+    }
+    const gone = await pinGone(pin);
+    this.died(
+      label,
+      why,
+      pinnedNotTuned(pin, error.reason ?? plain, gone),
+      gone,
+    );
+  }
+
+  /**
+   * **局の映像・音声・字幕がスクランブルされたまま届いているかを決める** (`LastingScramble`)。掛かったままなら
+   * 理由を伝えて終える処理を始め (`endScrambled`)、true を返す。いちばん新しく数えたぶんが `least` 個に満たなければ決めずに数え続ける。
+   * 掛かっていないと決まったら、あとは数えない
+   */
+  private judgeScrambled(least: number): boolean {
+    const watch = this.scramble;
+    if (watch === null) return false;
+    if (watch.verdict === "clear") this.scramble = null;
+    if (!watch.stillScrambled(least)) return false;
+    this.scramble = null;
+    const count = watch.newest(least);
+    this.ending = this.endScrambled(count?.scrambled ?? 0, count?.total ?? 0);
+    return true;
+  }
+
+  /**
+   * **スクランブルされたまま届いたことを、理由を添えて伝えて終える。** ffmpeg の指定の失敗
+   * (`Failed to set value … for option 'map'`) や「映像を出せませんでした」では、契約が無いことが分からない。
+   * 理由はカードと契約の状態から決める (`contracts.scrambledLiveMessage`)
+   */
+  private async endScrambled(scrambled: number, total: number): Promise<void> {
+    // 4K の局のスクランブルは ACAS で、まだ復号できない (`types.DESCRAMBLABLE`)。カードと契約の状態は関係ない
+    const message =
+      this.transport === "tlv"
+        ? undecodableReason(this.channelType, "tlv")
+        : await scrambledLiveNotice(this.serviceId, this.agent).catch(
+            () => "スクランブルを復号できませんでした",
+          );
+    if (this.stopped) return;
+    console.warn(
+      `[live] ${this.channelType}:${this.channel}: 局の映像・音声がスクランブルされたまま届きました (${scrambled} / ${total} パケット): ${message}`,
+    );
     this.tell({ type: "error", message });
+    this.stop();
   }
 
   /** エージェントに名乗る利用者の印。同じ局を観ている人どうしで同じになる (チューナーも共有) */
@@ -1751,41 +2543,103 @@ class Session {
 
   /**
    * チューナーを使う。**空きが無ければ待って掛け直す** (チャンネルを変える一瞬は 2 台要る)。
-   * 使えたら、どのチューナーに入ったかを覚えておく (`locate`。待たない)
+   * 使えたら、どのチューナーに入ったかを覚えておく (`locate`。待たない)。
+   *
+   * **観る局 (`program`) を渡す。** 1 局に絞って流すので、エージェントはその局の PMT と鍵がそろえば
+   * ほかの局 (ワンセグ・データ放送の局) の PMT を待たずに流し始める (docs/agent.md「B25 の復号もカードリーダーも自前」)
    */
   private async tune(): Promise<ReadableStream<Uint8Array>> {
-    const stream = await openWhenFree(
+    // どのエージェントに送るかは選局ごとに決まる (`tuner.openChannel`)。送った所は `place` で返る
+    const { stream, place } = await openWhenFree(
       this.channelType,
-      this.channel,
+      placesOfService(this.serviceId),
       this.aborter.signal,
       this.use,
       config.priority.live,
       () => this.stopped,
+      this.transport,
       this.pin,
+      this.program > 0 ? this.program : null,
+      LIVE_ANSWER_WAIT,
+      this.serviceId,
     );
-    this.locating = this.locate();
+    this.agent = place.agent;
+    this.learnCard(place.agent);
+    this.locating = this.locate(place);
+    this.settle();
     return stream;
   }
 
-  /** 自分の利用者がいるチューナーを覚える。訊けなければ覚えないまま (取り上げられても録画を名指しできないだけ) */
-  private async locate(): Promise<void> {
+  /** チューナーを使えたか、使えずに終えたら呼ぶもの (`whenTuned`) */
+  private readonly tuning: (() => void)[] = [];
+  /** 送ったエージェント (`agents.id`)。スクランブルされたまま届いた理由を、そのエージェントのカードで決める (`endScrambled`) */
+  private agent: number | null = null;
+  /** そのエージェントが復号に使うカードの番号 (`learnCard`) */
+  private readonly card = new CardNumber(
+    cardIdOf,
+    () => settings().bmlNetwork,
+    () => this.agent,
+    (id) => this.tell({ type: "card", id }),
+  );
+  private settled = false;
+
+  /**
+   * **選局したエージェントのカードの番号を、観ている人に知らせる** (`CardNumber`)。途中から来た人には `add` で渡す
+   */
+  private learnCard(agent: number): void {
+    void this.card.learn(agent);
+  }
+
+  /**
+   * チューナーを使えたら呼ぶ。使えずに終えたときも呼ぶ。もうどちらかになっていればその場で。
+   * 先回りしたセッションを終えるのに使う (`dropWarm`)
+   */
+  whenTuned(fn: () => void): void {
+    if (this.settled || this.stopped) fn();
+    else this.tuning.push(fn);
+  }
+
+  private settle(): void {
+    this.settled = true;
+    for (const fn of this.tuning.splice(0)) fn();
+  }
+
+  /** 自分の利用者がいるチューナーを覚える。一覧を取得できなければ覚えないまま (取り上げられても録画を名指しできないだけ) */
+  private async locate(place: Place): Promise<void> {
     try {
-      this.tuner = tunerOf(
-        await getTuners(),
+      const index = tunerOf(
+        await tunersOf(place.agent),
         this.channelType,
-        this.channel,
+        place.channel,
         this.use,
       );
+      this.tuner = index === null ? null : { agent: place.agent, index };
     } catch {
       this.tuner = null;
     }
   }
 
+  /** 放送のままの経路 (`runRaw`・`readTlv`) が読み終えたあとの扱い (`rawEnding`) */
+  private async endRaw(label: string, chase: boolean): Promise<void> {
+    switch (rawEnding({ chase, fed: this.fed, stopped: this.stopped })) {
+      case "ended":
+        this.tell({ type: "ended" });
+        return;
+      case "lost":
+        return await this.lose(label);
+      case "died":
+        this.died(label, "放送が途切れました", "映像を出せませんでした");
+        return;
+      case "quiet":
+        return;
+    }
+  }
+
   /**
-   * **チューナーから外された。** 畳んで、見ている人にリクエストし直させる (`lost`)。
+   * **チューナーから外された。** セッションを終えて、見ている人にリクエストし直させる (`lost`)。
    *
    * ここで取り直さないのは、エンコードしたものを途中から作り直すと受け側のバッファ (MSE・テレビの fMP4) が
-   * 続きとして読めないため。リクエストし直せばバッファごと作り直しになり、同じ局のライブとして素直に繋がる。
+   * 続きとして読めないため。リクエストし直せばバッファごと作り直しになり、同じ局のライブとしてそのまま繋がる。
    * リクエストし直すときの使い方はいつもの選局と同じ (`openWhenFree`)。約束どおり使ってよいチューナーがあればそこに入る。
    *
    * 録画にチューナーを取り上げられたのなら、その録画を添える (`live-yield.ts`)。画面は**リクエストし直しても入れなかったとき
@@ -1795,10 +2649,14 @@ class Session {
   private async lose(label: string): Promise<void> {
     /*
      * 使った直後に取り上げられたら、調べた答えがまだ戻っていないことがある。待ってから読む。
-     * それでも一覧から自分が消えたあとに訊いていたら覚えられない (録画を名指しできず、リクエストし直すだけになる)
+     * それでも一覧から自分が消えたあとに一覧を取得していたら覚えられない (録画を名指しできず、リクエストし直すだけになる)
      */
     await this.locating;
-    const recording = await yieldedTo(this.tuner);
+    const where = this.tuner;
+    const recording =
+      where === null
+        ? null
+        : await yieldedTo(where.index, () => tunersOf(where.agent));
     if (this.stopped) return;
     console.warn(
       `[live] ${label}: チューナーから外されました${recording === null ? "" : ` (録画 ${recording.id} に譲った)`}`,
@@ -1812,7 +2670,7 @@ class Session {
   }
 
   /**
-   * **番組が替わって映像・音声・字幕の並び (PMT) が変わった。** 畳んで、見ている人にリクエストし直させる (`restart`)。
+   * **番組が替わって映像・音声・字幕の並び (PMT) が変わった。** セッションを終えて、見ている人にリクエストし直させる (`restart`)。
    *
    * ffmpeg は起きたときの並びのまま音声・字幕を選んでいて (`encodeArgs` の `-map`)、音声の本数や字幕の PID が
    * 変わっても追従しない。その場で ffmpeg を起こし直さないのは `lose` と同じ理由で、時刻が 0 から数え直しになり、
@@ -1837,36 +2695,77 @@ class Session {
 
   /**
    * 届いた塊を 1 局に絞り (`pump` の説明)、**絞ったあとを** データ放送・時計・
-   * Hybridcast・EIT[p/f] の読み取りへ分ける。データ放送は誰も出していなければデコードしない (`wantData`)
+   * Hybridcast・EIT[p/f]・自動起動の指定 (`AutoStartWatch`)・PMT の音声 (`PmtAudioWatch`)・スクランブルの判定の読み取りへ分ける。データ放送は誰も出していなければデコードしない (`wantData`)
    */
   private tap(filter: ServiceFilter | null, chunk: Uint8Array): Uint8Array {
     const out = filter === null ? chunk : filter.filter(chunk);
     if (filter !== null) this.tsid = filter.transportStreamId;
     if (out.length === 0) return out;
-    // **188 バイトに切るのは 1 回だけ** (4 つのパーサで使い回す。ライブの処理でいちばん重いところ)
+    // **188 バイトに切るのは 1 回だけ** (7 つの読み取りで使い回す。ライブの処理でいちばん重いところ)
     const receivedAt = Date.now();
     const data = this.data;
     const ait =
       this.program > 0 ? (this.ait ??= new AitReader(this.program)) : null;
-    if (this.program > 0 && this.source === undefined)
+    if (this.program > 0 && this.source === undefined) {
       this.onAir ??= new PresentFollowing(this.program);
+      this.autoStart ??= new AutoStartWatch(this.program);
+      this.audioWatch ??= new PmtAudioWatch(this.program);
+    }
     const onAir = this.onAir;
+    const autoStart = this.autoStart;
+    const audioWatch = this.audioWatch;
+    let audiosChanged = false;
+    let autoStartChanged = false;
     let switched = false;
     const found: Ait[] = [];
+    // 追っかけ (録画のファイル) は数えない。掛かったまま録れていても、録画のほうで復号する (`encoder.ts`)
+    const scramble =
+      filter !== null && this.source === undefined ? this.scramble : null;
+    const media =
+      filter === null || scramble === null ? null : mediaPids(filter.streams);
     for (const packet of this.packets.feed(out)) {
+      if (media !== null) scramble?.feed(packet, media, receivedAt);
       data?.feedPacket(packet);
       this.clock.feedPacket(packet, receivedAt);
       ait?.feedPacket(packet, found);
       if (onAir?.feedPacket(packet) === true) switched = true;
+      if (autoStart?.feedPacket(packet) === true) autoStartChanged = true;
+      if (audioWatch?.feedPacket(packet) === true) audiosChanged = true;
     }
+    const startsNow = autoStartChanged ? (autoStart?.value ?? null) : null;
+    if (startsNow !== null) this.tell({ type: "autoStart", on: startsNow });
     if (found.length > 0) this.findHybridcast(found);
+    if (scramble !== null && scramble.verdict !== null)
+      this.judgeScrambled(SCRAMBLE_PACKETS);
     if (
       onAir !== null &&
       (switched || receivedAt - this.followedAt >= ON_AIR_EVERY)
     ) {
       this.followOnAir(onAir);
     }
+    // 番組が替わったら、番組表の音声 (名前・デュアルモノか) も替わる
+    if (audiosChanged || switched) this.followAudios();
     return out;
+  }
+
+  /** PMT の音声の ES の部品タグ。読むまでは null (`audioWatch`)。同じ局を選局する人の `nowPlaying` も使う (`pmtSeen`) */
+  get pmtAudioTags(): readonly (number | null)[] | null {
+    return this.audioWatch?.value ?? null;
+  }
+
+  /**
+   * **選べる音声を、PMT と番組表から組み直す。変わったら `audios` で知らせる。**
+   *
+   * 選局の答え (`tuned`) は PMT を読む前に出すので、番組表だけで組んだ一覧になっている。番組表に無い副音声の ES は
+   * そこに入らず、番組が替わっても選局し直すまで前の番組の一覧が残っていた。エンコードしている音声 (`audio`) は替えない
+   */
+  private followAudios(): void {
+    const tags = this.pmtAudioTags;
+    if (tags === null || this.transport === "tlv") return;
+    const next = nowPlaying(this.serviceId, this.audio.id, false, tags).audios;
+    if (JSON.stringify(next) === JSON.stringify(this.audios)) return;
+    this.audios = next;
+    this.tell({ type: "audios", audios: next });
   }
 
   /**
@@ -1881,7 +2780,7 @@ class Session {
       (event) => event !== null,
     );
     try {
-      followOnAir(events);
+      followOnAir(events, this.channelType);
     } catch (error) {
       console.warn(
         `[live] ${this.channelType}:${this.channel}: いまの番組を番組表に写せませんでした: ${error}`,
@@ -1890,10 +2789,22 @@ class Session {
   }
 
   /**
+   * 4K の局の、1 局に絞った TLV を MH-EIT[p/f] の読み取りへ渡す (`tap` の EIT[p/f] と同じ扱い)。
+   * 詰め替え (`runMmt`)・エンコード (`pump`)・HTTP の `raw` (`relayTlv`) のどれでも読む。追っかけ (`source`) は読まない (`onAir` の説明)
+   */
+  private followTlv(tlv: Uint8Array): void {
+    if (tlv.length === 0 || this.program <= 0 || this.source !== undefined)
+      return;
+    const onAir = (this.mmtOnAir ??= new MmtPresentFollowing(this.program));
+    if (onAir.feed(tlv) || Date.now() - this.followedAt >= ON_AIR_EVERY)
+      this.followOnAir(onAir);
+  }
+
+  /**
    * エージェントから来た TS を ffmpeg へ。**その局のぶんだけ渡す。**
    *
    * 録画と同じ絞り方 (`packages/arib/src/service-filter.ts`)。丸ごと渡すと、局が 3 つ入っている TS で
-   * ffmpeg が局を見つけられずに降りる (`encodeArgs` の説明)。
+   * ffmpeg が局を見つけられずに失敗して終了する (`encodeArgs` の説明)。
    *
    * **量はほとんど減らない。** 実測は tvk で 17.6 → 16.8 Mbit/s、日テレで
    * 17.3 → 14.5 Mbit/s。同じ TS に入っている局は**同じ ES を指している**ことが
@@ -1906,28 +2817,36 @@ class Session {
    * ## `write` の返りを待つ。**待たないとサーバごと落ちる**
    *
    * bun の `FileSink.write` は、**捌けなければ Promise を返す**
-   * (捌けたときは書けた数)。放っておくと、ffmpeg が降りたあとの
+   * (捌けたときは書けた数)。放っておくと、ffmpeg が終了したあとの
    * EPIPE が**受け取る先の無い失敗**になり、bun はそれで
-   * **プロセスを終わらせる**。ライブ 1 本の後始末で、録画まで道連れになる。
+   * **プロセスを終わらせる**。ライブ 1 本の後始末で、録画まで止まる。
    *
-   * `try`/`catch` では止まらない。投げられるのではなく、捨てた Promise が
+   * `try`/`catch` では止まらない。例外が送出されるのではなく、捨てた Promise が
    * あとから reject されるため。実機で落ちた (字幕だけ別の ffmpeg でエンコードしていた頃の
-   * 流し込みで EPIPE、終了コード 1)。同じ状況を作って数えると:
+   * 流し込みで EPIPE、終了コード 1)。同じ状況を作って数えた。
    *
    *     write を待たない   15 回中 8 回 落ちる
    *     write を待つ       15 回中 0 回
    *
-   * 待つのは詰まりの面倒を見ることにもなる。捌けるまで読むのを止めれば
+   * 待つのは詰まりへの対処にもなる。捌けるまで読むのを止めれば
    * いいだけで、放送を落とすことにはならない (汲み出しは別に回っている)
    */
   private async pump(
     stream: AsyncGenerator<Uint8Array>,
     proc: ReturnType<typeof Bun.spawn>,
-    /** リーダーを自分で閉じるか。ライブは起こし直しても使い回すので閉じない (`run`) */
+    /** リーダーを自分で閉じるか。ライブは起こし直しても使い回すので閉じない (`runEncode`) */
     own: boolean,
   ): Promise<void> {
     const writer = proc.stdin as import("bun").FileSink;
-    const filter = this.program > 0 ? new ServiceFilter(this.program) : null;
+    // この ffmpeg が無音を流しているか。起こし直して切り替わっても、止めるのはこの ffmpeg のときの値で決める (`finally`)
+    const silent = this.silent;
+    /*
+     * 4K の局は TS を経由しない。1 局に絞って詰め替えた fMP4 を渡す (`live-mmt.ts`)。ffmpeg ごとに作り直す
+     * (fMP4 は init から出し直し、時刻 0 も数え直す。ffmpeg の `start:` もそこから読み直す)
+     */
+    const mmt = this.transport === "tlv" ? new MmtLive(this.program) : null;
+    const filter =
+      mmt === null && this.program > 0 ? new ServiceFilter(this.program) : null;
     /** この ffmpeg を起こしてから、映像・音声・字幕の並びが変わったか */
     const streams = new StreamsWatch();
     /** 先頭から読んだ量 (バイト)。追っかけで作り直したところを覚えるのに使う (`restart`) */
@@ -1957,12 +2876,22 @@ class Session {
          */
         if (this.stopped || this.proc !== proc) break;
         consumed += next.value.length;
+        if (mmt !== null) {
+          const read = mmt.feed(next.value);
+          if (!this.takeMmt(read, mmt, consumed)) break;
+          for (const segment of read.segments) {
+            await writer.write(segment.data);
+            await writer.flush();
+          }
+          continue;
+        }
         const out = this.tap(filter, next.value);
         if (filter !== null && streams.changed(filter)) {
           this.restart(consumed);
           break;
         }
-        if (out.length === 0) continue;
+        // 無音を流しているときは、ffmpeg は TS を読まない (`encodeArgs` の `silent`)。データ放送などへ分けるだけ
+        if (out.length === 0 || silent) continue;
         // **書けたことを待つ** (上の説明)。待たないと、失敗したときに受け止める先がない
         await writer.write(out);
         await writer.flush();
@@ -1970,15 +2899,20 @@ class Session {
     } finally {
       if (own) await stream.return(undefined);
       endInput(proc);
+      /*
+       * 無音を流している ffmpeg は TS を読まないので、入力を閉じても終わらない。止めないと、チューナーから外されたときも
+       * 終わるのを待ったまま (`runEncode`) になり、セッションが終わらない
+       */
+      if (silent) proc.kill();
     }
   }
 
   /**
    * GPU のせいだったと決める。**ソフトウェアに替えて映像が出たときだけ**。選局直後で
-   * 映像がまだ来ていない・入力が途切れた、のように GPU と関係なく降りたのなら、
+   * 映像がまだ来ていない・入力が途切れた、のように GPU と関係なく失敗したのなら、
    * ソフトウェアでも出ずに「映像を出せませんでした」になる。そのとき GPU を 15 分
    * 外したり「GPU でエンコードできなかった」と出したりすると、誤った理由になる。
-   * 同時に開ける数を超えただけなら覚えず (`blameLiveHw`)、断り書きもそう言う
+   * 同時に開ける数を超えただけなら覚えず (`blameLiveHw`)、断り書きもその文にする (`GPU_BUSY`)
    */
   private blameGpu(): void {
     if (this.blame === null) return;
@@ -2009,7 +2943,11 @@ class Session {
       rung: this.rung,
       light: this.light,
       software: this.software,
-      gpuReady: () => codec !== "audio" && liveHwAvailable(codec) !== null,
+      gpuReady: () =>
+        codec !== "audio" &&
+        // 起こすときと同じ経路で引く (`runEncode` の `pickHw`。映像が HEVC ならデコードを GPU に載せない)
+        liveHwAvailable(codec, this.broadcast !== "hevc" && !this.hevcVideo) !==
+          null,
     });
     if (verdict === null) return;
     if (verdict === "heavy") {
@@ -2028,57 +2966,103 @@ class Session {
 
   /**
    * ffmpeg が出した fMP4 を割って配る。**割る道具は ffmpeg ごとに作り**、起こし直したとき
-   * (`run`)、前の ffmpeg の書きかけを次へ持ち越さない
+   * (`runEncode`)、前の ffmpeg の書きかけを次へ持ち越さない
    */
   private async drain(proc: ReturnType<typeof Bun.spawn>): Promise<void> {
     const splitter = new Fmp4Splitter();
     for await (const chunk of chunks(
       proc.stdout as ReadableStream<Uint8Array>,
     )) {
-      for (const segment of splitter.feed(chunk)) {
-        if (segment.kind === "init") {
-          this.init = segment.data;
-          if (this.proc === proc) {
-            this.length.init(segment.data);
-            this.opening.init ??= this.since();
-          }
-          for (const viewer of this.viewers)
-            this.hand(viewer, CHANNEL.videoInit, segment.data);
-        } else {
-          // 起こし直したあとに届いた前の ffmpeg の残りは数えない
-          if (this.proc === proc && !this.produced) {
-            this.produced = true;
-            this.blameGpu();
-            if (this.opening.media === undefined) {
-              this.opening.media = this.since();
-              console.log(
-                openingLine(
-                  `${this.channelType}:${this.channel}`,
-                  this.opening,
-                  this.way,
-                ),
-              );
-            }
-          }
-          if (this.proc === proc) {
-            this.media += this.length.media(segment.data);
-            const now = Date.now();
-            this.meter.record(now, this.media, now);
-            this.lighten(now);
-          }
-          for (const viewer of this.viewers)
-            this.hand(viewer, CHANNEL.videoMedia, segment.data);
-          this.tellClock();
-        }
+      // 起こし直したあとに届いた前の ffmpeg の残りは数えない
+      for (const segment of splitter.feed(chunk))
+        this.deliver(segment, this.proc === proc);
+    }
+  }
+
+  /**
+   * fMP4 の init か media を 1 つ配る (`drain` が ffmpeg の出力を割ったもの、`runMmt` が詰め替えたもの)。
+   * `current` はいまの ffmpeg (詰め替えはいつも) が出したものか。違えば開くまでの内訳と速さに数えない
+   */
+  private deliver(segment: Fmp4Segment, current: boolean): void {
+    if (segment.kind === "init") {
+      this.init = segment.data;
+      if (current) {
+        this.length.init(segment.data);
+        this.opening.init ??= this.since();
+      }
+      for (const viewer of this.viewers)
+        this.hand(viewer, CHANNEL.videoInit, segment.data);
+      return;
+    }
+    if (current && !this.produced) {
+      this.produced = true;
+      this.blameGpu();
+      if (this.opening.media === undefined) {
+        this.opening.media = this.since();
+        console.log(
+          openingLine(
+            `${this.channelType}:${this.channel}`,
+            this.opening,
+            this.way,
+          ),
+        );
       }
     }
+    if (current) {
+      this.media += this.length.media(segment.data);
+      const now = Date.now();
+      this.meter.record(now, this.media, now);
+      this.lighten(now);
+    }
+    for (const viewer of this.viewers)
+      this.hand(viewer, CHANNEL.videoMedia, segment.data);
+    this.tellClock();
+  }
+
+  /**
+   * 4K の局の塊を読んだ結果のうち、fMP4 のほかのもの (`live-mmt.ts`)。字幕の文字の配置を配り、時計の組を覚え、MH-EIT[p/f] を読む (`followTlv`)。
+   * 続けてよければ true。番組が替わってアセットの並びが変わったら作り直す (`restart`。false)。映像・音声がスクランブルされたまま
+   * 届き続けていたら理由を伝えて終える (`judgeScrambled`。終わるまでは読み続ける)
+   */
+  private takeMmt(read: MmtOut, mmt: MmtLive, consumed: number): boolean {
+    if (read.changed) {
+      this.restart(consumed);
+      return false;
+    }
+    /*
+     * スクランブルは TS の局と同じ決まりで決める (`LastingScramble`。窓ごとに数え、掛かったままの窓が 3 秒続いたら理由を伝えて終える)。
+     * 追っかけ (録画のファイル) は数えない
+     */
+    if (this.source === undefined && this.scramble !== null) {
+      this.scramble.add(read.media.total, read.media.scrambled, Date.now());
+      if (this.scramble.verdict !== null) this.judgeScrambled(SCRAMBLE_PACKETS);
+    }
+    this.followTlv(read.tlv);
+    if (mmt.hasCaptions && this.list.add(null))
+      for (const viewer of this.viewers)
+        this.tellCaptions(viewer, this.list.tracks);
+    if (read.anchor !== null)
+      this.mmtAnchor = { pcr: read.anchor.media, unixMs: read.anchor.unixMs };
+    /*
+     * 字幕の時刻は詰め替えた fMP4 の物差し。ffmpeg に渡したときは、ffmpeg が入力で 0 に寄せたぶん (`start:`) を引くと
+     * 出力の物差しになる (時計と同じ。`clockNotice`)。読めるまでは寄せていないとみる (fMP4 の始まりは 0 の近く)
+     */
+    const shift =
+      this.passthrough || !Number.isFinite(this.startPts) ? 0 : this.startPts;
+    for (const caption of read.captions)
+      this.deliverText({
+        at: Math.max(0, caption.at - shift * 1000),
+        page: caption.page,
+        language: 1,
+      });
+    return true;
   }
 
   /**
    * ffmpeg が出した字幕を割って配る。**時刻はコマに付いてくる。**
    *
    * コンテナは Matroska ([ts/mkv.ts](../ts/mkv.ts))。並べただけでは
-   * 時刻が乗らず、別の ffmpeg で出させると入口の寄せ幅が違ってずれる (`captions.ts`)
+   * 時刻が乗らず、別の ffmpeg で出させると入力の寄せ幅が違ってずれる (`captions.ts`)
    */
   private async subtitles(pipe: ReadableStream<Uint8Array>): Promise<void> {
     // 割る道具もデコードする側も ffmpeg ごと (`drain` と同じ理由。デコードする側は書式を字幕文を跨いで持つ)
@@ -2192,7 +3176,7 @@ class Session {
         for (const viewer of wanting) this.tellData(viewer, program);
       }
     }
-    // **組み立てるのは 1 回だけ。** 人数ぶん JSON にすると、人が増えたぶんだけ無駄に働く
+    // **JSON にするのは 1 回だけ。** 人数ぶん JSON にすると、人が増えたぶんだけ同じ変換を繰り返す
     const data = json(message);
     for (const viewer of wanting)
       viewer.connection.send(CHANNEL.data, 0n, data);
@@ -2211,7 +3195,7 @@ class Session {
    *
    * **`transportStreamId` だけは放送から取得します** (`ServiceFilter` が絞るときに
    * 読んだ PAT の値)。番組表には要らないので集めていませんが、**データ放送が
-   * 受信機に訊いてきます**。テレ朝の TVer リンクは `browser.getProgramID(4)` で
+   * 受信機に問い合わせます**。テレ朝の TVer リンクは `browser.getProgramID(4)` で
    * これを取り、TVer のサーバへ機器の識別子と並べて送る。`null` のままだと
    * 文字の "null" が飛んで、あちらが `e` を返し、画面には
    * 「情報を取得することができませんでした。[エラーコード:DT-RE]」とだけ出ます
@@ -2278,7 +3262,7 @@ class Session {
     for await (const line of lines(proc.stderr as ReadableStream<Uint8Array>)) {
       if (list !== this.list) return;
       /*
-       * **選べる字幕は入口の見出しに出ている。** 1 枚も来ていなくても
+       * **選べる字幕は入力の見出しに出ている。** 1 枚も来ていなくても
        * 分かるので、画面は待たずに切り替えを出せる (間隔の空く番組で
        * ボタンが出なかったのはこれを見ていなかったため)
        */
@@ -2287,15 +3271,17 @@ class Session {
           this.tellCaptions(viewer, list.tracks);
         continue;
       }
-      // 入口の見出しに出ている「0 に寄せたぶん」。時計を配るのに要る
+      // 入力の見出しに出ている「0 に寄せたぶん」。時計を配るのに要る
       if (!Number.isFinite(this.startPts) && line.includes("start:")) {
         this.startPts = parseStart(line);
         // 起こし直したあとの新しい対応は、次の塊で配る (`CLOCK_EVERY` を待たない)
         this.toldClockAt = 0;
       }
-      // 字幕が無い放送。**映像ごと落ちる**ので、字幕なしで再エンコードする (`run`)
+      // 字幕が無い放送。**映像ごと落ちる**ので、字幕なしで再エンコードする (`runEncode`)
       if (NO_SUBTITLE.test(line)) this.noSubtitle = true;
-      // NVENC の同時に開ける数を超えた。GPU から降りても方式は覚えない (`run`・`blameGpu`)
+      // 局の映像か音声が無い。字幕なしで起こし直しても同じところで失敗する (`runEncode`)
+      this.noMedia ??= missingMedia(line);
+      // NVENC の同時に開ける数を超えた。GPU からソフトウェアに切り替えても方式は覚えない (`runEncode`・`blameGpu`)
       if (nvencBusy(line)) this.busy = true;
       if (worthLogging(line)) {
         console.warn(
@@ -2309,7 +3295,7 @@ class Session {
    * Hybridcast が載っていれば、在ることと行き先を伝える。
    *
    * **同じものは伝え直さない。** 放送は同じ表を数秒ごとに繰り返し流すので、
-   * 素直に配ると毎秒の通知になる。
+   * そのまま配ると毎秒の通知になる。
    *
    * `autostart` のものだけ出す判断はしません。テレビが勝手に始めるかどうかの
    * 違いでしかなく、`present` (人が呼んだら始めるもの) も**在ることに変わりは
@@ -2342,7 +3328,7 @@ class Session {
     }
   }
 
-  tell(notice: Notice): void {
+  private tell(notice: Notice): void {
     for (const viewer of this.viewers) this.tellOne(viewer, notice);
   }
 
@@ -2350,10 +3336,10 @@ class Session {
     viewer.connection.send(CHANNEL.control, 0n, json(notice));
   }
 
-  /** 畳んだときに呼ぶもの (`whenStopped`) */
+  /** 終えたときに呼ぶもの (`whenStopped`) */
   private readonly stopping: (() => void)[] = [];
 
-  /** 畳んだら呼ぶ。追っかけが変換の枠を返すのに使う (`openChase`)。もう畳んでいればその場で */
+  /** 終えたら呼ぶ。追っかけが変換の枠を返すのに使う (`openChase`)。もう終えていればその場で */
   whenStopped(fn: () => void): void {
     if (this.stopped) fn();
     else this.stopping.push(fn);
@@ -2371,6 +3357,8 @@ class Session {
     // 選び直しで同じ目印の新しいものが載っていたら、そちらは消さない
     if (sessions.get(this.id) === this) sessions.delete(this.id);
     for (const fn of this.stopping.splice(0)) fn();
+    this.settle();
+    this.formatKnown();
   }
 
   /**
@@ -2383,7 +3371,7 @@ class Session {
    * 字幕は denpa がデコードして文字の配置にする (エンコードの経路と同じ)。
    *
    * **字幕の ffmpeg が失敗しても映像は止めない。** エンコードの経路と違って、映像はそもそも
-   * ffmpeg を通っていない。字幕を持たない放送で降りたら、覚えておいて (`captionless`)
+   * ffmpeg を通っていない。字幕を持たない放送で失敗したら、覚えておいて (`captionless`)
    * 次からは起こさない
    *
    * **追っかけも同じ** (`source`。録画中のファイルを読む)。違うのは終わり方だけで、読み切ったら `ended` を伝えて閉じる
@@ -2394,13 +3382,50 @@ class Session {
     const chase = this.source !== undefined;
     try {
       const tuned = this.source?.() ?? (await this.tune());
+      if (!chase) this.opening.tuned = this.since();
+      // 4K の局は 1 局に絞った TLV をそのまま流す (HTTP の `codec=raw` だけ。画面の「放送のまま」は詰め替えの `runMmt`)
+      if (this.transport === "tlv") return await this.relayTlv(label, tuned);
+      let input = chunks(tuned);
+      /*
+       * **ライブは、送り始める前に PMT で映像のコーデックを見る。** TS に HEVC を入れて送る 4K の局なら、画面の MPEG-2 の
+       * デコーダでは観られないので、HEVC の詰め替え (端末が HEVC を再生できなければエンコード) に替えて、エンコードの経路へ
+       * 渡す (`servedFormat`・`switchFormat`)。絞る側 (`ServiceFilter`) も PMT を読むまで何も出さないので、待っても遅れない
+       */
+      /*
+       * **追っかけも、開く前に録画の PMT を読めなかったもの (録り始めたばかり) も、送る前に PMT を読む** (`learnsBroadcast`)。
+       * 録画の先頭にはすぐ PMT が書かれるので、伸びている録画のストリームから読む。HEVC なら 4K の局の録画と同じく
+       * 放送の HEVC を写したものに替え (`chaseRawServed`)、読み直したストリームでエンコードの経路へ渡す
+       * (追っかけは ffmpeg を起こすたびに `source` から読み直す。読んだぶんは閉じる)。読めた答えは録画ごとに覚える
+       */
+      if (this.readsVideo()) {
+        const head = await peekPmt(input, this.program, PMT_WAIT);
+        input = head.stream;
+        if (this.stopped) return;
+        if (chase && head.count !== null)
+          this.learnsBroadcast?.(head.video === "hevc" ? "hevc" : "mpeg2");
+        const served = chase
+          ? chaseRawServed(this.asked, head.video)
+          : servedFormat(this.asked, head.video, this.playable);
+        if (served === null) {
+          this.died(label, "playable に HEVC・H.264・AV1 が無い", NO_FORMAT);
+          return;
+        }
+        if (!served.raw) {
+          this.switchFormat(served);
+          if (!chase) return await this.runEncode(label, input);
+          void input.return(undefined);
+          return await this.runEncode(label);
+        }
+      }
+      this.formatKnown();
       if (!remembered(captionless, this.serviceId)) captioner = this.captions();
       const filter = this.program > 0 ? new ServiceFilter(this.program) : null;
       const streams = new StreamsWatch();
       try {
-        for await (const chunk of chunks(tuned)) {
+        for await (const chunk of input) {
           if (this.stopped) break;
           this.fed = true;
+          if (!chase) this.opening.firstByte ??= this.since();
           const out = this.tap(filter, chunk);
           /*
            * **番組が替わって並びが変わったら、字幕の ffmpeg だけ起こし直す** (`StreamsWatch`)。
@@ -2421,6 +3446,15 @@ class Session {
             captioner = this.captions();
           }
           if (out.length === 0) continue;
+          if (this.opening.sent === undefined) {
+            this.opening.sent = this.since();
+            console.log(
+              rawOpeningLine(
+                `${this.channelType}:${this.channel}`,
+                this.opening,
+              ),
+            );
+          }
           // ライブは詰まったら捨てる。追っかけは捨てずに読むほうを止める (`hand` の説明)
           for (const viewer of this.viewers)
             this.hand(viewer, CHANNEL.rawTs, out);
@@ -2431,30 +3465,94 @@ class Session {
         // 届く前に切れたのは選局の失敗 (下の catch)。届いたあとなら外された
         if (!this.fed || chase) throw error;
       }
-      switch (rawEnding({ chase, fed: this.fed, stopped: this.stopped })) {
-        case "ended":
-          this.tell({ type: "ended" });
-          return;
-        case "lost":
-          return await this.lose(label);
-        case "died":
-          this.died(label, "放送が途切れました", "映像を出せませんでした");
-          return;
-        case "quiet":
-          return;
-      }
+      return await this.endRaw(label, chase);
     } catch (error) {
-      this.died(
-        label,
-        String(error),
-        chase
-          ? "録画を読めませんでした"
-          : whyNotTuned(String(error), resting(this.serviceId)),
-      );
+      if (chase) this.died(label, String(error), "録画を読めませんでした");
+      else await this.notTuned(label, error);
     } finally {
       captioner?.stop();
+      // スクランブルの理由を伝え終えてから終える (`endScrambled`)
+      await this.ending;
       this.stop();
     }
+  }
+
+  /**
+   * **4K の局の放送の HEVC と AAC を、エンコードせずに fMP4 に詰め替えて配る** (`passthrough`。docs/stream.md「4K の局のライブ」)。
+   *
+   *     エージェント (TLV) → 1 局に絞る → 映像・音声を取り出して fMP4 に詰め替える (`live-mmt.ts`) → WebSocket → MSE
+   *
+   * ffmpeg は起こさない。字幕も denpa が TTML から作る。途切れたときの扱いは放送そのまま (`runRaw`) と同じ。
+   * **追っかけも同じ** (`source`。4K の局の録画 `.mmts` を読む)。読み切ったら `ended` を伝えて閉じる
+   */
+  private async runMmt(label: string): Promise<void> {
+    const chase = this.source !== undefined;
+    try {
+      const tuned = this.source?.() ?? (await this.tune());
+      if (!chase) this.opening.tuned = this.since();
+      this.way = "hevc・詰め替え";
+      const mmt = new MmtLive(this.program);
+      let consumed = 0;
+      await this.readTlv(label, tuned, (chunk) => {
+        consumed += chunk.length;
+        const read = mmt.feed(chunk);
+        if (!this.takeMmt(read, mmt, consumed)) return false;
+        for (const segment of read.segments) this.deliver(segment, true);
+        return true;
+      });
+    } catch (error) {
+      if (chase) this.died(label, String(error), "録画を読めませんでした");
+      else await this.notTuned(label, error);
+    } finally {
+      this.stop();
+    }
+  }
+
+  /** 4K の局の、1 局に絞った TLV をそのまま配る (HTTP の `codec=raw`。`runRaw`) */
+  private relayTlv(
+    label: string,
+    tuned: ReadableStream<Uint8Array>,
+  ): Promise<void> {
+    const filter = new MmtServiceFilter(this.program);
+    return this.readTlv(label, tuned, (chunk) => {
+      const out = filter.filter(chunk);
+      this.followTlv(out);
+      if (out.length > 0)
+        for (const viewer of this.viewers)
+          this.hand(viewer, CHANNEL.rawTs, out);
+      return true;
+    });
+  }
+
+  /**
+   * チューナーの TLV を塊ごとに `each` へ渡す (4K の局。`runMmt`・`relayTlv`)。`each` が false を返したら抜ける。
+   * 尽きたら放送そのままの経路と同じく、外されたならリクエストし直させ、何も届かずに途切れたなら理由を伝える (`rawEnding`)
+   */
+  private async readTlv(
+    label: string,
+    tuned: ReadableStream<Uint8Array>,
+    each: (chunk: Uint8Array) => boolean,
+  ): Promise<void> {
+    // 追っかけ (`source`) は録画のファイルを読む。読み切ったら終わり (`rawEnding`)
+    const chase = this.source !== undefined;
+    let left = false;
+    try {
+      for await (const chunk of chunks(tuned)) {
+        if (this.stopped) break;
+        this.fed = true;
+        this.opening.firstByte ??= this.since();
+        if (!each(chunk)) {
+          left = true;
+          break;
+        }
+      }
+    } catch (error) {
+      // 届く前に切れたのは選局の失敗 (呼ぶ側の catch)。届いたあとなら外された。追っかけは読めなかった
+      if (!this.fed || chase) throw error;
+    }
+    // 作り直す (`restart`)・終える (`takeMmt`) と決めて抜けたなら、終わりの扱いはそちらで済んでいる
+    if (left) return;
+    await this.endRaw(label, chase);
   }
 
   /**
@@ -2533,8 +3631,7 @@ class RawCaptions {
  *
  * 名指しのチューナー (`pin`) も入る (下の引数の説明)。
  *
- * **回線に合わせて下げた段 (`rung`) も入る。** 段は固定の表 (`#lib/rungs.ts`) なので、同じ段の人どうしは共有できる。
- * 段 0 の目印は段を足す前と同じ
+ * **回線に合わせて下げた段 (`rung`) も入る。** 段は固定の表 (`#lib/rungs.ts`) なので、同じ段の人どうしは共有できる
  */
 export const key = (
   type: string,
@@ -2547,68 +3644,98 @@ export const key = (
   // **チューナーを名指ししているものは別のセッションにする**。名指しでない人と混ぜると、指定のチューナーで選局されない
   pin: string | null = null,
   rung: Rung = 0,
+  // **元の TS のまま送るもの (`Session.keepsTs`) は、HEVC の詰め替えに替えるものと分ける**
+  keepsTs = false,
 ) =>
-  `${type}:${channel}:${serviceId}:${form === "raw" ? "*" : audio.id}:${form}:${track}${pin === null ? "" : `@${pin}`}${rung === 0 ? "" : `~${rung}`}`;
+  `${type}:${channel}:${serviceId}:${form === "raw" ? "*" : audio.id}:${form}:${track}${pin === null ? "" : `@${pin}`}${rung === 0 ? "" : `~${rung}`}${keepsTs ? "!ts" : ""}`;
 const sessions = new Map<string, Session>();
 
-/** いまライブを観ている人がいるか (セッションが 1 つでもあるか)。Windows と Mac をスリープさせないかを決める (`power.ts`) */
+/**
+ * ライブのセッションが 1 つでもあるか (観る人を待って先に開いておくものも数える。追っかけは数えない)。
+ * Windows と Mac をスリープさせないかを決める (`power.ts`)
+ */
 export function hasLiveViewers(): boolean {
   return sessions.size > 0;
 }
 
-/** エンコードし始めて一覧に載せる。畳むのは見ている人がいなくなったとき。ここでは待たない */
-function begin(
-  channelType: string,
-  channel: string,
-  serviceId: number,
-  now: NowPlaying,
-  codec: StreamCodec,
-  track: number,
-  raw: boolean,
-  pin: string | null = null,
-  rung: Rung = 0,
-): Session {
+/**
+ * **入れ替えで止まることを、開いている全部の接続 (ライブ・追っかけ) に知らせる** (`Notice` の `restarting`)。
+ * 止まる直前 (録画を待ち終えたあと。`runtime.ts` の `stop`) に呼ぶ。画面はこのあとの途切れを回線の細さに数えない
+ */
+export function announceRestart(): void {
+  const notice: Notice = { type: "restarting" };
+  for (const connection of openConnections()) {
+    try {
+      connection.send(CHANNEL.control, 0n, json(notice));
+    } catch {
+      // 閉じかけの接続。知らせられなくても、画面は切れたことで同じく扱う
+    }
+  }
+}
+
+/** ライブで観るもの (`begin`・`sharedSession`・`watch`)。目印 (`key`) が同じなら同じセッションを共有する */
+interface Want {
+  channelType: string;
+  channel: string;
+  serviceId: number;
+  now: NowPlaying;
+  codec: StreamCodec;
+  /** その局の中で何本目の字幕を出すか */
+  track: number;
+  raw: boolean;
+  /** デバッグ用に名指ししたチューナー (`Session.pin`)。無ければ null */
+  pin: string | null;
+  rung: Rung;
+  /**
+   * 端末が再生できると送ってきた形式 (HTTP の `?playable=`)。TS で送る 4K の局の放送のままを、HEVC の詰め替えにするか
+   * エンコードするかを決める (`servedFormat`)。送ってこなければ省く (画面の WebSocket は、受け取れなければ自分で次の形式に移る)
+   */
+  playable?: readonly LiveFormat[];
+  /** 放送のままを元の TS のまま送るか (`Session.keepsTs`。HTTP の `codec=raw` で `?playable=` が無いもの) */
+  keepsTs?: boolean;
+  /** 映像のある局か (`schema.hasVideo`)。false なら `codec` は `audio` (`AUDIO_FORM`)。省けば映像のある局 */
+  video?: boolean;
+}
+
+/** エンコードし始めて一覧に載せる。終えるのは見ている人がいなくなったとき。ここでは待たない */
+function begin(want: Want): Session {
   const session = new Session(
-    channelType,
-    channel,
-    serviceId,
-    now.program,
-    now.audio,
-    codec,
-    track,
-    raw,
+    want.channelType,
+    want.channel,
+    want.serviceId,
+    want.now.program,
+    want.now.audio,
+    want.codec,
+    want.track,
+    want.raw,
     undefined,
     undefined,
-    pin,
-    rung,
+    want.pin,
+    want.rung,
+    want.now.transport,
+    want.keepsTs === true,
   );
+  session.audios = want.now.audios;
+  session.playable = want.playable ?? null;
+  session.video = want.video !== false;
   sessions.set(session.id, session);
   void session.run();
   return session;
 }
 
 /** いま同じもの (段まで同じ) をエンコードしているセッション。段を下げるときに枠が要るかを決める (`rungSlot`) */
-function sharedSession(
-  channelType: string,
-  channel: string,
-  serviceId: number,
-  now: NowPlaying,
-  codec: StreamCodec,
-  track: number,
-  raw: boolean,
-  pin: string | null,
-  rung: Rung,
-): Session | undefined {
+function sharedSession(want: Want): Session | undefined {
   return sessions.get(
     key(
-      channelType,
-      channel,
-      serviceId,
-      now.audio,
-      raw ? "raw" : codec,
-      track,
-      pin,
-      rung,
+      want.channelType,
+      want.channel,
+      want.serviceId,
+      want.now.audio,
+      want.raw ? "raw" : want.codec,
+      want.track,
+      want.pin,
+      want.rung,
+      want.keepsTs === true,
     ),
   );
 }
@@ -2617,35 +3744,15 @@ function sharedSession(
  * 見に行く。既に同じものをエンコードしていれば、そのセッションを共有する。
  *
  * `release` は段を下げたもの (`rung` が 1〜3) のために呼ぶ側が取った枠 (`rungSlot`)。新しくエンコードし始めたら
- * 畳んだときに返し、共有したならその場で返す
+ * 終えたときに返し、共有したならその場で返す
  */
 function watch(
-  channelType: string,
-  channel: string,
-  serviceId: number,
-  now: NowPlaying,
-  codec: StreamCodec,
-  track: number,
-  raw: boolean,
+  want: Want,
   viewer: Viewer,
-  pin: string | null = null,
-  rung: Rung = 0,
   release: () => void = () => undefined,
 ): Session {
-  const shared = sharedSession(
-    channelType,
-    channel,
-    serviceId,
-    now,
-    codec,
-    track,
-    raw,
-    pin,
-    rung,
-  );
-  const session =
-    shared ??
-    begin(channelType, channel, serviceId, now, codec, track, raw, pin, rung);
+  const shared = sharedSession(want);
+  const session = shared ?? begin(want);
   if (shared === undefined) session.whenStopped(release);
   else release();
   session.add(viewer);
@@ -2677,7 +3784,7 @@ export const CHASE_STREAM_HOLD = 4 * 1024 * 1024;
  * 放送そのままでは効かない (全部の音声を送り、アプリが選ぶ)。
  *
  * 画面の視聴者と同じ取り合いに加わる。同じ局・同じエンコード方式・**同じ音声**を誰かが見ていれば
- * 共有し (`key`)、最後の 1 人が抜けたら畳む。局が無ければ null。
+ * 共有し (`key`)、最後の 1 人が抜けたら終える。局が無ければ null。
  *
  * `rung` は回線に合わせて下げた段 (`#lib/rungs.ts`。コーデックは呼ぶ側が `viewing.askedFormat`・`liveAudioOnly` で決めて `codec` に渡す)。
  * 放送そのままでは効かない。音声だけは画面の WebSocket と同じく音声のビットレートだけを下げ (`audioArgs`)、枠は使わない。
@@ -2688,49 +3795,95 @@ export function liveStream(
   codec: StreamCodec | "raw",
   audio?: string,
   rung: Rung = 0,
+  playable: readonly LiveFormat[] | null = null,
 ): ReadableStream<Uint8Array> | null | "busy" {
-  const row = serviceOf(serviceId);
-  if (row === undefined) return null;
-  const raw = codec === "raw";
-  const form = raw ? "h264" : codec;
-  const level = raw ? 0 : rung;
-  const now = nowPlaying(serviceId, audio);
-  const shared = sharedSession(
-    row.type,
-    row.channel,
-    serviceId,
-    now,
-    form,
-    0,
-    raw,
-    null,
-    level,
+  const want = httpWant(serviceId, codec, audio, rung, playable !== null);
+  if (want === null) return null;
+  if (playable !== null) want.playable = playable;
+  const release = rungSlot(
+    want.codec === "audio" ? 0 : want.rung,
+    sharedSession(want) !== undefined,
   );
-  const release = rungSlot(codec === "audio" ? 0 : level, shared !== undefined);
   if (release === null) return "busy";
-  return sessionStream((viewer) =>
-    watch(
-      row.type,
-      row.channel,
+  const opened: { session?: Session } = {};
+  const stream = sessionStream((viewer) => {
+    opened.session = watch(want, viewer, release);
+    return opened.session;
+  });
+  if (opened.session !== undefined) httpSessions.set(stream, opened.session);
+  return stream;
+}
+
+/** HTTP のライブの応答と、それを流すセッション (`liveServed`) */
+const httpSessions = new WeakMap<ReadableStream<Uint8Array>, Session>();
+
+/**
+ * **HTTP のライブが実際に流す形式** (`liveStream` が返したもの)。TS で送る 4K の局の放送のままは、PMT を読んでから
+ * HEVC の詰め替えかエンコードに替わる (`servedFormat`)。決まるまで待つ。応答ヘッダの `X-Denpa-Codec` と Content-Type に使う。
+ * `liveStream` が返したものでなければ null
+ */
+export async function liveServed(
+  stream: ReadableStream<Uint8Array>,
+): Promise<{ codec: StreamCodec; raw: boolean } | null> {
+  const session = httpSessions.get(stream);
+  if (session === undefined) return null;
+  await session.decided;
+  return { codec: session.codec, raw: session.raw };
+}
+
+/**
+ * HTTP のライブ (`liveStream`・`liveCaptions`) が観るもの。字幕は 1 本目で、チューナーは名指ししない。
+ * 放送そのままでは段を下げない。4K の局の `hevc` (放送の HEVC の詰め替え) も段を下げない (下げるコーデックは呼ぶ側が決めて渡す)。
+ * 局が無いか、局のチャンネルが分からなければ null
+ */
+function httpWant(
+  serviceId: number,
+  form: StreamCodec | "raw",
+  audio: string | undefined,
+  rung: Rung,
+  /** 端末が再生できる形式を送ってきたか (`?playable=`)。送ってこない `raw` は元の TS のまま送る (`Session.keepsTs`) */
+  stated = true,
+): Want | null {
+  const row = serviceOf(serviceId);
+  // チャンネルの分からない局 (エージェントの控えの写しがまだ無い) は選局できない
+  if (row === undefined || row.channel === null) return null;
+  // 映像の無い局は、どの形式をリクエストされても音声だけ (`AUDIO_FORM`)
+  if (!hasVideo(row.service_type))
+    return {
+      channelType: row.type,
+      channel: row.channel,
       serviceId,
-      now,
-      form,
-      0,
-      raw,
-      viewer,
-      null,
-      level,
-      release,
-    ),
-  );
+      now: nowPlaying(serviceId, audio),
+      codec: AUDIO_FORM.codec,
+      track: 0,
+      raw: false,
+      pin: null,
+      rung: 0,
+      video: false,
+    };
+  const raw = form === "raw";
+  const whole = row.transport === "tlv" && form === "hevc";
+  return {
+    channelType: row.type,
+    channel: row.channel,
+    serviceId,
+    now: nowPlaying(serviceId, audio, whole),
+    codec: raw ? "h264" : form,
+    track: 0,
+    raw,
+    pin: null,
+    rung: raw || whole ? 0 : rung,
+    // TS で送る 4K の局があるのはケーブルだけ。ほかの局は分けずに共有する
+    keepsTs: raw && !stated && row.type === "CATV" && row.transport === "ts",
+  };
 }
 
 /**
  * **HTTP で流す追っかけ再生** (`GET /api/recordings/<id>/chase`)。テレビのアプリ向け。
  *
  * - `raw` … 録画中の元の TS を、`at` 秒に当たるところから**そのまま**流し、伸びるのを追い読みする
- *   (位置の当て方は `chasePlan` のバイト比例)。録り終えて尻まで読んだら閉じる
- * - `h264` / `av1` … 画面の追っかけ (`openChase`) と同じ再エンコードを、WebSocket ではなく
+ *   (位置の当て方は `chasePlan` のバイト比例)。録り終えて末尾まで読んだら閉じる
+ * - `h264` / `av1` (段を下げたときは `hevc` も) … 画面の追っかけ (`openChase`) と同じ再エンコードを、WebSocket ではなく
  *   HTTP の fMP4 で流す。読み切ったら (`ended`) 閉じる
  *
  * シークは `at` を変えてリクエストし直す (画面の追っかけと同じく、位置ごとに立て直す)。
@@ -2752,12 +3905,27 @@ export function chaseStream(
   if (source === undefined || source.size === 0) return null;
   if (codec === "raw") {
     const { rec, path, size } = source;
-    const plan = chasePlan(size, recordedSec(rec), at);
-    return followFile(path, plan.offset, plan.paceBytesPerSec, () =>
+    const plan = chasePlan(size, recordedSec(rec, path), at);
+    // 4K の局の録画 (TLV) は、パケットの先頭から送る (`tlvStart`)
+    const offset =
+      recordedTransport(path) === "tlv"
+        ? tlvStart(path, plan.offset)
+        : plan.offset;
+    return followFile(path, offset, plan.paceBytesPerSec, () =>
       recordingDone(rec.id),
     );
   }
-  const release = holdTranscode();
+  // 4K の局の録画の H.265 は放送の HEVC を写す (`chaseForm`)。エンコードしないので枠を使わない。映像の無い録画は音声だけで、これも使わない
+  const program = aribServiceId(source.rec.service_id);
+  const { copy } = chaseForm(
+    { codec, raw: false, rung, playable: [codec] },
+    recordedTransport(source.path),
+    recordedBroadcast(source.path, program),
+  );
+  const release =
+    copy || !recordedMedia(source.path, program).video
+      ? () => undefined
+      : holdTranscode();
   if (release === null) return "busy";
   return sessionStream((viewer, hold) =>
     openChase(
@@ -2800,21 +3968,30 @@ export function liveCaptions(
   audio?: string,
   rung: Rung = 0,
 ): ReadableStream<Uint8Array> | null {
-  const row = serviceOf(serviceId);
-  if (row === undefined) return null;
-  // 放送そのままの目印は音声で分けない (`key`)。変換したものは映像と同じ決め方で音声を選ぶ (`liveStream`)
-  const session = sessions.get(
-    key(
-      row.type,
-      row.channel,
-      serviceId,
-      nowPlaying(serviceId, form === "raw" ? undefined : audio).audio,
-      form,
-      0,
-      null,
-      form === "raw" ? 0 : rung,
-    ),
-  );
+  // 映像 (`liveStream`) と同じ決め方で目印を作る。放送そのままの目印は音声で分けない (`key`)
+  /*
+   * ケーブルの局の `raw` は、元の TS のまま送るもの (`?playable=` の無い映像) を先に探し、無ければ HEVC の詰め替えに替えうるもの
+   * (`?playable=` の付いた映像) を探す (`Session.keepsTs`)。ほかの局はどちらも同じ目印になる
+   */
+  const want = httpWant(serviceId, form, audio, rung, false);
+  /*
+   * `codec=auto` で放送のままが選ばれ、PMT を読んで HEVC の詰め替えかエンコードに替えたもの (`servedFormat`) は、
+   * 応答の `X-Denpa-Codec` (`hevc` など) で来る。目印はリクエストされた `raw` なので、`raw` の目印で探して送っている形式を比べる
+   */
+  const switched = (): Session | undefined => {
+    if (form === "raw") return undefined;
+    const asked = httpWant(serviceId, "raw", audio, 0);
+    const found = asked === null ? undefined : sharedSession(asked);
+    return found !== undefined && !found.raw && found.codec === form
+      ? found
+      : undefined;
+  };
+  const session =
+    want === null
+      ? undefined
+      : (sharedSession(want) ??
+        sharedSession({ ...want, keepsTs: false }) ??
+        switched());
   if (session === undefined || !session.alive) return null;
   return captionFeed((out) => {
     const viewer: Viewer = {
@@ -2837,14 +4014,14 @@ const CAPTION_LEAD = 10;
 const CAPTION_AHEAD = 10;
 
 /**
- * 1 本の録画に同時に起こしておく字幕の ffmpeg の数。**超えたら古いものから畳む。**
+ * 1 本の録画に同時に起こしておく字幕の ffmpeg の数。**超えたら古いものから止める。**
  *
  * アプリはシークのたびにリクエストし直すので、前の繋ぎが切れたと分かるのが遅れる (前段の nginx 越しなど) と
- * 一時的に何本も並ぶ。古いほどもう観ていない位置なので、新しいものを断るより古いものを畳む
+ * 一時的に何本も並ぶ。古いほどもう観ていない位置なので、新しいものを断るより古いものを止める
  */
 export const CAPTION_PER_RECORDING = 3;
 
-/** 録画ごとに、いま起こしている字幕の ffmpeg の畳み方 (古い順) */
+/** 録画ごとに、いま起こしている字幕の ffmpeg の止め方 (古い順) */
 const recordingCaptioners = new Map<number, (() => void)[]>();
 
 /**
@@ -2871,7 +4048,9 @@ export function recordingCaptions(
   const source = chaseSource(recordingId);
   if (source === undefined || source.size === 0) return null;
   const { rec, path, size } = source;
-  const recorded = recordedSec(rec);
+  // 4K の局の元の録画 (`.mmts`) は TLV で、TS の字幕の読み取りも ffmpeg も読めない (空のまま 200 にしない)
+  if (recordedTransport(path) === "tlv") return null;
+  const recorded = recordedSec(rec, path);
   const plan = chasePlan(size, recorded, Math.max(0, at - CAPTION_LEAD));
   const burst = Math.round(
     (size / Math.max(1, recorded)) * (CAPTION_LEAD + CAPTION_AHEAD),
@@ -2891,13 +4070,14 @@ export function recordingCaptions(
     ).getReader();
     let stopped = false;
     /** いま写させている ffmpeg。番組が替わって並びが変わったら起こし直す (下の流し込み) */
-    let proc = spawnRecordingCaptioner(
-      program,
-      label,
-      language,
-      out,
-      () => proc,
-    );
+    let proc: ReturnType<typeof Bun.spawn>;
+    try {
+      proc = spawnRecordingCaptioner(program, label, language, out, () => proc);
+    } catch (error) {
+      // ffmpeg を起こせなかった。読み始めた録画を閉じる (残すと、ずっと読み続ける)
+      reader.cancel().catch(() => undefined);
+      throw error;
+    }
     const stop = () => {
       if (stopped) return;
       stopped = true;
@@ -2909,7 +4089,7 @@ export function recordingCaptions(
       if (rest.length > 0) recordingCaptioners.set(rec.id, rest);
       else recordingCaptioners.delete(rec.id);
     };
-    // 多すぎたら古いものから畳む (`CAPTION_PER_RECORDING`)。畳まれた接続は ffmpeg が降りて閉じる
+    // 多すぎたら古いものから止める (`CAPTION_PER_RECORDING`)。止めた接続は ffmpeg が終了して閉じる
     const held = recordingCaptioners.get(rec.id) ?? [];
     for (const old of held.slice(
       0,
@@ -2964,7 +4144,7 @@ export function recordingCaptions(
 
 /**
  * 録画の字幕を写す ffmpeg を 1 本起こし (`spawnCaptioner`)、選べる字幕と文字の配置を `out` へ送らせる。
- * **読み切ったら閉じる** (字幕を持たない録画なら、ffmpeg が組み立てで降りる)。ただし起こし直された
+ * **読み切ったら閉じる** (字幕を持たない録画なら、ffmpeg が組み立てで失敗して終了する)。ただし起こし直された
  * あとの古いもの (`current` が自分でない) は閉じない
  */
 function spawnRecordingCaptioner(
@@ -2975,7 +4155,7 @@ function spawnRecordingCaptioner(
   current: () => ReturnType<typeof Bun.spawn>,
 ): ReturnType<typeof Bun.spawn> {
   const { proc, pipe } = spawnCaptioner(program, 0);
-  // 選べる字幕は入口の見出しから (`TrackList`)。ffmpeg ごとに数え直す。失敗は残す
+  // 選べる字幕は入力の見出しから (`TrackList`)。ffmpeg ごとに数え直す。失敗は残す
   const list = new TrackList(program);
   const text = new CaptionText();
   const effective = () => pickLanguage(text.languages, language);
@@ -3091,13 +4271,111 @@ export function sessionStream(
 }
 
 /**
- * 誰も繋いでこなかったときに畳むまで (ms)。
+ * 誰も繋いでこなかったときに終えるまで (ms)。
  *
  * **画面はすぐ来る**。実測で、ページを組みはじめてから WebSocket が繋がる
  * まで 160ms。それでも来ないなら開いたそばから離れた人なので、使ったままに
- * しない (ライブは録画の次に優先度が高いので、放っておくと番組表の取得からチューナーを取り上げ続ける)。
+ * しない (チューナーが足りないときはライブを録画の次に先にするので、放っておくと番組表の取得からチューナーを取り上げ続ける)。
  */
 const WARM_WAIT = 8_000;
+
+/** 先回りして始めたセッション (`warm`)。終えたら外す。誰も来ていないかは `Session.empty` で見る */
+const warmed = new Set<Session>();
+
+/**
+ * **画面が先回りと違う形式をリクエストしたら、先回りしたセッションを終える。**
+ *
+ * 先回りの形式はサーバの推定 (`viewing.warmFormat`) で、画面が決めた形式と食い違うことがある (MPEG-2 をデコードできない
+ * 端末の自動は H.264)。誰も来ないセッションも、終えるまでの 8 秒 (`WARM_WAIT`) はチューナーを使ったままで、その間に別の局を
+ * 選ぶと、空いているチューナーがほかに無ければ入れなかった。
+ *
+ * 終えるのは、リクエストされたセッションがチューナーを使えてから (使えずに終えたときも)。先回りしたものと同じチャンネルなので
+ * 選局を共有でき、先に終えるとチューナーが選局し直しになる。間に別の局を選べば、リクエストされたセッションが終わった時点で終える
+ *
+ * @param by 画面がリクエストしたセッション。先回りしたものに入ったのなら、それは誰かが観ているので終えない
+ */
+function dropWarm(serviceId: number, by: Session): void {
+  const idle = [...warmed].filter(
+    (session) =>
+      session !== by && session.serviceId === serviceId && session.empty,
+  );
+  if (idle.length === 0) return;
+  by.whenTuned(() => {
+    for (const session of idle) if (session.empty) session.stop();
+  });
+}
+
+/**
+ * **リクエストされた形式を、局の放送のコーデックに合わせて決め直す** (選局の `attend`・先回りの `warm`)。
+ *
+ * - 4K の局 (`broadcast` が `hevc`。TLV と、TS で送る局) の放送のまま (`raw`) は、放送の HEVC の詰め替え (`hevc`)。
+ *   画面に送る放送のままはこれだけ。1 局に絞った TLV (`raw`) は HTTP の `codec=raw` だけが流す (TS で送る 4K の局の HTTP の `raw` も詰め替え。`servedFormat`)。
+ *   4K の局の `hevc` は詰め替えなので GPU は要らない
+ * - MPEG-2 の局の `hevc` は GPU でエンコードする。出せなければ H.264 にする (`liveHevc`。`downgraded`)
+ */
+export function liveForm<C extends StreamCodec>(
+  broadcast: BroadcastCodec,
+  codec: C,
+  raw: boolean,
+  hevc: () => boolean = liveHevc,
+): { codec: C | "h264" | "hevc"; raw: boolean; downgraded: boolean } {
+  if (broadcast === "hevc")
+    return raw
+      ? { codec: "hevc", raw: false, downgraded: false }
+      : { codec, raw: false, downgraded: false };
+  const downgraded = codec === "hevc" && !raw && !hevc();
+  return { codec: downgraded ? "h264" : codec, raw, downgraded };
+}
+
+/**
+ * **映像の無い局 (ラジオ・データ放送。`schema.hasVideo`) と映像の無い録画の追っかけで送る形式。** どの形式をリクエストされても音声だけ (AAC の fMP4)。
+ * 放送のままの TS は送らない (画面の MPEG-2 のデコーダに映像の無い TS を渡すことを確かめていない)。音声だけは枠を使わない。
+ * 音声も無い局 (データ放送だけの局) は無音を流す (`Session.silent`)。
+ * 答え (`tuned`) には `video: false` を付け、画面は回線に合わせて段を動かさない (`live-player.svelte.ts`)
+ */
+export const AUDIO_FORM = {
+  codec: "audio",
+  raw: false,
+  downgraded: false,
+} as const;
+
+/**
+ * **追っかけで送る形式と段** (`openChase`・`chaseStream`)。`broadcast` は録画の放送のコーデック (`recorded-broadcast.ts`)。
+ *
+ * - MPEG-2 の局の録画の H.265 は段 0 では作らない (`#lib/live.ts` の `LiveCodec`) ので H.264 にする。元の TS (`raw`) はそのまま
+ * - 4K の局の録画 (`.mmts` と、TS で送る 4K の局の `.m2ts`) の放送のまま (`raw`) と段 0 の `hevc` は、放送の HEVC を写す (`copy`)。
+ *   `.mmts` は詰め替え (`Session.runMmt`)、`.m2ts` は ffmpeg で写す (`copiesVideo`)。どちらも変換の枠を使わない。
+ *   `raw` で来るのは画面の WebSocket だけ (HTTP の `codec=raw` は元の録画を直に流す)
+ * - 4K の局の録画の段を下げた `hevc` は、H.265 にエンコードしないので `playable` から選び直す (`liveRungCodec`)。
+ *   HTTP は呼ぶ側が 4K の局の決め方で選んである (`viewing.askedFormat`)
+ */
+export function chaseForm(
+  asked: Pick<ChaseAsked, "codec" | "raw" | "rung" | "playable">,
+  transport: Transport,
+  broadcast: BroadcastCodec,
+  /** GPU で出せるかの引き方 (`rungCodec`)。テストで差し替えるときだけ渡す */
+  pick?: Parameters<typeof rungCodec>[2],
+): { codec: StreamCodec; raw: boolean; rung: Rung; copy: boolean } {
+  const lowered = asked.rung !== 0 && !asked.raw;
+  if (broadcast === "mpeg2" && transport === "ts")
+    return {
+      codec: asked.codec === "hevc" && !lowered ? "h264" : asked.codec,
+      raw: asked.raw,
+      rung: asked.raw ? 0 : asked.rung,
+      copy: false,
+    };
+  if (asked.raw || (asked.codec === "hevc" && !lowered))
+    return { codec: "hevc", raw: false, rung: 0, copy: true };
+  return {
+    codec:
+      asked.codec === "hevc"
+        ? liveRungCodec(asked.playable, "hevc", pick)
+        : asked.codec,
+    raw: false,
+    rung: asked.rung,
+    copy: false,
+  };
+}
 
 /**
  * **画面が繋いでくる前にエンコードし始める。**
@@ -3113,10 +4391,10 @@ const WARM_WAIT = 8_000;
  * 覚えている前回の局か (`LAST_COOKIE`)、一覧の先頭。
  *
  * **1 枚も出ないうちに繋がるので、合流の待ちは付かない。** エンコードしたものは
- * キーフレームから始まるが、それが出るのは選局・エージェントの溜め・ffmpeg の立ち上がりの
+ * キーフレームから始まるが、それが出るのは選局・エージェントのバッファ・ffmpeg の立ち上がりの
  * あとなので、160ms で来る画面はまだ何も渡されていない状態で繋がる。
  *
- * 待たない・投げない。使えなくても画面はいつもどおり繋いでくるので、
+ * 待たず、例外も出さない。使えなくても画面はいつもどおり繋いでくるので、
  * そのとき改めて開くだけ。
  */
 export function warm(
@@ -3133,8 +4411,15 @@ export function warm(
 ): void {
   if (channelType === "" || channel === "" || !Number.isFinite(serviceId))
     return;
-  // H.265 を出せなければ、選局の指示と同じく H.264 で温める (`attend`)
-  if (codec === "hevc" && !raw && !liveHevc()) codec = "h264";
+  // H.265 を出せなければ、選局の指示と同じく H.264 で温める。4K の局の放送のままは詰め替え (`liveForm`)
+  const row = serviceOf(serviceId);
+  const transport = row?.transport ?? "ts";
+  // 映像の無い局は、選局の指示と同じく音声だけで温める (`AUDIO_FORM`)
+  const video = row === undefined || hasVideo(row.service_type);
+  const form = video
+    ? liveForm(broadcastCodec(transport), codec, raw)
+    : AUDIO_FORM;
+  raw = form.raw;
   /*
    * **誰かがもうこの局を観ていれば温めない。** 画面は番組が切り替わるたびに読み直す
    * (`routes/live/+page.svelte`) ので、観ている最中にも何度もここへ来る。下の目印は
@@ -3147,19 +4432,31 @@ export function warm(
     if (session.serviceId === serviceId && !session.empty) return;
   }
 
-  const now = nowPlaying(serviceId, audio);
-  // 字幕は 1 本目で温める。**選び直す人は稀**で、そのときは再エンコードになる。
+  // 字幕は 1 本目で温める。**選び直す人は稀**で、そのときは再エンコードになる
+  const want: Want = {
+    channelType,
+    channel,
+    serviceId,
+    now: nowPlaying(
+      serviceId,
+      audio,
+      transport === "tlv" && form.codec === "hevc",
+    ),
+    codec: form.codec,
+    track: 0,
+    raw,
+    pin: null,
+    rung: 0,
+    video,
+  };
   // 既にエンコードしていれば何もしない。開き直すたびに増やさない
-  if (
-    sessions.has(
-      key(channelType, channel, serviceId, now.audio, raw ? "raw" : codec, 0),
-    )
-  )
-    return;
-  const session = begin(channelType, channel, serviceId, now, codec, 0, raw);
+  if (sharedSession(want) !== undefined) return;
+  const session = begin(want);
+  warmed.add(session);
+  session.whenStopped(() => warmed.delete(session));
 
   /*
-   * **誰も来なければ自分で畳む。** 見ている人がいなくなったら畳む仕掛け
+   * **誰も来なければ自分で終える。** 見ている人がいなくなったら終える仕掛け
    * (`depart`) は、**1 人も来なかった場合には動かない**
    */
   const timer = setTimeout(() => {
@@ -3185,7 +4482,7 @@ type Asked =
       caption: number;
       /** 字幕の第何言語か。省かれていれば前のまま (`Viewer.language`) */
       language: number | undefined;
-      /** 放送そのままで欲しいと言われたか */
+      /** 放送そのままをリクエストされたか */
       raw: boolean;
       /** デバッグ用に名指しされたチューナー (エージェントの `tuner`)。無ければ名指ししない */
       tuner: string | null;
@@ -3193,6 +4490,11 @@ type Asked =
       rung: Rung;
       /** 端末が再生できるコーデック (`parsePlayable`)。段を下げるときのコーデックを選ぶ (`rungCodec`) */
       playable: LiveCodec[];
+      /**
+       * 画面が前の答え (`tuned` の `broadcast`) で受け取った放送のコーデック (`Tuned.broadcast`)。TS で送る 4K の局と分かっていれば `hevc` で、
+       * 「放送のまま」を選局の前から HEVC の詰め替えとして受ける (`liveForm`)。確かめるのは PMT を読んでから
+       */
+      broadcast: BroadcastCodec;
     }
   | ChaseAsked;
 
@@ -3205,7 +4507,7 @@ type ChaseAsked = {
   codec: LiveCodec;
   caption: number;
   language: number | undefined;
-  /** 元の TS で欲しいと言われたか (`codec` は効かない) */
+  /** 元の TS をリクエストされたか (`codec` は効かない) */
   raw: boolean;
   /** 回線に合わせて下げた段 (`#lib/rungs.ts`)。読めなければ 0。`raw` では効かない */
   rung: Rung;
@@ -3214,9 +4516,9 @@ type ChaseAsked = {
 };
 
 /**
- * 画面から来た JSON を読む。**画面から来る値をそのまま信じない**。知らない形式の
- * エンコード方式は H.264 に、数でないものは 0 に落とす。読めないもの (知らない type、
- * 局の名指しが無い tune) は null で、黙って捨てる。
+ * 画面から来た JSON を読む。**画面から来る値をそのまま使わない**。ほかの値の
+ * エンコード方式は H.264 に、数でないものは 0 に落とす。読めないもの (ほかの type、
+ * 局の名指しが無い tune) は null で、何も返さずに捨てる。
  *
  * 選局と追っかけで読むのをここ 1 箇所にしてある (両方に足すものが片方だけにならないように)
  */
@@ -3233,7 +4535,7 @@ export function parseCommand(message: Record<string, unknown>): Asked | null {
   const number = Number(message["language"]);
   const language =
     Number.isInteger(number) && number >= 1 && number <= 8 ? number : undefined;
-  // 段 (`#lib/rungs.ts`)。知らない値は 0 (下げない)
+  // 段 (`#lib/rungs.ts`)。ほかの値は 0 (下げない)
   const rung = parseRung(message["rung"]);
   switch (message["type"]) {
     case "data":
@@ -3244,19 +4546,21 @@ export function parseCommand(message: Record<string, unknown>): Asked | null {
       return { type: "hold", on: message["on"] === true };
     case "chase": {
       const at = Number(message["at"]);
-      // 追っかけは段 0 では H.265 を出さない (`#lib/live.ts` の `LiveCodec`)。段を下げるときは `playable` から選ぶ
-      const chased = codec === "hevc" ? "h264" : codec;
+      /*
+       * 追っかけは段 0 では H.265 にエンコードしない (`#lib/live.ts` の `LiveCodec`)。段を下げるときは `playable` から選ぶ。
+       * 4K の局の録画の H.265 は放送の HEVC の詰め替えなので通す (MPEG-2 の局の録画では `chaseForm` が H.264 に読み替える)
+       */
       return {
         type: "chase",
         recordingId: Number(message["recordingId"]),
         at: Number.isFinite(at) ? Math.max(0, at) : 0,
         audio,
-        codec: chased,
+        codec,
         caption,
         language,
         raw: message["raw"] === true,
         rung,
-        playable: parsePlayable(message["playable"], chased),
+        playable: parsePlayable(message["playable"], codec),
       };
     }
     case "tune": {
@@ -3281,6 +4585,8 @@ export function parseCommand(message: Record<string, unknown>): Asked | null {
             : null,
         rung,
         playable: parsePlayable(message["playable"], codec),
+        // 画面が前の答えで受け取った放送のコーデック (`Tuned.broadcast`)。ほかの値は MPEG-2
+        broadcast: message["broadcast"] === "hevc" ? "hevc" : "mpeg2",
       };
     }
     default:
@@ -3288,7 +4594,7 @@ export function parseCommand(message: Record<string, unknown>): Asked | null {
   }
 }
 
-/** 見ている人を降ろす。**最後の 1 人が抜けたら畳む**。残すとチューナーを使ったままになる */
+/** 見ている人を外す。**最後の 1 人が抜けたら終える**。残すとチューナーを使ったままになる */
 function depart(session: Session, viewer: Viewer): void {
   session.remove(viewer);
   if (session.empty) session.stop();
@@ -3297,7 +4603,7 @@ function depart(session: Session, viewer: Viewer): void {
 /**
  * 接続 1 本ぶんの受け持ち。**繋いでいる間だけチューナーを使う。**
  *
- * 接続そのものが在席の印になる (stream.md#入っているもの の畳み方)。
+ * 接続そのものが在席の印になる (stream.md#入っているもの の終え方)。
  * HTTP のストリームだと切断の検出が遅れるが、WebSocket なら閉じた時点で分かる。
  */
 export function attend(connection: Connection): void {
@@ -3326,7 +4632,7 @@ export function attend(connection: Connection): void {
       else current.setLanguage(viewer, asked.language);
       return;
     }
-    // 追っかけの元の TS を送るのを止める・続ける。読む側 (`openChase` の `held`) が見る
+    // 追っかけの元の TS を送るのを止める・続ける。読む側 (`openChase` の `stopReading`) が見る
     if (asked.type === "hold") {
       viewer.held = asked.on;
       return;
@@ -3339,7 +4645,7 @@ export function attend(connection: Connection): void {
     if (asked.type === "chase") {
       leave();
       viewer.ready = false;
-      // 止めてと言われていたのは前の位置のぶん。新しい位置は送り始める (画面も止めた印を戻している)
+      // 止める指示を受けていたのは前の位置のぶん。新しい位置は送り始める (画面も止めた印を戻している)
       viewer.held = false;
       // 段を下げるなら、コーデックはサーバが選ぶ (`rungCodec`。答えの `tuned` で知らせる)
       const lowered = asked.rung !== 0 && !asked.raw;
@@ -3353,29 +4659,60 @@ export function attend(connection: Connection): void {
       );
       return;
     }
-    const { channelType, channel, serviceId, audio, caption, raw, tuner } =
-      asked;
+    const { channelType, channel, serviceId, audio, caption, tuner } = asked;
+    // 復号できない局 (`services.decodable`) は選局しない。流してもスクランブルされたままで映らない (HTTP のライブも同じに断る)
+    const row = serviceOf(serviceId);
+    if (row !== undefined && !row.decodable) {
+      connection.send(
+        CHANNEL.control,
+        0n,
+        json({
+          type: "error",
+          message: undecodableReason(row.type, row.transport),
+        } satisfies Notice),
+      );
+      return;
+    }
+    const transport = row?.transport ?? "ts";
+    /*
+     * 放送のコーデック。TS で送る 4K の局は、この局を開いている画面が前の答え (`tuned` の `broadcast`) で HEVC と受け取って
+     * いれば、選局の指示に付けてくる (`asked.broadcast`)。付けてこなければ MPEG-2 として受け、PMT を読んでから決める (`servedFormat`)
+     */
+    const broadcast: BroadcastCodec =
+      transport === "tlv" || asked.broadcast === "hevc" ? "hevc" : "mpeg2";
     /*
      * **H.265 を出せなければ H.264 にする** (`liveHevc`。GPU が無い・印を外した・最近落ちた)。画面は答え (`tuned`) の
-     * コーデックで受け取るので、そのまま観られる。替えたことは断り書きで言う
+     * コーデックで受け取るので、そのまま観られる。替えたことは断り書きで伝える。
+     * 4K の局の放送のままは、放送の HEVC の詰め替え (`liveForm`)
      */
-    const downgraded = asked.codec === "hevc" && !raw && !liveHevc();
-    const plain = downgraded ? "h264" : asked.codec;
+    // 映像の無い局は、どの形式をリクエストされても音声だけ (`AUDIO_FORM`)。段も下げない
+    const video = row === undefined || hasVideo(row.service_type);
+    const form = video
+      ? liveForm(broadcast, asked.codec, asked.raw)
+      : AUDIO_FORM;
+    const { downgraded, raw } = form;
+    const plain = form.codec;
     /*
      * 段を下げるなら、コーデックはサーバが選ぶ (`rungCodec`)。放送そのままでは下げない。
      * 音声だけは段で音声のビットレートだけを下げる (`audioArgs`)。映像をエンコードしないので枠は使わない
      */
-    let rung: Rung = raw ? 0 : asked.rung;
+    let rung: Rung = raw || !video ? 0 : asked.rung;
     let codec: StreamCodec =
-      rung === 0 || plain === "audio" ? plain : rungCodec(asked.playable, true);
+      rung === 0 || plain === "audio"
+        ? plain
+        : liveRungCodec(asked.playable, broadcast);
 
-    const now = nowPlaying(serviceId, audio);
+    const now = nowPlaying(
+      serviceId,
+      audio,
+      transport === "tlv" && codec === "hevc",
+    );
 
     /*
      * **同じものをエンコードしているなら、再エンコードしない。**
      *
-     * ただし**畳まれていないことを確かめる**。ffmpeg が降りたセッションを
-     * 指したままだと「もう見ている」と見なされ、選び直しても「やり直す」を
+     * ただし**終わっていないことを確かめる**。ffmpeg が終了したセッションを
+     * 指したままだと「もう見ている」と見なされ、選び直しても「再試行」を
      * 押しても新しく起こさない。画面は待ち続けるだけになる。
      * `form` を省くと、段とコーデックは見ずに局・音声・字幕だけを比べる (下の枠の話)
      */
@@ -3384,12 +4721,13 @@ export function attend(connection: Connection): void {
       current.channelType === channelType &&
       current.channel === channel &&
       current.serviceId === serviceId &&
-      current.raw === raw &&
+      current.asked.raw === raw &&
       current.pin === tuner &&
       (raw ||
         (current.audio.id === now.audio.id &&
           (form === undefined ||
-            (current.codec === form.codec && current.rung === form.rung)))) &&
+            (current.asked.codec === form.codec &&
+              current.rung === form.rung)))) &&
       current.track === caption;
     let same = sameAs({ codec, rung });
 
@@ -3397,23 +4735,24 @@ export function attend(connection: Connection): void {
      * **段を下げた新しいエンコードには、その場で変換する本数の枠を 1 つ使う** (`rungSlot`)。同じ段をもう誰かが観ていれば
      * 共有するので使わない。観ているのが自分だけの段を下げたセッションから移るなら、抜ければ枠が 1 つ空くので、抜けてから取る。
      * 抜けるかは枠を取る前に決める (`rungPlan`)。抜けたあとで取れないと、映像が切れたうえに今の段にも戻れない。
-     * **空かなければ段を下げない。** いま同じ局を観ていればその段のまま、そうでなければ段 0 で開き、理由を断り書きで言う
+     * **空かなければ段を下げない。** いま同じ局を観ていればその段のまま、そうでなければ段 0 で開き、理由を断り書きで伝える
      */
+    const want = (): Want => ({
+      channelType,
+      channel,
+      serviceId,
+      now,
+      codec,
+      track: caption,
+      raw,
+      pin: tuner,
+      rung,
+      video,
+    });
     let release: (() => void) | null = () => undefined;
     let refused = false;
     if (rung !== 0 && !same && codec !== "audio") {
-      const shared = () =>
-        sharedSession(
-          channelType,
-          channel,
-          serviceId,
-          now,
-          codec,
-          caption,
-          raw,
-          tuner,
-          rung,
-        ) !== undefined;
+      const shared = () => sharedSession(want()) !== undefined;
       const plan = rungPlan({
         shared: shared(),
         room: transcodeRoom(),
@@ -3453,17 +4792,27 @@ export function attend(connection: Connection): void {
      * `tuned` も先に出す。MediaSource を作るのは画面側で、init はそれより先には使えない。
      */
     viewer.ready = false;
-    const notice: Notice = {
-      type: "tuned",
-      channelType,
-      channel,
-      codecs: codecsFor(codec),
-      codec,
-      raw,
-      rung,
-      audio: now.audio.id,
-      audios: now.audios,
-    };
+    /*
+     * 入るセッションが PMT を読んで形式を替えていたら (TS で送る 4K の局の放送のまま。`servedFormat`)、送っている形式で答える。
+     * まだ読んでいなければリクエストどおりに答え、替えたときにセッションが答え直す (`switchFormat`)
+     */
+    const joined = same && current !== null ? current : sharedSession(want());
+    const notice: Notice =
+      joined?.hevcVideo === true
+        ? { ...joined.tunedNotice(), audio: now.audio.id, audios: now.audios }
+        : {
+            type: "tuned",
+            channelType,
+            channel,
+            serviceId,
+            codecs: codecsFor(codec, broadcast),
+            codec,
+            raw,
+            rung,
+            audio: now.audio.id,
+            audios: now.audios,
+            ...(video ? {} : { video: false as const }),
+          };
     connection.send(CHANNEL.control, 0n, json(notice));
     if (downgraded && rung === 0 && codec === "h264")
       connection.send(
@@ -3475,17 +4824,17 @@ export function attend(connection: Connection): void {
       connection.send(
         CHANNEL.control,
         0n,
-        json({ type: "notice", message: RUNG_BUSY } satisfies Notice),
+        json({ type: "notice", message: busyNote(true) } satisfies Notice),
       );
 
     /*
      * **再エンコードしなくても、リクエストされたら必ず答える。**
      *
-     * 黙って返していた頃は、**いま映している局をもう一度押すと映像が止まった**。
+     * 何も送らずに返していた頃は、**いま映している局をもう一度押すと映像が止まった**。
      * 画面側は `tune` のたびに MediaSource を捨てる作りで (`live-player.svelte.ts` の
      * `forget`)、`tuned` と init が来て初めて作り直す。何も変わらないからと
-     * 黙ると、**捨てたきり二度と作られない**。塊は届き続けるので、
-     * エラーも出ないまま黒い画面で止まる (実機で踏んだ)。
+     * 答えないと、**捨てたきり二度と作られない**。塊は届き続けるので、
+     * エラーも出ないまま黒い画面で止まる (実機で起きた)。
      *
      * 答えるだけなら再エンコードにはならない。`add` は持っている init を
      * その場で渡すので、映像は 0.2 秒ほどで戻る
@@ -3497,23 +4846,12 @@ export function attend(connection: Connection): void {
     }
 
     leave();
-    current = watch(
-      channelType,
-      channel,
-      serviceId,
-      now,
-      codec,
-      caption,
-      raw,
-      viewer,
-      tuner,
-      rung,
-      release,
-    );
+    current = watch(want(), viewer, release);
+    dropWarm(serviceId, current);
   };
 
   /*
-   * **送り出しの具合を知らせる** (`pace`。`server/pace.ts`)。溜まりと捨てた塊は接続ごと、エンコードの速さはいま観ているセッションのもの。
+   * **送り出しの具合を知らせる** (`pace`。`server/pace.ts`)。バッファの量と捨てた塊は接続ごと、エンコードの速さはいま観ているセッションのもの。
    * 何も観ていない間は送らない
    */
   const meter = new PaceMeter();
@@ -3547,8 +4885,7 @@ export function attend(connection: Connection): void {
 const chaseResumes = new Map<number, ChaseResume>();
 
 function rememberResume(recordingId: number, resume: ChaseResume): void {
-  for (const [id, held] of chaseResumes)
-    if (held.until < Date.now()) chaseResumes.delete(id);
+  pruneExpired(chaseResumes, (held) => held.until, Date.now());
   chaseResumes.set(recordingId, resume);
 }
 
@@ -3559,15 +4896,16 @@ function rememberResume(recordingId: number, resume: ChaseResume): void {
  * チューナーは使わない。録画が書き足している元の TS を追い読みして (`chase.ts`)、
  * ライブと同じ `Session` に流し込む。**共有はしない**。観る位置が人ごとに
  * 違うので、同じものを観る 2 人はほぼ起きない。セッションの一覧 (`sessions`) にも
- * 載せない (見ている人が選び直すか抜ければ `leave` が畳む)。
+ * 載せない (見ている人が選び直すか抜ければ `leave` が終える)。
  *
  * シークの当たりの付け方は `chasePlan` (chase.ts の冒頭)。
  *
- * **その場の変換の枠を 1 つ使う** (`transcode.ts`)。埋まっていれば断る。畳んだら返す。
- * HTTP のエンドポイント (`chaseStream`) は先に取って `held` で渡す (断るのを 503 にするため)
+ * **その場の変換の枠を 1 つ使う** (`transcode.ts`)。埋まっていれば断る。終えたら返す。
+ * HTTP のエンドポイント (`chaseStream`) は先に取って `held` で渡す (断るのを 503 にするため)。
+ * 放送の HEVC を写すもの (`chaseForm` の `copy`) と、映像の無い録画の音声だけは枠を使わない
  *
  * **元の TS で送るとき (`raw`) は枠を使わない。** ffmpeg は字幕を写すものだけ (`Session.runRaw`。ライブの MPEG-2 と同じ)。
- * 倍速の送り込みはそのままで、捨てずに読むほうを止める。止めるのは画面に止めてと言われたとき (`Viewer.held`) と、
+ * 倍速の送り込みはそのままで、捨てずに読むほうを止める。止めるのは画面から止める指示を受けたとき (`Viewer.held`) と、
  * 送り先が詰まっているとき (`Connection.congested`)。画面が再生位置を出せるよう、録画の先頭の PTS を `timeline` に載せる
  */
 function openChase(
@@ -3587,25 +4925,46 @@ function openChase(
     return refuse(text);
   };
 
-  const { recordingId, at, audio: wanted, codec, caption, raw } = asked;
-  // 段を下げた追っかけも使う枠は 1 つ (下げないときと同じ)。コーデックは呼ぶ側が選んである (`rungCodec`)
-  const rung = raw ? 0 : asked.rung;
+  const { recordingId, at, audio: wanted, caption } = asked;
   const source = Number.isInteger(recordingId)
     ? chaseSource(recordingId)
     : undefined;
   if (source === undefined) return refuseHeld("録画が見つかりません");
   const { rec, path, size } = source;
   if (size === 0) return refuseHeld("まだ何も録画されていません");
-  const release = raw ? (held ?? (() => undefined)) : (held ?? holdTranscode());
+  /*
+   * **4K の局の録画 (`.mmts`) は TS を経由しない** (`Session.transport`。ライブの 4K の局と同じ)。放送のままは放送の HEVC の詰め替えで
+   * (`passthrough`。ffmpeg も枠も使わない)、エンコードするときは詰め替えた fMP4 を ffmpeg に渡す。
+   * TS で送る 4K の局の録画は、開く前に録画の PMT を読んで 4K の局として形式を決める (`recordedBroadcast`・`chaseForm`)
+   */
+  const transport = recordedTransport(path);
+  // ffmpeg に名指しさせる放送の番号。録画 TS は絞ってあるが、探させない理屈はライブと同じ
+  const program = aribServiceId(rec.service_id);
+  const broadcast = recordedBroadcast(path, program);
+  /*
+   * **映像の無い録画 (ラジオ・データ放送の局) は音声だけ** (`AUDIO_FORM`。ライブと同じ)。音声も無い録画は追っかけない
+   * (流すものが無い。録り終えれば観る画面で無音とデータ放送を流す)。PMT をまだ読めない録り始めは映像のある録画として開く
+   */
+  const media = recordedMedia(path, program);
+  if (!media.video && !media.audio) return refuseHeld(NO_MEDIA_CHASE);
+  const { codec, raw, rung, copy } = media.video
+    ? chaseForm(asked, transport, broadcast)
+    : { ...AUDIO_FORM, rung: 0 as Rung, copy: false };
+  // 段を下げた追っかけも使う枠は 1 つ (下げないときと同じ)。コーデックは呼ぶ側が選んである (`rungCodec`)。音声だけは枠を使わない
+  const release =
+    raw || copy || codec === "audio"
+      ? (held ?? (() => undefined))
+      : (held ?? holdTranscode());
   if (release === null) return refuse(BUSY);
   /*
-   * **畳んだら読むのをやめる** (`session.whenStopped` で立てる)。止めている間 (`hold`) に畳まれると、`followFile` は
+   * **終えたら読むのをやめる** (`session.whenStopped` で立てる)。止めている間 (`hold`) に終わると、`followFile` は
    * 止めたまま回り続け、録画のファイルと字幕の ffmpeg (`runRaw` の finally に来ない) が残っていた
    */
   const reading = { stopped: false };
+  // 元の TS で開いても、録画の PMT を読んで HEVC の写しに替えることがある (`Session.learnsBroadcast`)。そのときの形式で見る
   const stopReading = () =>
     !reading.stopped &&
-    (raw
+    (session.raw
       ? chaseReadHeld({
           asked: viewer.held === true,
           congested: viewer.connection.congested === true,
@@ -3616,25 +4975,24 @@ function openChase(
   const finished = rec.finished_at !== null;
   // 番組が替わって作り直したところの近くなら、そのバイトから (`chase.ts` の `resumePlan`)
   const plan = resumePlan(
-    chasePlan(size, recordedSec(rec), at),
+    chasePlan(size, recordedSec(rec, path), at),
     chaseResumes.get(rec.id),
   );
 
   const tracks = audioTracks(parseAudios(rec));
   const audio = pickTrack(tracks, wanted);
-  // ffmpeg に名指しさせる放送の番号。録画 TS は絞ってあるが、探させない理屈はライブと同じ
-  const program = aribServiceId(rec.service_id);
 
   tell({
     type: "tuned",
     channelType: "chase",
     channel: String(rec.id),
-    codecs: codecsFor(codec),
+    codecs: codecsFor(codec, broadcast),
     codec,
     raw,
     rung,
     audio: audio.id,
     audios: tracks,
+    ...(media.video ? {} : { video: false as const }),
   });
   const timeline: Extract<Notice, { type: "timeline" }> = {
     type: "timeline",
@@ -3671,6 +5029,9 @@ function openChase(
       (consumed) => rememberResume(rec.id, resumeFrom(plan, consumed)),
       null,
       rung,
+      transport,
+      false,
+      broadcast,
     );
   } catch (failure) {
     // 起こせなかった。取った枠は返す
@@ -3681,6 +5042,17 @@ function openChase(
   session.whenStopped(() => {
     reading.stopped = true;
   });
+  session.video = media.video;
+  /*
+   * **録り始めたばかりで開く前に PMT を読めなかった録画を元の TS で送るときは、送る前に録画のストリームから PMT を読む**
+   * (`Session.learnsBroadcast`)。TS で送る 4K の局の録画なら、画面の MPEG-2 のデコーダは HEVC をデコードできないので、
+   * 放送の HEVC を写したものに替えて答え直す。読めた答えは覚え、次に開くときはそれで形式を決める。
+   * 答え直す `tuned` (`Session.switchFormat`) には選べる音声も入れる
+   */
+  if (raw && transport === "ts" && !broadcastDecided(path)) {
+    session.audios = tracks;
+    session.learnsBroadcast = (found) => learnBroadcast(path, found);
+  }
   session.add(viewer);
   if (!raw) {
     void session.run();
@@ -3688,7 +5060,7 @@ function openChase(
   }
   /*
    * **元の TS は、録画の先頭の PTS を読んでから流し始める** (`timeline` の `origin`。読むのは非同期で、読めたものは覚える)。
-   * 先に流すと、画面は物差しの 0 を知らないまま再生位置を出すことになる。読み終える前に選び直された (畳まれた) ら流さない
+   * 先に流すと、画面は物差しの 0 が分からないまま再生位置を出すことになる。読み終える前に選び直された (終わった) ら流さない
    */
   void tsFileHead(path).then((origin) => {
     if (!session.alive) return;
@@ -3699,8 +5071,8 @@ function openChase(
 }
 
 /**
- * 追っかけ・録画の字幕で読む録画と、その元の TS。消した・元の TS が無いものは undefined。
- * `size` は元の TS のいまの大きさで、読めなければ 0 (まだ何も録画されていない)
+ * 追っかけ・録画の字幕で読む録画と、その元の TS (`tsPathOf`。「エンコードしない」録画は置き場の TS)。
+ * 消した・元の TS が無いものは undefined。`size` は元の TS のいまの大きさで、読めなければ 0 (まだ何も録画されていない)
  */
 function chaseSource(
   recordingId: number,
@@ -3712,19 +5084,33 @@ function chaseSource(
     .from(recordings)
     .where(eq(recordings.id, recordingId))
     .get();
-  if (rec === undefined || rec.deleted_at !== null || rec.ts_path === null)
+  const path = rec === undefined ? null : tsPathOf(rec);
+  if (rec === undefined || rec.deleted_at !== null || path === null)
     return undefined;
-  return { rec, path: rec.ts_path, size: fileSize(rec.ts_path) ?? 0 };
+  return { rec, path, size: recordingSize(path) ?? 0 };
 }
 
-/** 録れている長さ (秒)。録り終えていれば実測、まだなら**録り始めてからの経過** */
-function recordedSec(rec: typeof recordings.$inferSelect): number {
-  return rec.finished_at !== null
-    ? (rec.duration_ms ?? rec.end_at - rec.start_at) / 1000
-    : (Date.now() - rec.created_at) / 1000;
+/**
+ * 追っかけで読む録画の伝送の形式 (`recordedTransport`) と放送のコーデック (`recordedBroadcast`)。HTTP の追っかけが使う。
+ * 伝送の形式は `codec=raw` の Content-Type を決め (TS は `video/mp2t`、4K の局は 1 局に絞った TLV の `application/x-arib-tlv`)、
+ * 放送のコーデックは `auto` と段の選び方を決める (`viewing.askedFormat`)。録画が無ければ TS の MPEG-2
+ */
+export function chaseMedia(recordingId: number): {
+  transport: Transport;
+  broadcast: BroadcastCodec;
+} {
+  const source = chaseSource(recordingId);
+  if (source === undefined) return { transport: "ts", broadcast: "mpeg2" };
+  return {
+    transport: recordedTransport(source.path),
+    broadcast: recordedBroadcast(
+      source.path,
+      aribServiceId(source.rec.service_id),
+    ),
+  };
 }
 
-/** もう書き足されないか。録り終えたら (行が消えたときも)、尻に着いた時点で読み終わり */
+/** もう書き足されないか。録り終えたら (行が消えたときも)、末尾に着いた時点で読み終わり */
 function recordingDone(id: number): boolean {
   const row = orm()
     .select({ finished_at: recordings.finished_at })
@@ -3739,43 +5125,90 @@ interface NowPlaying {
    * 放送が名乗っている番号 (ARIB の service_id = TS の program_number)。
    * **`services.id` とは別物**。あちらは `network_id * 100000 + service_id` の
    * 内部 ID で、TS の中には出てこない。**内部 ID を渡すと** ffmpeg はその番号の局を
-   * 探して見つけられず、**映像も音も出ない** (実機でやった)。ffmpeg に渡すのはこちら
+   * 探して見つけられず、**映像も音も出ない** (実機で確かめた)。ffmpeg に渡すのはこちら
    */
   program: number;
   /** 選べる音声。画面へそのまま送る */
   audios: AudioTrack[];
   /** そのうちエンコードするもの */
   audio: AudioTrack;
+  /** 伝送の形式 (`services.transport`)。`tlv` は 4K の局 (`Session.transport`) */
+  transport: Transport;
 }
 
 /**
- * いま流れている番組から、ffmpeg に渡す局の番号と音声を決める。**番組表から決める。**
+ * いま流れている番組から、ffmpeg に渡す局の番号と音声を決める。**番組表と、読んであれば PMT から決める。**
  *
  * - 局の番号 … ffmpeg に名指しさせる `program_number` (`NowPlaying.program`)
- * - 音声 … 番組表の `audios` から、選べるものを組み立てる (`arib.audioTracks`)。
+ * - 音声 … 番組表の `audios` から、選べるものを組み立てる (`arib.audioTracks`)。PMT を読んであれば、並びと本数は PMT に従う。
  *   **古い行には `audios` が入っていない**ので、そのときは `audio_type` だけで
  *   デュアルモノかどうかを見る。どちらも無ければ「そのまま出す」1 つ
  *
+ * **4K の局 (`tlv`) は 1 本目の音声だけ** (詰め替えるのは MPT の最初の音声のアセット。`mmt-media.ts`)。デュアルモノの左右は選べる
+ * (ffmpeg でエンコードするときに配り直す)。放送の HEVC を詰め替えて送るとき (`whole`) は音声も放送のままなので、選べるものは「そのまま」1 つ
+ *
  * @param serviceId 局の内部 ID (`services.id`)。画面から届くのはこれ
  * @param wanted 画面が求めてきた音声 (`AudioTrack.id`)。無いものなら先頭
+ * @param whole 4K の局の放送の HEVC と AAC を、エンコードせずに詰め替えて送るか (`Session.passthrough`)
+ * @param pmt PMT の音声の ES の部品タグ (`Session.pmtAudioTags`)。省けば、同じ局を流しているセッションが読んだもの (`pmtSeen`)。
+ *   どれも読んでいなければ番組表だけで決める
  */
-function nowPlaying(serviceId: number, wanted: string | undefined): NowPlaying {
+function nowPlaying(
+  serviceId: number,
+  wanted: string | undefined,
+  whole = false,
+  pmt = pmtSeen(serviceId),
+): NowPlaying {
+  const row = Number.isFinite(serviceId) ? serviceOf(serviceId) : undefined;
+  const transport = row?.transport ?? "ts";
   const decide = (program: number, audios: Audio[]): NowPlaying => {
-    const tracks = audioTracks(audios);
+    const all = audioTracks(audios, transport === "tlv" ? undefined : pmt);
+    const tracks =
+      transport === "tlv"
+        ? whole
+          ? audioTracks([])
+          : all.filter((track) => track.stream === 0)
+        : all;
+    const audio = pickTrack(tracks, wanted);
     return {
       program,
-      audios: tracks,
-      audio: pickTrack(tracks, wanted),
+      // データ放送が選んだ音声 (`arib.broadcastTrack`) は番組表の一覧に無いので、選んでいる間は足して画面の「音声」に出す
+      audios: tracks.includes(audio) ? tracks : [...tracks, audio],
+      audio,
+      transport,
     };
   };
 
-  if (!Number.isFinite(serviceId)) return decide(0, []);
+  if (row === undefined) return decide(0, []);
   const program = orm()
     .select({ audio_type: programs.audio_type, audios: programs.audios })
     .from(programs)
     .where(airingAt(serviceId))
     .get();
-  return decide(aribServiceId(serviceId), parseAudios(program));
+  return decide(row.service_id, parseAudios(program));
+}
+
+/**
+ * **いま同じ局を流しているセッションが読んだ PMT の音声** (`Session.pmtAudioTags`)。どれも読んでいなければ undefined。
+ *
+ * 流れているものだけを見る。止まったセッションの PMT は番組が替わったあとも残るので、PMT に無くなった音声を
+ * 選ばせると、ffmpeg は音声を指定できずに終了する。音声を選び直すと、選局し直す前のセッションがまだ流れているので、そちらの PMT が使える
+ */
+function pmtSeen(serviceId: number): readonly (number | null)[] | undefined {
+  for (const session of sessions.values()) {
+    if (session.serviceId !== serviceId || !session.alive) continue;
+    const tags = session.pmtAudioTags;
+    if (tags !== null) return tags;
+  }
+  return undefined;
+}
+
+/** PMT の音声の ES の部品タグを読む (`Session.audioWatch`)。**並びが初めて決まったか変わったら** `feedPacket` が true を返す */
+export class PmtAudioWatch extends PmtWatch<readonly (number | null)[]> {
+  /** @param program 放送の番号 (program_number。`NowPlaying.program`) */
+  constructor(program: number) {
+    super(program, pmtAudios);
+  }
 }
 
 /** その局でいま流れている番組 (`programs` の絞り込み) */
@@ -3787,23 +5220,57 @@ function airingAt(serviceId: number, at = Date.now()) {
   );
 }
 
-/** ffmpeg に名指しさせる放送の番号 (ARIB のサービス ID)。局が無ければ 0 = 探させない */
-export function aribServiceId(serviceId: number): number {
-  return serviceOf(serviceId)?.service_id ?? 0;
-}
-
 /** 局の行のうち、選局と放送の番号に要るぶん */
 function serviceOf(serviceId: number) {
   return orm()
     .select({
       type: services.type,
-      channel: services.channel,
+      channel: serviceChannel(),
       service_id: services.service_id,
       network_id: services.network_id,
+      decodable: services.decodable,
+      transport: services.transport,
+      service_type: services.service_type,
     })
     .from(services)
     .where(eq(services.id, serviceId))
     .get();
+}
+
+/**
+ * **TS の局の PMT を読んだあとで、実際に送る形式を決める** (`Session.runRaw`)。
+ *
+ * TS に HEVC を入れて送る 4K の局 (`video` が `hevc`) の放送のまま (`raw`) は、元の TS ではなく HEVC の詰め替え (`hevc`)。
+ * 画面の MPEG-2 のデコーダ (WASM) は HEVC をデコードできない。端末が送ってきた再生できる形式に HEVC が無ければ
+ * (`playable` に `hevc` が無い)、4K の局と同じく縮めて SDR にした H.264 (それも無ければ AV1)。どれも無ければ null
+ * (呼ぶ側が「再生できる形式がありません」で終える)。`playable` が null なら送ってきていない。
+ * それ以外 (MPEG-2 の局・放送のままでない) は、リクエストされたまま
+ */
+export function servedFormat(
+  asked: { codec: StreamCodec; raw: boolean },
+  video: ServiceVideo | null,
+  playable: readonly LiveFormat[] | null,
+): { codec: StreamCodec; raw: boolean } | null {
+  if (video !== "hevc" || !asked.raw) return asked;
+  if (playable === null || playable.includes("hevc"))
+    return { codec: "hevc", raw: false };
+  if (playable.includes("h264")) return { codec: "h264", raw: false };
+  if (playable.includes("av1")) return { codec: "av1", raw: false };
+  return null;
+}
+
+/**
+ * **元の TS で開いた追っかけが、録画のストリームの PMT を読んだあとで実際に送る形式** (`Session.runRaw`)。
+ * 開く前に録画の PMT を読めなかった (録り始めたばかり) ので、MPEG-2 の局の録画として元の TS で開いている。
+ * 映像が HEVC なら、4K の局の録画の放送のまま (`chaseForm`) と同じく放送の HEVC を写したもの (`copiesVideo`。変換の枠を使わない)。
+ * HEVC を再生できない端末は、答え (`tuned` の `broadcast`) を見て自分で次の形式に移る。それ以外はリクエストされたまま
+ */
+export function chaseRawServed(
+  asked: { codec: StreamCodec; raw: boolean },
+  video: ServiceVideo | null,
+): { codec: StreamCodec; raw: boolean } {
+  if (video !== "hevc" || !asked.raw) return asked;
+  return { codec: "hevc", raw: false };
 }
 
 /**
@@ -3812,7 +5279,7 @@ function serviceOf(serviceId: number) {
  * - `ended` … 追っかけが録れているところまで読み切った。終わりであってエラーではない (エンコードの経路と同じく `ended` を伝える)
  * - `lost` … ライブで、届いたあとに途切れた (チューナーから外された)。リクエストし直させる (`lose`)
  * - `died` … ライブで、何も届かないまま途切れた。理由を伝える
- * - `quiet` … もう畳んでいる (選び直された・抜けた)。何も伝えない
+ * - `quiet` … もう終えている (選び直された・抜けた)。何も伝えない
  */
 export function rawEnding(o: {
   chase: boolean;

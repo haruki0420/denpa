@@ -11,7 +11,7 @@
  * API があっても `fullscreenEnabled` が偽なら使えない (iframe の許可が無いなど) ので、
  * そのときも次へ回す
  */
-export type FullscreenMode = "standard" | "webkit" | "pseudo";
+type FullscreenMode = "standard" | "webkit" | "pseudo";
 
 /** ベンダープレフィックス付きの API (古い iPadOS の Safari)。型に無いので自分で書く */
 interface WebkitElement {
@@ -50,7 +50,7 @@ export function nativeFullscreenElement(doc: object): Element | null {
 }
 
 /**
- * 本物の全画面に入る。**失敗しても黙る** (押した直後でなくなった・許可が無いなど)。
+ * 本物の全画面に入る。**失敗しても例外を投げない** (押した直後でなくなった・許可が無いなど)。
  * 古い webkit は Promise を返さないことがある
  */
 export async function requestNative(

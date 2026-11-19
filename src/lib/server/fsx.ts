@@ -4,9 +4,10 @@ import {
   mkdirSync,
   renameSync,
   rmdirSync,
+  statSync,
   unlinkSync,
 } from "node:fs";
-import { dirname } from "node:path";
+import { dirname, isAbsolute, relative } from "node:path";
 
 import { config } from "./config";
 
@@ -31,12 +32,16 @@ export function removeIfExists(path: string | null | undefined): void {
 }
 
 /**
- * ファイルを消した後に空になったフォルダ (シリーズ) を畳む。
- * encodedDir 自身より上には絶対に遡らない。
+ * ファイルを消した後に空になったフォルダ (シリーズ) を消す。
+ * encodedDir 自身より上には絶対に遡らない。encodedDir の外 (名前の先頭が同じだけの隣のフォルダも) には触らない
  */
 export function pruneEmptyDirs(path: string): void {
+  const inside = (dir: string) => {
+    const rel = relative(config.encodedDir, dir);
+    return rel !== "" && !rel.startsWith("..") && !isAbsolute(rel);
+  };
   let dir = dirname(path);
-  while (dir.startsWith(config.encodedDir) && dir !== config.encodedDir) {
+  while (inside(dir)) {
     try {
       rmdirSync(dir);
     } catch {
@@ -44,5 +49,14 @@ export function pruneEmptyDirs(path: string): void {
       return;
     }
     dir = dirname(dir);
+  }
+}
+
+/** いまのファイルの大きさ。無ければ null (消された・まだ書き始めていない) */
+export function fileSize(path: string): number | null {
+  try {
+    return statSync(path).size;
+  } catch {
+    return null;
   }
 }

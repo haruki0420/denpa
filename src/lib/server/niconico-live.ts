@@ -5,7 +5,7 @@
  *   端末が何台あっても、1 つの局に繋ぐのは 1 本
  * - 接続先は denpa-hub の `/niconico/live/watch` から受け取る (局の ID とユーザー ID を渡し、アクセストークンを付ける)。
  *   ニコニコ固有の値は hub が持つ。hub が 401 を返したら 1 回だけトークンを更新してやり直す
- * - やり取りは NX-Jikkyo と同じ形 (`nx.ts`): `startWatching` (映像はリクエストしない)・`ping` に `pong`・`seat` の間隔で `keepSeat`・
+ * - やり取りは NX-Jikkyo と同じ形式 (`nx.ts`): `startWatching` (映像はリクエストしない)・`ping` に `pong`・`seat` の間隔で `keepSeat`・
  *   `postComment` (いつも 184) に `postCommentResult` か `error`・`disconnect`。最初の返事が来たら書ける。
  *   書き込みの `vpos` の基準 (`vposBaseTime`) は、どの返事に載っていても読む (読めなければ繋いだ時刻)
  * - **繋ぐのは書き込みの欄が開いている間だけ。** 欄は開いている間 30 秒おきに `touch` を呼ぶ。`IDLE` の間呼ばれなければ閉じる。
@@ -391,6 +391,8 @@ export class NiconicoLive {
     const session = this.sessions.get(channel);
     if (session !== undefined && !session.ended) {
       session.touch();
+      // 繋がったあとの失敗は、前と同じ理由でも記録に残す (`open` は繋ぎ始めたところで返るので、繋がったかはここで見る)
+      if (session.state === "ready") this.lastReason = null;
       return session.state;
     }
     const downAt = this.down.get(channel);
@@ -421,7 +423,6 @@ export class NiconicoLive {
     );
     this.sessions.set(channel, session);
     void session.open().then(() => {
-      if (session.state === "ready") this.lastReason = null;
       // 繋げなかった (連携していない・切れた・断られた) ものは閉じる。次に呼ばれたら試し直す
       if (session.state === "unlinked" || session.state === "down")
         session.close();

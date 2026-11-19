@@ -26,7 +26,7 @@
    *
    * **ボタンは、等速ならメーターのアイコンだけの丸、速めている間は数字だけ (「1.25」)。**
    * 速めているときだけ数字が出れば、それ自体が「いま速めている」の印になる (オンの短い線は重ねない。1 つの意味に印は 1 つ)。
-   * メニューの引き金なので `aria-pressed` は付けず、開いているかを `aria-expanded` で言う (`Menu`)。いまの速さは名前が言う。
+   * メニューの引き金なので `aria-pressed` は付けず、開いているかを `aria-expanded` で言う (`Menu`)。いまの速さはボタンの名前に入れる。
    * ボタンの上では × を付けない。速さのボタンだと分かっているので要らない。
    *
    * **選択肢は「×1.25」のまま。** 開いた並びは数字だけが縦に並ぶので、何の数か (倍) を書いておく。
@@ -51,11 +51,11 @@
 </script>
 
 <!--
-    中身 (`children`) は速めているときだけ渡す。ControlButton は中身が無いときだけ丸くする。
-    ボタンは 1 つのまま、アイコンと数字を差し替える (`{#if}` で ControlButton ごと出し分けない)
+  中身 (`children`) は速めているときだけ渡す。ControlButton は中身が無いときだけ丸くする。
+  ボタンは 1 つのまま、アイコンと数字を差し替える (`{#if}` で ControlButton ごと出し分けない)
 -->
 {#snippet number()}
-  <span style="font-variant-numeric: tabular-nums">{speed}</span>
+  <span class="num">{speed}</span>
 {/snippet}
 
 <Menu
@@ -86,7 +86,6 @@
       onclick={() => onselect(value)}
       data-testid={testid && `${testid}-option`}
       data-speed={value}
-      data-active={value === speed ? "" : undefined}
     >
       ×{value}
     </button>
@@ -95,26 +94,24 @@
 
 <style>
   /*
-     * **数字のときも、丸いボタンと同じ幅から。** 文字を添えるボタンの余白 (1.25rem) では
-     * 「1.25」で 80px と、隣の丸 (48px) に比べて横に間延びする。「2」は丸と同じ幅まで広げる。
-     * 等速の丸 (`ov-round`) には当てない。幅も余白も丸の決まりのまま
-     */
+   * **数字のときも、丸いボタンと同じ幅から。** 「2」は丸と同じ幅まで広げる (余白は文字のボタンの決まり。`ControlButton`)。
+   * 等速の丸 (`ov-round`) には当てない。幅も余白も丸の決まりのまま
+   */
   .speed {
     display: contents;
   }
   .speed :global(.ov-btn:not(.ov-round)) {
     min-width: 3rem;
-    padding-inline: 0.75rem;
   }
   /* 狭い枠 (舞台の `data-compact`) では丸が 40px になる (`ControlButton`)。数字も同じ幅から */
   :global(.stage[data-compact]) .speed :global(.ov-btn:not(.ov-round)) {
     min-width: 2.5rem;
   }
   /*
-     * 箱と選択肢の地・項目の間は `SettingsMenu` と同じなので app.css (`.menu`・`.overlay-menu`) に置く。
-     * ここは数字を大きく真ん中にそろえるだけ。畳むときは速さのボタンごと ⚙ の先頭に入れるので (`Extras`)、
-     * このメニューは畳まないときだけ出る
-     */
+   * 箱と選択肢の地・項目の間は `SettingsMenu` と同じなので app.css (`.menu`・`.overlay-menu`) に置く。
+   * ここは数字を大きく真ん中にそろえるだけ。畳むときは速さのボタンごと ⚙ の先頭に入れるので (`Extras`)、
+   * このメニューは畳まないときだけ出る
+   */
   :global(.overlay-menu.speed-menu) {
     font-size: var(--dp-text-lg);
   }

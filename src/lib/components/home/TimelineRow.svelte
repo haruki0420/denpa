@@ -1,9 +1,9 @@
 <script lang="ts">
   /**
-   * 時間軸の 1 行 (予約・録画・録り逃し)。どれも同じ形にする: (録れたものは) ポスター、
-   * 時刻と番組名、局と尺、右に押すもの。状態を言うときだけ下に段を足す (`RowActivity`。2 段まで):
-   * いま動いているもの (録画中・エンコード中・端末に保存中) と、黙っていると「録れたつもり」になるもの
-   * (競合・失敗・欠ける・ロゴで CM を判定できなかった)
+   * 時間軸の 1 行 (予約・録画・録り逃し)。どれも同じ形にする。(録れたものは) ポスター、
+   * 時刻と番組名、局と尺、右に押すもの。状態を言うときだけ下に段を足す (`RowActivity`。2 段まで)。
+   * 段に出すのは、いま動いているもの (録画中・エンコード中・端末に保存中) と、出さないと「録れたつもり」になるもの
+   * (競合・失敗・欠ける・録画が途中で切れた・ロゴで CM を判定できなかった)
    */
   import "@anyblades/blades/components/progress";
   import type { SubmitFunction } from "$app/forms";
@@ -36,6 +36,7 @@
     size,
     stateLabel,
     time,
+    videoLossNote,
   } from "#lib/format.js";
   import { offline, removeLocal } from "#lib/offline.svelte.js";
   import { type RowStatus, statusLines, toneOf } from "#lib/row-status.js";
@@ -65,7 +66,7 @@
       : `${size(rec.ts_size)} (${extra.join("、")})`;
   }
 
-  /** 消し終えたら、端末に落としてあったコピーも片付ける (行の削除と「⋯」の削除で同じ) */
+  /** 消し終えたら、端末に保存したコピーも片付ける (行の削除と「⋯」の削除で同じ) */
   function afterDelete(rec: Rec): SubmitFunction {
     return () => async (options) => {
       await options.update();
@@ -150,8 +151,8 @@
   }
 
   /**
-   * 録画の行の段。動いているもの (エンコード・待ち・録画中・端末に保存中) が先、
-   * 問題 (失敗・欠けた・ロゴで CM を判定できなかった・端末に保存できなかった) が後
+   * 録画の行の段。動いているもの (エンコード・待ち・端末に保存中) が先、
+   * 問題 (失敗・欠けた・録画が途中で切れた・ロゴで CM を判定できなかった・端末に保存できなかった) が後
    */
   function recLines(rec: Rec): RowStatus[] {
     const shown = rowState(rec);
@@ -170,10 +171,6 @@
         testid: "recording-state",
         detailTestid: encoding ? "encode-progress" : undefined,
       });
-    } else if (rec.state === "recording") {
-      activities.push(
-        recordingLine(shown.label, rec.end_at, "recording-state"),
-      );
     } else if (!shown.quiet) {
       problems.push({
         kind: rec.state,
@@ -199,10 +196,20 @@
         kind: "save-failed",
         tone: "error",
         label: "端末に保存できませんでした",
-        detail: "詳細からやり直せます",
+        detail: "詳細から再試行できます",
       });
     }
     problems.push(...clipLine(rec, true));
+    const loss = videoLossNote(rec.video_loss);
+    if (loss !== null && rec.deleted_at === null) {
+      problems.push({
+        kind: "video-loss",
+        tone: "warning",
+        label: loss.label,
+        detail: loss.detail,
+        testid: "video-loss",
+      });
+    }
     if (logoUnusable(rec.cm_note) && rec.deleted_at === null) {
       problems.push({
         kind: "logo",
@@ -215,14 +222,14 @@
     return statusLines(activities, problems);
   }
 
-  /** 「45.0%・あと 3 分 04 秒」。SSE で届く進み (`encode-live`) があればそちら。読み直しを待たずに動く */
+  /** 「45.0%・あと 3 分 04 秒」。SSE で届く進み具合 (`encode-live`) があればそちら。読み直しを待たずに動く */
   function encodeLine(rec: Rec): string {
     return encodeDetail(encodeLive.entries[rec.id], rec);
   }
 </script>
 
 <!-- 予約の行 (これから・録画中・「完了した予約も表示」で出る終わった予約) -->
-{#snippet resRow(item: Item & { kind: "res" }, nested: boolean)}
+{#snippet resRow(item: Item & { kind: "res" })}
   {@const res = item.res}
   <div
     data-testid="reservation-row"
@@ -255,7 +262,7 @@
     </div>
     <div class="row-actions">
       {#if res.recording_id !== null}
-        <!-- 追っかけ再生 (issue #16)。録っている最中でも頭から観られる -->
+        <!-- 追っかけ再生 (issue #16)。録っている最中でも先頭から観られる -->
         <a
           class="button"
           href={resolve(`chase/${res.recording_id}`)}
@@ -284,8 +291,8 @@
       {/if}
     </div>
     <!--
-      録画中は、録り終わるまでの進みを行の下端に敷く (あと何分かは 3 段目に出る)。
-      いちばん上の録画中の行は、バーの先に「いま」の時刻を出す (線の代わり。`TimelineHeading`)
+      録画中は、録り終わるまでの進み具合を行の下端に敷く (あと何分かは 3 段目に出る)。
+      いちばん上の録画中の行は、バーの先に「いま」の時刻を出す (「いま」の行の代わり。`TimelineHeading`)
     -->
     {#if item.zone === "now" && res.end_at > res.start_at}
       {@const done = Math.min(
@@ -296,7 +303,7 @@
         class="row-bar rec"
         value={done}
         max="1"
-        aria-label="録画の進み"
+        aria-label="録画の進み具合"
         data-testid="recording-progress"
       ></progress>
       {#if ctx.firstLiveKey === item.key}
@@ -311,8 +318,8 @@
   </div>
 {/snippet}
 
-<!-- 録り逃しの行。観るものが無いので、押すと詳細だけ出す。置くのは畳むための削除だけ -->
-{#snippet missedRow(item: Item & { kind: "missed" }, nested: boolean)}
+<!-- 録り逃しの行。観るものが無いので、押すと詳細だけ出す。置くのは一覧から消すための削除だけ -->
+{#snippet missedRow(item: Item & { kind: "missed" })}
   {@const res = item.res}
   <div
     data-testid="missed-row"
@@ -327,7 +334,6 @@
         start={res.start_at}
         end={res.end_at}
         name={res.name}
-        testid="missed-state"
         open={() => ctx.openMissed(res)}
       />
       <RowMeta
@@ -366,10 +372,10 @@
 {/snippet}
 
 <!--
-    録画の行。押すと再生 (録っている最中は追っかけ)。中身を読みたいときは行の「詳細」から。
-    置き場と尺と切った CM の位置は属性にだけ持たせる (確かめる手段は残しておきたい)
+  録画の行。押すと再生。中身を読みたいときは行の「詳細」から。
+  置き場と尺と切った CM の位置は属性にだけ持たせる (確かめる手段は残しておきたい)
 -->
-{#snippet recRow(item: Item & { kind: "rec" }, nested: boolean)}
+{#snippet recRow(item: Item & { kind: "rec" })}
   {@const rec = item.rec}
   {@const link = ctx.watchLink(rec)}
   {@const shown = rowState(rec)}
@@ -377,9 +383,9 @@
   {@const canDelete = rec.deleted_at === null && rec.job_id === null}
   {@const openDetail = () => ctx.openRecording(rec)}
   <!--
-        **途中まで観たものは残りを出す。** 観た位置は続きから始めるために持っていて、末尾まで観たものは
-        消えるので、残っている = まだ途中。ポスターの下端に細いバー、2 段目に「残り何分」
-    -->
+    **途中まで観たものは残りを出す。** 観た位置は続きから始めるために持っていて、末尾まで観たものは
+    消えるので、残っている = まだ途中。ポスターの下端に細いバー、2 段目に「残り何分」
+  -->
   {@const progress = link === null ? null : rec.progress}
   <div
     data-testid="recording-row"
@@ -505,7 +511,11 @@
                     class="menu-item menu-danger"
                     data-testid="row-menu-delete-confirm"
                   >
-                    <Icon icon={Trash} size="size-4" />削除を確定
+                    <Icon icon={Trash} size="size-4" />{offline.entries[
+                      rec.id
+                    ] === undefined
+                      ? "削除を確定"
+                      : "端末とサーバから削除"}
                   </button>
                 {:else}
                   <button
@@ -540,7 +550,7 @@
       {#if rec.deleted_at === null}
         {#if rec.job_id !== null}
           <!-- 動いている間は中断だけ。裏で ffmpeg が元の TS を読んでいるので、削除すると、その ffmpeg も失敗する。
-                        狭い画面はアイコンだけ (3 段目のエンコードの進みに幅を回す。字は読み上げに残す) -->
+                        狭い画面はアイコンだけ (3 段目のエンコードの進み具合に幅を回す。字は読み上げに残す) -->
           {#if rec.job_canceling}
             <button
               type="button"
@@ -571,6 +581,9 @@
               submit={afterDelete(rec)}
               testid="delete-button"
               confirmTestid="delete-confirm"
+              confirmLabel={offline.entries[rec.id] === undefined
+                ? "削除を確定"
+                : "端末とサーバから削除"}
               icon
             />
           </div>
@@ -587,7 +600,7 @@
         class:running={known}
         value={known ? barPercent : undefined}
         max="1"
-        aria-label="エンコードの進み"
+        aria-label="エンコードの進み具合"
       ></progress>
     {:else if held?.state === "downloading"}
       <progress
@@ -595,16 +608,16 @@
         class:running={held.progress !== null}
         value={held.progress ?? undefined}
         max="1"
-        aria-label="端末への保存の進み"
+        aria-label="端末への保存の進み具合"
       ></progress>
     {/if}
   </div>
 {/snippet}
 
 {#if item.kind === "res"}
-  {@render resRow(item, nested)}
+  {@render resRow(item)}
 {:else if item.kind === "missed"}
-  {@render missedRow(item, nested)}
+  {@render missedRow(item)}
 {:else}
-  {@render recRow(item, nested)}
+  {@render recRow(item)}
 {/if}

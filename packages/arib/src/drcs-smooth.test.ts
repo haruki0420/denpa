@@ -69,7 +69,7 @@ function sent(
 const at = (g: Grey, x: number, y: number) => g.pixels[y * g.width + x]!;
 
 describe("decodeGrey", () => {
-  test("1画素 bits ビットを上の桁から読み、v / (depth - 1) の濃さにする", () => {
+  test("1 画素 bits ビットを上の桁から読み、v / (depth - 1) の濃さにする", () => {
     expect([
       ...decodeGrey(4, 1, 2, 1, Uint8Array.from([0b1010_0000])).pixels,
     ]).toEqual([255, 0, 255, 0]);
@@ -95,7 +95,7 @@ describe("collapseDoubled", () => {
     expect(rows(collapseDoubled(doubled))).toEqual(rows(small));
   });
 
-  test("4 倍でも畳み切る。片方だけ水増しなら片方だけ畳む", () => {
+  test("4 倍でも元の大きさまで縮める。片方だけ水増しなら片方だけ縮める", () => {
     expect(
       rows(collapseDoubled(grey(["####", "####", "....", "...."]))),
     ).toEqual(["#", "."]);
@@ -201,7 +201,7 @@ describe("smoothDrcs", () => {
   });
 
   test("一辺 64 に届くまで 2 倍ずつ。256 は超えない", () => {
-    /** 斜めの線 (畳めない) を `size`x`size` で送ったときの、送る画像の大きさ */
+    /** 斜めの線 (縮められない) を `size`x`size` で送ったときの、送る画像の大きさ */
     const sizeOf = (size: number) => {
       const drcs = smoothDrcs(
         size,
@@ -219,7 +219,7 @@ describe("smoothDrcs", () => {
     expect([wide.w, wide.h]).toEqual([255, 1]);
   });
 
-  test("読めない画像 (大きさ 0・知らない bits) はそのまま渡す", () => {
+  test("読めない画像 (大きさ 0・対応していない bits) はそのまま渡す", () => {
     expect(smoothDrcs(0, 0, 2, 1, new Uint8Array())).toEqual({
       w: 0,
       h: 0,
@@ -239,7 +239,7 @@ describe("smoothDrcs", () => {
 });
 
 describe("pack4", () => {
-  test("16 階調にして1画素4ビットで詰める (左の画素が上の桁。奇数なら最後の下の桁は 0)", () => {
+  test("16 階調にして 1 画素 4 ビットで詰める (左の画素が上の桁。奇数なら最後の下の桁は 0)", () => {
     const g = { width: 3, height: 1, pixels: Uint8Array.from([255, 0, 128]) };
     expect([...pack4(g)]).toEqual([0xf0, 0x80]);
   });

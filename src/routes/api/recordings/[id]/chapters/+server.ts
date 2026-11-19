@@ -3,6 +3,7 @@ import { statSync } from "node:fs";
 import { config } from "#lib/server/config.js";
 import { encodedFile } from "#lib/server/library.js";
 import { PROBE_TIMEOUT, tsChapters } from "#lib/server/playback.js";
+import { recordingProbeInput } from "#lib/server/recording-io.js";
 import { recordingOr404 } from "#lib/server/recording.js";
 import { etagMatches, fileEtag } from "#lib/server/serve.js";
 import { run } from "#lib/server/stream.js";
@@ -20,7 +21,7 @@ import { parseChapters } from "#lib/ts/watch.js";
  * `recordings.cm_ranges` にも検出した位置は残っているが、**エンコードの完了と
  * 食い違うことがある。**
  *
- * - CM を**切って**エンコードしたものは、切ったぶんだけ後ろが前に詰まっている
+ * - v2.37 までに CM を**切って**エンコードしたものは、切ったぶんだけ後ろが前に詰まっている
  * - 引き継いだ録画 (EPGStation) は denpa が検出していないので `cm_ranges` が空。
  *   それでもチャプターは入っている
  *
@@ -33,14 +34,14 @@ import { parseChapters } from "#lib/ts/watch.js";
  *
  * ## 待たせない
  *
- * `-show_chapters` は見出しだけを読むので、中身を舐めない。実機の 30 分ものでも
+ * `-show_chapters` は見出しだけを読むので、中身は読まない。実機の 30 分ものでも
  * 一瞬で返る。**開くたびに呼ぶ**ので、録画ごとに控えを持つほどではない
  * (ファイルが再エンコードされたら中身も変わる)。
  *
  * ## 持たせてよいが、毎回確かめさせる
  *
  * **CM 検出のやり直しは、同じパスのファイルのチャプターを書き直す** (`encoder.runCmJob`)。
- * パスで 1 時間持たせていた頃は、やり直したあとも古いチャプターが返っていた。
+ * パスで長く持たせると、やり直したあとも古いチャプターが返る。
  * `no-cache` + ETag (ファイルの大きさと更新時刻) にして、変わっていなければ ffprobe も走らせずに 304 で返す
  */
 
@@ -79,11 +80,16 @@ export async function GET({ params, request }) {
       "-show_chapters",
       "-print_format",
       "json",
-      path,
+      ...recordingProbeInput(path),
     ],
     { timeoutMs: PROBE_TIMEOUT, stdout: true },
   );
   const out = new TextDecoder().decode(probed.stdout);
+  // 失敗 (時間切れを含む) は控えさせない。ETag を付けると、ファイルが変わるまで空のチャプターが 304 で返り続ける
+  if (probed.code !== 0) {
+    delete headers["ETag"];
+    headers["Cache-Control"] = "no-store";
+  }
 
   return Response.json({ chapters: parseChapters(out) }, { headers });
 }

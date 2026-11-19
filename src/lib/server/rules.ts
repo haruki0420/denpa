@@ -18,6 +18,7 @@ import { duplicateReason } from "../format";
 import { hasTime, inTime, jstOf } from "../rule-time";
 import { parseSearchFields, type SearchField } from "../search";
 import type { Program, Rule } from "../types";
+import { shareKey } from "./agent-channels";
 import { config } from "./config";
 import { paidAllowed } from "./contracts";
 import { now, orm } from "./db";
@@ -32,6 +33,7 @@ import {
   type Taken,
 } from "./episode";
 import {
+  hasVideo,
   HELD_STATES,
   programs as programTable,
   recordedHistory,
@@ -74,7 +76,13 @@ export function haystack(
 type Matchable = Pick<
   Program,
   "service_id" | "is_free" | "genres" | "genre_detail" | "start_at"
->;
+> & {
+  /**
+   * 局の ARIB のサービス種別 (`services.service_type`)。映像の無い局 (`schema.hasVideo`) は、局を名指ししたルールだけが当てる。
+   * 省けば見ない (検索の「これからの放送」は録るかどうかを決めないので、映像の無い局の番組も出す)
+   */
+  arib_service_type?: number;
+};
 
 /**
  * 番組のジャンル。中分類まで持っている genre_detail を使い、
@@ -88,12 +96,11 @@ function parseGenreDetail(program: Matchable): Genre[] {
 }
 
 /**
- * 判定に使う形式にほどいたルール。
+ * 判定に使う形式に直したルール。
  *
- * ほどく作業 (JSON の読み出し、キーワードの分割、全角の直し) を**ルール 1 つにつき
- * 1 回**にするために分けてある。以前は判定のたびにやっていて、実機では
- * 有効なルール 318 × これから放送される番組 25,608 = **810 万回**それをやっていた。
- * ルールを 1 つ足すだけで十数秒待たされていたのはこれが理由。
+ * 直す作業 (JSON の読み出し、キーワードの分割、全角を半角に寄せる) を**ルール 1 つにつき
+ * 1 回**にするために分けてある。判定のたびにやると、実機では
+ * 有効なルール 318 × これから放送される番組 25,608 = **810 万回**になり、ルールを 1 つ足すだけで十数秒掛かった。
  */
 interface CompiledRule {
   rule: Rule;
@@ -132,7 +139,7 @@ export function compile(rule: Rule): CompiledRule {
 /**
  * SQL の `GLOB` で候補を減らすための形式。**減らすだけで、当てるのは `matchesCompiled`。**
  *
- * 下見 (`rule-preview.ts`) はこれから放送される番組を全部引いて JS で絞っていた。
+ * 下見 (`rule-preview.ts`) がこれから放送される番組を全部引いて JS で絞ると、
  * 実データ相当 (33,000 件) で全列を読むだけで 330〜400ms、条件が 1 語でも同じだけ
  * かかる。番組名に `GLOB '*語*'` を掛ければ当たった行だけ読める。
  *
@@ -172,6 +179,7 @@ export const ANY_PAID: PaidAllowed = () => true;
  *
  * - `paid` 契約を確かめていない有料放送 (`PaidAllowed`)
  * - `service` 局の条件から外れる
+ * - `videoless` 映像の無い局 (ラジオ・データ放送) の番組で、ルールがその局を名指ししていない
  * - `genre` ジャンルの条件から外れる
  * - `time` 始まる時刻が時間帯の外
  * - `weekday` 始まる時刻の曜日が条件の外
@@ -182,6 +190,7 @@ export const ANY_PAID: PaidAllowed = () => true;
 export type Miss =
   | "paid"
   | "service"
+  | "videoless"
   | "genre"
   | "time"
   | "weekday"
@@ -190,7 +199,7 @@ export type Miss =
   | "ignore";
 
 /**
- * ほどいたルールに番組が当てはまらない理由。当てはまれば null。
+ * 直したルール (`compile`) に番組が当てはまらない理由。当てはまれば null。
  *
  * 検索用テキストは**関数で受け取る**。文字を作るのが一番高くつくので、
  * 局やジャンルで落ちる番組にはそもそも作らせない。
@@ -219,6 +228,17 @@ export function missOf(
       serviceType !== undefined && (types?.includes(serviceType) ?? false);
     if (!byService && !byType) return "service";
   }
+
+  /*
+   * **映像の無い局 (ラジオ・データ放送) の番組は、その局を名指ししたルールだけが当てる。** 種別 (「地上波全部」) や
+   * キーワードだけのルールは当てない。取り込んでいなかった頃からあるルールが、映像の無い局を急に録り始めないため。データ放送の局は 1 日 1 番組のことがあり、キーワードで当たると丸 1 日録る
+   */
+  if (
+    program.arib_service_type !== undefined &&
+    !hasVideo(program.arib_service_type) &&
+    !(services?.includes(program.service_id) ?? false)
+  )
+    return "videoless";
 
   // ジャンルは "7" (大分類だけ) と "7-0" (中分類まで) の 2 通りで持つ。
   // 昔のルールは数値の配列だが、読み出し時に文字列へ揃えてある (schema.ts の strings)
@@ -254,7 +274,7 @@ export function missOf(
   return ignores.some((k) => text.includes(k)) ? "ignore" : null;
 }
 
-/** ほどいたルールに番組が当てはまるか ({@link missOf} が理由を返さないか) */
+/** 直したルールに番組が当てはまるか ({@link missOf} が理由を返さないか) */
 export function matchesCompiled(
   compiled: CompiledRule,
   program: Matchable,
@@ -394,7 +414,7 @@ const DECLINE_WINDOW = 10 * 60 * 1000;
  * ところが id が同じでなくなるケースが 2 つあり、どちらも実機で**取り消したはずの回が
  * 録れた**として出た。
  *
- * - **枝番違い。** 同じ放送が 23608 と 23609 の両方に載るとき、束ねが一時的に
+ * - **枝番違い。** 同じ放送が 23608 と 23609 の両方に載るとき、1 本にまとめる判定 (`oneBroadcast`) が一時的に
  *   外れる (片方だけ延長が先に届く、タイトルがまだ違う) と、取り消していないほうの
  *   枝番に予約が無いので立つ。放送直前なら猶予 (`ruleRetractGrace`) の中で
  *   引っ込まず、そのまま録れる
@@ -407,14 +427,15 @@ const DECLINE_WINDOW = 10 * 60 * 1000;
  *
  * **システムの取り消しは含めない。** 選局できなくなった局の予約はシステムが
  * 取り消す (`epg.clearBelongings`、`canceled_by = 'system'`) が、それは「局が戻ったなら
- * 録る」でよい。列を足す前の行 (NULL) は人が押したものとして扱う。
- * 手動予約を人が取り消したぶんは含める。今までも id が同じ限りルールを止めていたので、
- * その振る舞いを id が変わっても続けるだけ。
+ * 録る」でよい。同じ番組 (同じ id) で戻ったぶんは、当て直しの前に取り消しの行を予約に戻す (`epg.restoreReturned`)。
+ * 列を足す前の行 (NULL) は人が押したものとして扱う。
+ * 手動予約を人が取り消したぶんは含める。id が同じなら `INSERT OR IGNORE` でルールが止まるので、
+ * id が変わっても同じに止める。
  */
 export function canceledBroadcasts(at: number): Declined {
   const rows = orm()
     .select({
-      channel: services.channel,
+      channel: shareKey(),
       name: reservations.name,
       start_at: reservations.start_at,
     })
@@ -655,6 +676,39 @@ function episodeSkips<T extends Candidate>(
 }
 
 /**
+ * **同じ放送は 1 本だけ。** 同じ物理チャンネルの中で、同じ時刻に同じ番組名が
+ * 流れていたら同じ放送とみなし、いちばん小さい局だけを残す (並びはそのまま)。
+ * 予約を立てるとき (`applyRules`) と下見 (`rule-preview.ts`) で同じものを使う。
+ *
+ * 局は分割放送のために枝番を持っていて (TOKYO MX なら 23608 / 23609、
+ * どちらも名前は「TOKYO MX1」)、**分割していない間は同じ番組が両方に載る**。
+ * 素通しにしていた実機では、同じ回が 2 本録れたうえに、2 つのエンコードが
+ * 同じ名前のファイルへ同時に書いて中身が壊れた。
+ *
+ * 中身が違うとき (MX1 と MX2 で別番組) はタイトルが違うので、両方残る。
+ *
+ * **終了時刻はキーに入れない。** 延長は枝番ごとに別々のタイミングで届く
+ * (EIT p/f は局ごと) ので、片方だけ `end_at` が動いた回は「別の放送」に
+ * 見えて両方が立っていた。開始とタイトルが同じなら同じ放送。
+ *
+ * @param channelOf 放送の物理チャンネル
+ */
+export function oneBroadcast<
+  T extends { service_id: number; start_at: number; name: string },
+>(list: readonly T[], channelOf: (item: T) => string): T[] {
+  const kept = new Map<string, T>();
+  for (const item of list) {
+    const key = `${channelOf(item)} ${item.start_at} ${item.name}`;
+    const twin = kept.get(key);
+    // 枝番の小さいほうが本チャンネル (MX1 なら 23608)。並び順に左右されないよう、あとから小さいものが来たら入れ替える
+    if (twin !== undefined && twin.service_id <= item.service_id) continue;
+    kept.set(key, item);
+  }
+  const survivors = new Set(kept.values());
+  return list.filter((item) => survivors.has(item));
+}
+
+/**
  * 下見 (`rule-preview.ts`) の「録らない」({@link episodeSkips})。人が取り消した放送は `applyRules` も
  * 立てないので、「最初の放送」の候補に入れない。両方当たるなら同じ回のほう (`repeat` / `recorded`) を返す
  */
@@ -730,7 +784,7 @@ export function duplicateAtStart(recordingId: number): string | null {
   if (owner === undefined || !owner.dedupe) return null;
 
   const service = orm()
-    .select({ type: services.type })
+    .select({ type: services.type, network_id: services.network_id })
     .from(services)
     .where(eq(services.id, recording.service_id))
     .get();
@@ -781,6 +835,7 @@ export function duplicateAtStart(recordingId: number): string | null {
     end_at: recording.end_at,
     service_id: recording.service_id,
     type: service?.type ?? "",
+    network_id: service?.network_id ?? 0,
   };
   const skip = firstAirings([airing], new Set(), [
     ...takenOf(rows),
@@ -790,14 +845,33 @@ export function duplicateAtStart(recordingId: number): string | null {
 }
 
 /**
- * 外れても引っ込めない予約か (下見の行に出す。猶予は `applyRules` と同じ)。手動のものと、もうすぐ始まる (猶予の内) もの。
+ * 外れても引っ込めない予約か (`applyRules` と下見が同じ決まりで見る)。手動のものと、**有効なルール** (`enabled`) の予約で
+ * もうすぐ始まる (猶予の内) もの。ルールごと消された・止められた予約は、直前でも引っ込める (人が押した結果なので)。
  * 録り始めたものは予約の候補 (`started_at` が空) に入らないので、ここには来ない
  */
 export function keepsReservation(
-  held: { manual: boolean; start_at: number },
+  held: { manual: boolean; start_at: number; rule_id: number | null },
   at: number,
+  enabled: (rule: number) => boolean,
 ): boolean {
-  return held.manual || held.start_at < at + config.ruleRetractGrace;
+  if (held.manual) return true;
+  return (
+    held.rule_id !== null &&
+    enabled(held.rule_id) &&
+    held.start_at < at + config.ruleRetractGrace
+  );
+}
+
+/** 有効なルールの ID (`keepsReservation` に渡す) */
+export function enabledRuleIds(): Set<number> {
+  return new Set(
+    orm()
+      .select({ id: ruleTable.id })
+      .from(ruleTable)
+      .where(eq(ruleTable.enabled, true))
+      .all()
+      .map((row) => row.id),
+  );
 }
 
 interface RuleSync {
@@ -814,8 +888,8 @@ interface RuleSync {
 /**
  * ルールを番組表に当て直して、予約をそろえる。
  *
- * **足すだけでなく、外れたものは消す。** 足すだけだった頃は、番組表が書き換わって
- * 条件から外れた予約がそのまま残り、消す手立てが画面の「取り消し」しか無かった。
+ * **足すだけでなく、外れたものは消す。** 足すだけだと、番組表が書き換わって
+ * 条件から外れた予約がそのまま残り、消すには画面で取り消すしか無い。
  *
  * - 当たるのに予約が無い → **作る**
  * - 予約があるのに、どのルールにも当たらなくなった → **消す**
@@ -858,12 +932,17 @@ export function applyRules(options: { rule?: number } = {}): RuleSync {
   const at = now();
   // 録画のしかたは全体で 1 つ。ルールごとに持たせるとどこで決まったか分からなくなる
   const recording = settings();
-  // 種別 (GR/BS/CS) でも絞り込めるよう、番組に局の種別と物理チャンネルを添えて取る
+  // 種別でも絞り込めるよう、番組に局の種別と物理チャンネルを添えて取る。
+  // 復号できるか (`services.decodable`) も添える。当てないのは下のループで、番組そのものは引く (下の `listed`。
+  // 局が復号できなくなったあとに残った予約を、条件から外れたものとして引っ込める)
   const programs = orm()
     .select({
       ...getTableColumns(programTable),
       service_type: services.type,
-      channel: services.channel,
+      // 映像の無い局は、局を名指ししたルールだけが当てる (`missOf`)
+      arib_service_type: services.service_type,
+      channel: shareKey(),
+      decodable: services.decodable,
     })
     .from(programTable)
     .innerJoin(services, eq(services.id, programTable.service_id))
@@ -891,27 +970,22 @@ export function applyRules(options: { rule?: number } = {}): RuleSync {
       matched: Rule[];
     }
   >();
-  /**
-   * **同じ放送は 1 本だけ。** 同じ物理チャンネルの中で、同じ時刻に同じ番組名が
-   * 流れていたら同じ放送とみなし、いちばん小さい局だけを残す。
-   *
-   * 局は分割放送のために枝番を持っていて (TOKYO MX なら 23608 / 23609、
-   * どちらも名前は「TOKYO MX1」)、**分割していない間は同じ番組が両方に載る**。
-   * 素通しにしていた実機では、同じ回が 2 本録れたうえに、2 つのエンコードが
-   * 同じ名前のファイルへ同時に書いて中身が壊れた。
-   *
-   * 中身が違うとき (MX1 と MX2 で別番組) はタイトルが違うので、両方残る。
-   *
-   * **終了時刻はキーに入れない。** 延長は枝番ごとに別々のタイミングで届く
-   * (EIT p/f は局ごと) ので、片方だけ `end_at` が動いた回は「別の放送」に
-   * 見えて両方が立っていた。開始とタイトルが同じなら同じ放送。
-   */
-  const simulcast = new Map<string, { serviceId: number; programId: number }>();
+  /** 当たった放送。この中から同じ放送を 1 本にまとめる (`oneBroadcast`) */
+  const hits: {
+    owner: Rule;
+    program: (typeof programs)[number];
+    matched: Rule[];
+  }[] = [];
   // 有料放送は契約中と確かめた局だけ当てる (`contracts.paidAllowed`)。当てはめ 1 回につき 1 回読む
   const paidOk = paidAllowed();
   for (const program of programs) {
+    /*
+     * **復号できない局の番組は当てない** (`services.decodable`)。番組表を読めて番組表に出ている局でも、
+     * 録ってもスクランブルのままで観られない
+     */
+    if (!program.decodable) continue;
     const textOf = textCache(program);
-    // 先勝ちの持ち主のほかに、当たったルールを全部見る (下の dedupe / skip_earlier の受け手)
+    // 先勝ちの持ち主のほかに、当たったルールを全部見る (下の dedupe / skip_earlier の対象)
     const matched = searching
       .filter((candidate) =>
         matchesCompiled(
@@ -931,20 +1005,13 @@ export function applyRules(options: { rule?: number } = {}): RuleSync {
      * 枝番違いや event_id の変更ですり抜ける (上の `canceledBroadcasts`)
      */
     if (declined.has(program)) continue;
-    const key = `${program.channel} ${program.start_at} ${program.name}`;
-    const twin = simulcast.get(key);
-    if (twin !== undefined) {
-      // 枝番の小さいほうが本線 (MX1 なら 23608)。並び順に左右されないよう、
-      // あとから小さいものが来たら入れ替える
-      if (twin.serviceId <= program.service_id) continue;
-      wanted.delete(twin.programId);
-    }
-    simulcast.set(key, {
-      serviceId: program.service_id,
-      programId: program.id,
-    });
-    wanted.set(program.id, { rule: owner, program, matched });
+    hits.push({ owner, program, matched });
   }
+  const hitPrograms = hits.map((hit) => hit.program);
+  const kept = new Set(oneBroadcast(hitPrograms, (p) => p.channel));
+  for (const { owner, program, matched } of hits)
+    if (kept.has(program))
+      wanted.set(program.id, { rule: owner, program, matched });
 
   /*
    * **同じ回は最初の放送だけ** (ルールの `dedupe`) と **前の回は録らない** (`skip_earlier`)。
@@ -999,9 +1066,8 @@ export function applyRules(options: { rule?: number } = {}): RuleSync {
         .all();
   /** 番組表にまだ載っている番組。読めていないだけのものと区別する */
   const listed = new Map(programs.map((program) => [program.id, program]));
-  /** まだ生きているルール。消された/止められたぶんは猶予を置かずに引っ込める */
+  /** 有効なルール。消された/止められたぶんは猶予を置かずに引っ込める */
   const enabled = new Set(rules.map((rule) => rule.id));
-  const grace = at + config.ruleRetractGrace;
 
   orm().transaction((tx) => {
     for (const { rule, program } of wanted.values()) {
@@ -1035,16 +1101,9 @@ export function applyRules(options: { rule?: number } = {}): RuleSync {
         /*
          * 別のルールが引き取ったなら付け替えるだけで、録るものは変わらない。
          *
-         * **同じルールでも、優先度は当て直す。**
-         *
-         * 予約は `INSERT OR IGNORE` で立てるので、**もう立っている
-         * ぶんは作った日の優先度のまま**だった。ルールの優先度を
-         * 上げても効くのは次に立つ予約からで、いま競合している
-         * 予約はいくら上げても負けたまま。実機で、優先度 2 に
-         * 上げた「片田舎のおっさん」が優先度 1 の裏番組に負け続けて
-         * いた (予約側は 3 件とも 1 のまま)。
-         *
-         * 優先度はルールが持つものなので、こちらを本物として扱う
+         * **同じルールでも、優先度は当て直す。** 予約は `INSERT OR IGNORE` で立てるので、
+         * もう立っているぶんは作った日の優先度のまま残る。当て直さないと、ルールの優先度を
+         * 上げても、いま競合している予約は負けたままになる。優先度はルールが持つものなので、ルールの値を写す
          */
         const moved = owner.rule.id !== reservation.rule_id;
         if (moved || owner.rule.priority !== reservation.priority) {
@@ -1064,10 +1123,13 @@ export function applyRules(options: { rule?: number } = {}): RuleSync {
       const program = listed.get(reservation.program_id);
       // 番組表から消えているだけかもしれない。タイトルが空のものも判断材料にならない
       if (program === undefined || program.name === "") continue;
-      // ルールが生きているのに外れた = 番組表が動いた。直前なら録っておく
-      const byChurn =
-        reservation.rule_id !== null && enabled.has(reservation.rule_id);
-      if (byChurn && reservation.start_at < grace) continue;
+      // ルールが有効なのに外れた = 番組表が動いた。直前なら録っておく (`keepsReservation`)
+      const kept = keepsReservation(
+        { ...reservation, manual: false },
+        at,
+        (id) => enabled.has(id),
+      );
+      if (kept) continue;
       tx.delete(reservations).where(eq(reservations.id, reservation.id)).run();
       result.dropped++;
     }

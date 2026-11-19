@@ -13,11 +13,11 @@
  *
  * ## 映像と同じ ffmpeg で受ける。**それが時刻を揃える唯一の方法**
  *
- * ffmpeg は入口で時刻を 0 に寄せ直すが、その寄せ幅は**プロセスごとに違う**。
+ * ffmpeg は入力で時刻を 0 に寄せ直すが、その寄せ幅は**プロセスごとに違う**。
  * 別々に起動した 2 本はエンコードを始めたときのキーフレームが 0〜0.5 秒ずれる (仕掛けを 5 通り作って
- * -60〜+450ms とばらけた)。`-copyts` で放送の絶対時刻を保っても、**mp4 のマルチプレクサが
+ * -60〜+450 ms とばらけた)。`-copyts` で放送の絶対時刻を保っても、**mp4 のマルチプレクサが
  * その時刻を 0 に詰め直す**ので、受け側から見た 0 がどの放送時刻かは外から知りようがない。
- * 1 本にすれば入口の寄せが 1 回だけになって両方の出口に効く (実機で 1ms 以内で一致)。
+ * 1 本にすれば入力の寄せが 1 回だけになって両方の出力に効く (実機で 1 ms 以内で一致)。
  *
  * 字幕は**デコードせずに写す** (`-c:s copy`)。ffmpeg に字幕のデコーダは要らない。
  *
@@ -37,27 +37,22 @@ import {
 } from "@danything/arib/caption-text";
 import { LANGUAGE } from "@danything/arib/language";
 import { CLOCK } from "@danything/arib/pes";
-import {
-  descriptors,
-  packetPid,
-  PacketStream,
-  PID_PAT,
-  pmtStreams,
-  PmtTracker,
-  TABLE_PMT,
-} from "@danything/arib/psi";
+import { descriptors, PacketStream, pmtStreams } from "@danything/arib/psi";
 
 import { type CaptionTrack, CHANNEL, type Notice } from "#lib/live.js";
 import { type MkvFrame, MkvSplitter } from "#lib/ts/mkv.js";
+import type { ServiceVideo } from "#lib/types.js";
 
-/** 失敗を言っている行。**それ以外は入口の説明なので捨てる** */
+import { PmtWatch } from "./pmt-watch";
+
+/** 失敗を示す行。**それ以外は入力の説明なので捨てる** */
 const TROUBLE = /error|Error|failed|Failed|Cannot|Unable|No such|Invalid data/;
 
 /**
- * 放送の欠けにいちいち言われるぶん。**残さない。**
+ * 放送の欠けのたびに出力される行。**残さない。**
  *
  * 電波の欠けは日常的にあり、デコーダはそのたびに「直した」「捨てた」をログに出力する
- * (選べる字幕を入口の見出しから読み取るためにログは info まで開けてある)。
+ * (選べる字幕を入力の見出しから読み取るためにログは info まで開けてある)。
  * 弱い局では毎秒何行も出て、**本当の失敗がその中に埋もれる**。
  *
  * 消すのは「1 パケットぶんの取りこぼし」だけ。組み立てやエンコーダの失敗
@@ -72,7 +67,7 @@ export function worthLogging(line: string): boolean {
 }
 
 /**
- * 字幕を**デコードせずに写す**出口。映像とは別の出口 (`pipe:3`) に出す。
+ * 字幕を**デコードせずに写す**出力。映像とは別の出力 (`pipe:3`) に出す。
  *
  * - `-c:s copy` … 字幕の PES の中身をそのまま (`S_ARIBSUB`)。デコードするのは denpa (`CaptionText`)
  * - `matroska` … **時刻をコマと一緒に運ぶコンテナ**。塊の上限を最小にして、
@@ -114,14 +109,14 @@ export function programSpec(program: number): string {
  * **放送そのままで送る経路の字幕** (docs/stream.md#放送そのままmpeg-2を送る)。映像はエンコードしないので、ffmpeg には字幕だけを
  * 写させる。
  *
- * エンコードの経路で「同じ ffmpeg に両方エンコードさせる」のは、ffmpeg が入口で時刻を 0 に寄せ、その
+ * エンコードの経路で「同じ ffmpeg に両方エンコードさせる」のは、ffmpeg が入力で時刻を 0 に寄せ、その
  * 寄せ幅がプロセスごとに違うからだった (上の説明)。放送そのままの経路では**寄せない** (`-copyts`)。
  * 受け側が合わせる相手は放送の PTS そのもの (ブラウザが自分で PES から読む) なので、
  * 字幕も放送の PTS のまま出せば突き合わせられる。mp4 のマルチプレクサが時刻を 0 に詰め直す
- * 問題は、字幕の出口 (Matroska) には無い。実機の録画で、出てきた字幕の時刻が元の TS の
- * 字幕 PES の PTS と 1ms 単位で一致した (71759.734333 → 71759.734)。
+ * 問題は、字幕の出力 (Matroska) には無い。実機の録画で、出てきた字幕の時刻が元の TS の
+ * 字幕 PES の PTS と 1 ms 単位で一致した (71759.734333 → 71759.734)。
  *
- * **`-copyts` を外すと合わない。** 映像を出さない ffmpeg は寄せ幅を入口の `start:` とは
+ * **`-copyts` を外すと合わない。** 映像を出さない ffmpeg は寄せ幅を入力の `start:` とは
  * 違う値にし (同じ録画で 0.3〜0.7 秒ずれた)、それを外から知る方法が無い。
  *
  * 映像をデコードしない (字幕の ES だけを読む) ので、エンコードする ffmpeg と違って CPU はほとんど使わない
@@ -139,7 +134,7 @@ export function rawCaptionArgs(
   const from = programSpec(program);
   return [
     "-hide_banner",
-    // 出口が名前付きパイプ (Windows) でも、あるかを確かめさせない (`stream.sideOutput`)
+    // 出力が名前付きパイプ (Windows) でも、あるかを確かめさせない (`stream.sideOutput`)
     "-y",
     "-nostats",
     "-fflags",
@@ -158,12 +153,12 @@ export function rawCaptionArgs(
  *
  * 字幕を持たない局はある (ショッピングやサブチャンネル)。そこに
  * `0:p:X:s:0` を要求すると、ffmpeg は**組み立ての時点で終了する**。つまり
- * **映像も出ない**。そうと分かったら字幕なしで起動し直す (`Session.run`)。
+ * **映像も出ない**。そうと分かったら字幕なしで起動し直す (`Session.runEncode`)。
  *
  * ffmpeg は `Stream map '' matches no streams.` と出力する。**この行は記録に残らない** (`worthLogging` の
  * 言葉を含まない)。残るのはそのあとの `Failed to set value '0:p:X:s:0' for option 'map': Invalid argument`
  *
- * 起動する前に PMT を読んで、字幕が無ければ初めから要求しない (`peekCaptions`)。これは PMT を読めなかった
+ * 起動する前に PMT を読んで、字幕が無ければ初めから要求しない (`peekPmt`)。これは PMT を読めなかった
  * ときと、ffmpeg と見立てが食い違ったときの備え
  */
 export const NO_SUBTITLE = /matches no streams/;
@@ -201,30 +196,75 @@ export function captionStreams(section: Uint8Array): number {
   return count;
 }
 
-/** TS を少しずつ渡して、その局の PMT から字幕の本数を読む (`captionStreams`) */
-export class CaptionCount {
+/**
+ * 映像の stream_type と、そのコーデック。ffmpeg と同じく、PMT に並んだ最初の映像を局の映像とみなす。
+ * ケーブルの 4K の局には、TS に HEVC (0x24) を入れて送る局がある (docs/stream.md「TS で送る 4K の局」)
+ */
+const VIDEO_STREAMS: ReadonlyMap<number, ServiceVideo> = new Map([
+  [0x02, "mpeg2"],
+  [0x1b, "h264"],
+  [0x24, "hevc"],
+]);
+
+/** **PMT から局の映像のコーデックを読む** (`VIDEO_STREAMS`)。映像が無ければ null */
+export function pmtVideo(section: Uint8Array): ServiceVideo | null {
+  for (const [type] of pmtStreams(section)) {
+    const video = VIDEO_STREAMS.get(type);
+    if (video !== undefined) return video;
+  }
+  return null;
+}
+
+/** 音声の stream_type (MPEG-1・MPEG-2 の音声、ADTS と LATM の AAC)。放送の音声は ADTS の AAC (0x0F) */
+const AUDIO_STREAMS: ReadonlySet<number> = new Set([0x03, 0x04, 0x0f, 0x11]);
+
+/** **PMT に音声があるか** (`AUDIO_STREAMS`)。データ放送だけの局は映像も音声も無い */
+function pmtAudio(section: Uint8Array): boolean {
+  for (const [type] of pmtStreams(section))
+    if (AUDIO_STREAMS.has(type)) return true;
+  return false;
+}
+
+/**
+ * TS を少しずつ渡して、その局の PMT から字幕の本数 (`captionStreams`)・映像のコーデック (`pmtVideo`)・音声があるか (`pmtAudio`) を読む
+ */
+export class PmtPeek {
   private readonly packets = new PacketStream();
-  private readonly pmt: PmtTracker;
+  private readonly pmt: PmtWatch<{
+    count: number;
+    video: ServiceVideo | null;
+    audio: boolean;
+  }>;
+  /** 読んだ PMT にある映像のコーデック。まだ読んでいないか、映像が無ければ null */
+  video: ServiceVideo | null = null;
+  /** 読んだ PMT に音声があるか。まだ読んでいなければ null */
+  audio: boolean | null = null;
 
   /** @param program 放送が名乗っている番号 */
   constructor(program: number) {
-    this.pmt = new PmtTracker(program);
+    this.pmt = new PmtWatch(program, (section) => ({
+      count: captionStreams(section),
+      video: pmtVideo(section),
+      audio: pmtAudio(section),
+    }));
   }
 
-  /** 塊を 1 つ。**PMT を読めたら字幕の本数**、まだなら null */
+  /** 塊を 1 つ。**PMT を読めたら字幕の本数**、まだなら null。映像のコーデックは `video`、音声があるかは `audio` に入れる */
   feed(chunk: Uint8Array): number | null {
     for (const packet of this.packets.feed(chunk)) {
-      const pid = packetPid(packet);
-      if (pid !== PID_PAT && pid !== this.pmt.pid) continue;
-      for (const section of this.pmt.feed(packet, pid))
-        if (section[0] === TABLE_PMT) return captionStreams(section);
+      if (!this.pmt.feedPacket(packet)) continue;
+      const read = this.pmt.value;
+      if (read === null) continue;
+      this.video = read.video;
+      this.audio = read.audio;
+      return read.count;
     }
     return null;
   }
 }
 
 /**
- * PMT を待つ長さ (ms)。本物の電波は PMT を 100ms ごとに流すので、届き始めればすぐ読める。
+ * PMT を待つ長さ (ms)。本物の電波は PMT を 100 ms ごとに流すので、届き始めればすぐ読める。
  *
  * **待っても映像は遅れない。** ffmpeg へ渡すものは局に絞っていて、絞る側 (`ServiceFilter`) は
  * PMT を読むまで 1 バイトも出さない。ここで区切るのは、その局の PMT が来ない放送で待ち続けないため
@@ -232,25 +272,33 @@ export class CaptionCount {
 export const PMT_WAIT = 3_000;
 
 /**
- * **ffmpeg を起動する前に、字幕があるかを TS の先頭から読む。**
+ * **ffmpeg を起動する前に、字幕があるかと映像のコーデック・音声があるかを TS の先頭から読む。**
  *
- * 字幕を持たない放送に字幕の出口を要求すると ffmpeg は入口を探り終えてから終了し、起動し直すぶん
+ * 字幕を持たない放送に字幕の出力を要求すると ffmpeg は入力を探り終えてから終了し、起動し直すぶん
  * 映像が 1.5 秒ほど遅れる (`NO_SUBTITLE`)。PMT には ES が全部並んでいるので、起動する前に分かる。
- * ffmpeg の `-map …?` (無ければ飛ばす) では足りない。字幕の出口に何も無いと、それで終了する
+ * ffmpeg の `-map …?` (無ければ飛ばす) では足りない。字幕の出力に何も無いと、それで終了する
+ *
+ * 映像のコーデックは、TS に HEVC を入れて送る 4K の局を、MPEG-2 の局と分けてエンコードするのに使う (`live.encodeArgs` の `video`)。
  *
  * **読んだ塊は捨てない。** 返すストリームの先頭から同じものが出てくる
  *
  * @param program 放送が名乗っている番号
- * @param wait これだけ待って PMT を読めなければ、字幕の本数は null (分からない)
+ * @param wait これだけ待って PMT を読めなければ、字幕の本数・映像のコーデック・音声があるかは null (分からない)
  * @param onChunk 塊が届くたびに呼ぶ (開くまでの内訳の「最初のバイト」)
  */
-export async function peekCaptions(
+export async function peekPmt(
   stream: AsyncGenerator<Uint8Array>,
   program: number,
   wait: number,
   onChunk?: () => void,
-): Promise<{ stream: AsyncGenerator<Uint8Array>; count: number | null }> {
-  const counter = new CaptionCount(program);
+): Promise<{
+  stream: AsyncGenerator<Uint8Array>;
+  count: number | null;
+  video: ServiceVideo | null;
+  /** PMT に音声があるか。読めなければ null */
+  audio: boolean | null;
+}> {
+  const counter = new PmtPeek(program);
   const head: Uint8Array[] = [];
   let timer: ReturnType<typeof setTimeout> | undefined;
   const late = new Promise<"late">((resolve) => {
@@ -280,7 +328,12 @@ export async function peekCaptions(
   } finally {
     clearTimeout(timer);
   }
-  return { stream: replay(head, pending, stream), count };
+  return {
+    stream: replay(head, pending, stream),
+    count,
+    video: counter.video,
+    audio: counter.audio,
+  };
 }
 
 /** 読んでおいた塊、読みかけの 1 つ、残り、の順に出す */
@@ -306,12 +359,12 @@ async function* replay(
   }
 }
 
-/** ffmpeg が入口の見出しに書く行 */
+/** ffmpeg が入力の見出しに書く行 */
 const PROGRAM = /^\s*Program (\d+)/;
 const STREAM = /^\s*Stream #0:(\d+)\[0x[0-9a-f]+\](?:\((\w+)\))?: (\w+):/;
 
 /**
- * ffmpeg の入口の見出しから、その局の字幕ストリームを読み取る。
+ * ffmpeg の入力の見出しから、その局の字幕ストリームを読み取る。
  *
  * **字幕が 1 枚も来ていなくても、あることは分かる** (字幕の間隔が空く番組でも切り替えを出せる)。
  *
@@ -340,6 +393,16 @@ export class TrackList {
     const lang = stream[2] ?? null;
     const index = this.found.length;
     this.found.push({ index, lang, label: label(index, lang) });
+    return true;
+  }
+
+  /**
+   * ffmpeg を通さずに分かった字幕を 1 本足す (4K の局の TTML。`live-mmt.ts` の `hasCaptions`)。
+   * もう 1 本あれば足さない。**足したら true**
+   */
+  add(lang: string | null): boolean {
+    if (this.found.length > 0) return false;
+    this.found.push({ index: 0, lang, label: label(0, lang) });
     return true;
   }
 
@@ -386,7 +449,7 @@ export class CaptionText {
 
   /**
    * 出すもの (言語ごとに 0 か 1 枚)。字幕管理データ・送り直し・待ちだけのコマは何も出さない。
-   * **読めないコマは捨てて続ける。** 投げると、受けている側 (ライブの字幕 API) ごと止まる
+   * **読めないコマは捨てて続ける。** 例外を送出すると、受けている側 (ライブの字幕 API) ごと止まる
    */
   feed(frame: MkvFrame): CaptionShown[] {
     const out: CaptionShown[] = [];
@@ -433,7 +496,7 @@ export class CaptionText {
 }
 
 /**
- * 送る形式にする。**中身は JSON** (`CaptionPage`)、先頭の時刻は映像と同じ物差し (90kHz。stream.md#websocket-プロトコル)。
+ * 送る形式にする。**中身は JSON** (`CaptionPage`)、先頭の時刻は映像と同じ物差し (90 kHz。stream.md#websocket-プロトコル)。
  * 前の 1 枚を丸ごと置き換えるので、消すのも同じ種別 (`runs` が空) で送る
  */
 export function textFrame(shown: Pick<CaptionShown, "at" | "page">): {
@@ -479,14 +542,14 @@ export function appFrame(
 export const CAPTION_FEED_BACKLOG = 8 * 1024 * 1024;
 
 /**
- * 読まれないまま溜まったら、作る側に**待ってもらう**量 (バイト)。録画の字幕は録画を読む速さで
+ * 読まれないまま溜まったら、作る側を**待たせる**量 (バイト)。録画の字幕は録画を読む速さで
  * 作れるので、受け側が先読みを止めたら (アプリは持つ枚数に上限がある) 録画を読むのも止める
  * (`CaptionOut.backedUp`)。閉じる量より必ず小さくする
  */
 export const CAPTION_FEED_HOLD = 1024 * 1024;
 
 /**
- * 何も届かなくても送る間 (ms)。**字幕の無い時間は数分続く**ので、黙っていると前段
+ * 何も届かなくても送る間 (ms)。**字幕の無い時間は数分続く**ので、何も送らないと前段
  * (nginx の既定は 60 秒) や受け側の読みの時間切れに切られる
  */
 const CAPTION_PING_MS = 20_000;
@@ -497,7 +560,7 @@ const PING = new TextEncoder().encode(JSON.stringify({ type: "ping" }));
 export interface CaptionOut {
   /** WebSocket と同じ形式で 1 フレーム渡す。**字幕 (文字の配置) と、選べる字幕の通知だけ通す** */
   send(kind: number, pts: bigint, payload: Uint8Array): void;
-  /** 終わり (録画を読み切った・セッションが畳まれた) */
+  /** 終わり (録画を読み切った・セッションが終わった) */
   close(): void;
   /** 読まれずに溜まっているか (`CAPTION_FEED_HOLD`)。作る側が待てるなら待つ */
   backedUp(): boolean;
@@ -557,8 +620,15 @@ export function captionFeed(
         timer = setInterval(() => {
           if (!closed) push(CHANNEL.control, 0n, PING);
         }, CAPTION_PING_MS);
-        const leave = open(out);
-        // 作っている最中に閉じた (セッションがもう畳まれていた) ら、すぐ後始末する
+        let leave: () => void;
+        try {
+          leave = open(out);
+        } catch (error) {
+          // 起こせなかった (ffmpeg が無いなど)。間を埋める送信を止めてから伝える
+          finish();
+          throw error;
+        }
+        // 作っている最中に閉じた (セッションがもう終わっていた) ら、すぐ後始末する
         if (closed) leave();
         else detach = leave;
       },

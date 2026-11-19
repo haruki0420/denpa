@@ -41,6 +41,7 @@ const {
   startLink,
   subjectOf,
   unlink,
+  warnShape,
 } = await import("./niconico");
 const { orm } = await import("./db");
 const { niconicoLink } = await import("./schema");
@@ -227,7 +228,7 @@ describe("更新", () => {
     expect(refreshCalls.length).toBe(1);
   });
 
-  test("hub に届かないときは投げ、連携はそのまま (次にまた試す)", async () => {
+  test("hub に届かないときは例外を送出し、連携はそのまま (次にまた試す)", async () => {
     await linkExpiring();
     reply = () => json({ error: "temporarily_unavailable" }, 502);
     await expect(accessToken()).rejects.toThrow("HTTP 502");
@@ -287,7 +288,21 @@ describe("応答を読む", () => {
     expect(warned.length).toBe(1);
   });
 
-  test("アクセストークンが無ければ投げる", () => {
+  test("形式の警告は、同じものは 1 度だけ、違うものはそれぞれ 1 度ずつ出す", () => {
+    const original = console.warn;
+    const logged: string[] = [];
+    console.warn = (message: string) => logged.push(message);
+    try {
+      warnShape("一つ目");
+      warnShape("一つ目");
+      warnShape("二つ目");
+    } finally {
+      console.warn = original;
+    }
+    expect(logged).toEqual(["[niconico] 一つ目", "[niconico] 二つ目"]);
+  });
+
+  test("アクセストークンが無ければ例外を送出する", () => {
     expect(() => readTokens({ refresh_token: "r" })).toThrow();
     expect(() => readTokens(null)).toThrow();
   });

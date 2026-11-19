@@ -12,11 +12,15 @@ import {
   bxmlDescriptor,
   ddbSection,
   diiSection,
+  eventMessageDescriptor,
   multipartModule as multipart,
+  nptReferenceDescriptor,
   packetize,
   patSection,
+  pcrPacket,
   programMap,
   stream,
+  streamDescriptorSection,
   tdtPacket,
   withCrc,
 } from "./synth.js";
@@ -70,7 +74,7 @@ function carousel(
   ];
 }
 
-/** 食わせて、出てきた通知を全部集める */
+/** 渡して、出てきた通知を全部集める */
 function decode(...parts: Uint8Array[]): ResponseMessage[] {
   const out: ResponseMessage[] = [];
   const decoder = new BmlDecoder((message) => out.push(message));
@@ -83,13 +87,46 @@ const head = bmlHead();
 describe("parseBxmlInfo", () => {
   test("入口の ES は起動のしかたまで持っている", () => {
     const descriptor = bxmlDescriptor();
-    // 記述子の頭 (tag/length) と data_component_id を落とした残り
+    // 記述子の先頭 (tag/length) と data_component_id を落とした残り
     const info = parseBxmlInfo(Uint8Array.from(descriptor.slice(4)));
     expect(info.entryPointFlag).toBe(true);
     expect(info.entryPointInfo?.autoStartFlag).toBe(true);
     // 0011 = 960x540。データ放送でいちばんよく使われる
     expect(info.entryPointInfo?.documentResolution).toBe(3);
     expect(info.additionalAribCarouselInfo?.dataEventId).toBe(0x0f);
+  });
+
+  test("TR-B14 表 2-3 のビットの並びで読む (バージョンを書いた地上波の入口)", () => {
+    // 0x33: transmission_format 00・entry_point_flag 1・auto_start_flag 1・document_resolution 0011
+    // 0x20: use_xml 0・default_version_flag 0・independent_flag 1・style_for_TV_flag 0・reserved
+    // 0003 0000: bml_major_version 3・bml_minor_version 0 (default_version_flag が 0 のときだけある)
+    // 0x18: data_event_id 1・event_section_flag 1。0x40: ondemand_retrieval_flag 0・file_storable_flag 1
+    const info = parseBxmlInfo(
+      Uint8Array.from([0x33, 0x20, 0x00, 0x03, 0x00, 0x00, 0x18, 0x40]),
+    );
+    expect(info.transmissionFormat).toBe(0);
+    expect(info.entryPointInfo).toEqual({
+      autoStartFlag: true,
+      documentResolution: 3,
+      useXML: false,
+      defaultVersionFlag: false,
+      independentFlag: true,
+      styleForTVFlag: false,
+      bmlMajorVersion: 3,
+      bmlMinorVersion: 0,
+    });
+    expect(info.additionalAribCarouselInfo).toEqual({
+      dataEventId: 1,
+      eventSectionFlag: true,
+      ondemandRetrievalFlag: false,
+      fileStorableFlag: true,
+      startPriority: 0,
+    });
+    // auto_start_flag だけを落とす (0x23)
+    expect(
+      parseBxmlInfo(Uint8Array.from([0x23, 0xe0, 0x18, 0x40])).entryPointInfo
+        ?.autoStartFlag,
+    ).toBe(false);
   });
 
   test("入口でない ES は起動のしかたを持たない", () => {
@@ -103,7 +140,7 @@ describe("parseBxmlInfo", () => {
 });
 
 describe("moduleFiles", () => {
-  test("multipart を1ファイルずつにデコードする", () => {
+  test("multipart を 1 ファイルずつにデコードする", () => {
     const files = moduleFiles(
       multipart([
         ["/startup.bml", "text/X-arib-bml", "<bml/>"],
@@ -121,8 +158,8 @@ describe("moduleFiles", () => {
     expect(files[1]!.contentType.type).toBe("image");
   });
 
-  /** 中身が 1 つのモジュールは包まれていない。置き場所は BML 側が知っている */
-  test("multipart でなければ丸ごと1ファイル", () => {
+  /** 中身が 1 つのモジュールは包まれていない。置き場所は BML の文書側で決まる */
+  test("multipart でなければ丸ごと 1 ファイル", () => {
     const files = moduleFiles(new TextEncoder().encode("PNG"), "image/png");
     expect(files).toHaveLength(1);
     expect(files[0]!.contentLocation).toBeNull();
@@ -142,12 +179,12 @@ describe("inflate", () => {
     expect(inflate(squeezed, { type: 0 })).toEqual(original);
   });
 
-  /** 知らない縮め方は諦める。**壊れたものを配るより出さないほうがいい** */
-  test("知らない縮め方は null", () => {
+  /** 対応していない圧縮方式は諦める。**壊れたものを配るより出さないほうがいい** */
+  test("対応していない圧縮方式は null", () => {
     expect(inflate(new Uint8Array(4), { type: 9 })).toBeNull();
   });
 
-  test("伸ばせなければ null を返し、例外を投げない", () => {
+  test("展開できなければ null を返し、例外を投げない", () => {
     expect(inflate(Uint8Array.from([1, 2, 3, 4]), { type: 0 })).toBeNull();
   });
 
@@ -179,6 +216,28 @@ describe("BmlDecoder", () => {
     expect(
       pmt.components.find((component) => component.componentId === 0)?.bxmlInfo,
     ).toBeUndefined();
+  });
+
+  test("PMT の音声は、部品タグの無い ES も PMT の順に null で並べる (audios。components には出ない)", () => {
+    const pmt = programMap(SERVICE, VIDEO_PID, [
+      [0x02, VIDEO_PID, [0x52, 0x01, 0x00]],
+      // 部品タグの無い AAC が先に並ぶ
+      [0x0f, 0x111],
+      [0x0f, 0x112, [0x52, 0x01, 0x10]],
+      [0x0d, BML_PID, [0x52, 0x01, COMPONENT_TAG, ...bxmlDescriptor()]],
+    ]);
+    const out = decode(
+      packetize(0x0000, patSection([[SERVICE, PMT_PID]])),
+      packetize(PMT_PID, pmt),
+    );
+    const message = out.find((item) => item.type === "pmt");
+    if (message?.type !== "pmt") throw new Error("pmt が出ていない");
+    expect(message.audios).toEqual([null, 0x10]);
+    expect(
+      message.components
+        .filter((component) => component.streamType === 0x0f)
+        .map((component) => component.pid),
+    ).toEqual([0x112]);
   });
 
   /** 放送は同じ表を何度も送る。そのまま通すと受け側が画面を組み直し続ける */
@@ -425,7 +484,7 @@ describe("BmlDecoder", () => {
   });
 
   /** 壊れたセクションで例外を投げない。**映像の付け足しが映像を止めてはいけない** */
-  test("でたらめを食べても投げない", () => {
+  test("でたらめを渡しても例外を投げない", () => {
     const junk = packetize(
       BML_PID,
       withCrc([0x3b, 0x00, 0x00, 0xff, 0xff, 0xc1, 0x00, 0x00, 1, 2, 3]),
@@ -487,6 +546,132 @@ describe("BmlDecoder", () => {
   });
 });
 
+describe("イベントメッセージ (ストリーム記述子)", () => {
+  /** イベントメッセージだけを運ぶ ES。BML の符号化方式は付いていない */
+  const EVENT_PID = 0x0801;
+  const EVENT_TAG = 0x41;
+  const eventHead = () => [
+    packetize(0x0000, patSection([[SERVICE, PMT_PID]])),
+    packetize(
+      PMT_PID,
+      programMap(SERVICE, VIDEO_PID, [
+        [0x02, VIDEO_PID, [0x52, 0x01, 0x00]],
+        [0x0d, BML_PID, [0x52, 0x01, COMPONENT_TAG, ...bxmlDescriptor()]],
+        [0x0d, EVENT_PID, [0x52, 0x01, EVENT_TAG]],
+      ]),
+    ),
+  ];
+  const events = (out: ResponseMessage[]) =>
+    out.flatMap((message) =>
+      message.type === "esEventUpdated" ? [message] : [],
+    );
+
+  test("BML の符号化方式が付いていない DSM-CC の ES のものも、部品タグを付けて配る", () => {
+    const out = decode(
+      ...eventHead(),
+      packetize(
+        EVENT_PID,
+        streamDescriptorSection(
+          [eventMessageDescriptor({ id: 3, version: 2, data: [0x41] })],
+          1,
+        ),
+      ),
+    );
+    expect(events(out)).toEqual([
+      {
+        type: "esEventUpdated",
+        componentId: EVENT_TAG,
+        dataEventId: 1,
+        events: [
+          {
+            type: "immediateEvent",
+            eventMessageGroupId: 0,
+            timeMode: 0,
+            eventMessageType: 0,
+            eventMessageId: 0x0302,
+            privateDataByte: [0x41],
+          },
+        ],
+      },
+    ]);
+  });
+
+  test("イベントメッセージだけの ES では、カルーセルを組み立てない", () => {
+    const module = multipart([["/startup.bml", "text/X-arib-bml", "<bml/>"]]);
+    const out = decode(
+      ...eventHead(),
+      packetize(
+        EVENT_PID,
+        diiSection(DOWNLOAD_ID, 4066, {
+          moduleId: 1,
+          moduleSize: module.length,
+          moduleVersion: 1,
+          contentType: "multipart/mixed",
+        }),
+      ),
+    );
+    expect(out.some((message) => message.type === "moduleListUpdated")).toBe(
+      false,
+    );
+  });
+
+  test("時刻指定のものは、NPT がその時刻に達してから届いた回で、すぐ起きるものとして配る", () => {
+    // STC 10 秒で NPT 0。イベントは NPT 1 秒
+    const section = packetize(
+      EVENT_PID,
+      streamDescriptorSection([
+        nptReferenceDescriptor(10 * 90_000, 0),
+        eventMessageDescriptor({ id: 5, npt: 90_000 }),
+      ]),
+    );
+    const out = decode(
+      ...eventHead(),
+      pcrPacket(VIDEO_PID, 10.5),
+      section,
+      pcrPacket(VIDEO_PID, 11.5),
+      section,
+    );
+    expect(events(out).map((message) => message.events[1]?.type)).toEqual([
+      "nptEvent",
+      "immediateEvent",
+    ]);
+    expect(events(out)[1]?.events[1]).toMatchObject({
+      timeMode: 0,
+      eventMessageId: 0x0501,
+    });
+  });
+
+  test("STC が NPT 参照の時刻に達する前は、その参照を使わない", () => {
+    // 参照は STC 20 秒から。PCR は 10 秒なので、NPT はまだ分からない
+    const out = decode(
+      ...eventHead(),
+      pcrPacket(VIDEO_PID, 10),
+      packetize(
+        EVENT_PID,
+        streamDescriptorSection([
+          nptReferenceDescriptor(20 * 90_000, 0),
+          eventMessageDescriptor({ id: 5, npt: 0 }),
+        ]),
+      ),
+    );
+    expect(events(out)[0]?.events[1]?.type).toBe("nptEvent");
+  });
+
+  test("PCR を読む前は、時刻指定のまま配る", () => {
+    const out = decode(
+      ...eventHead(),
+      packetize(
+        EVENT_PID,
+        streamDescriptorSection([
+          nptReferenceDescriptor(0, 0),
+          eventMessageDescriptor({ id: 5, npt: 0 }),
+        ]),
+      ),
+    );
+    expect(events(out)[0]?.events[1]?.type).toBe("nptEvent");
+  });
+});
+
 describe("ModuleBuilder", () => {
   test("大きさ 0 のモジュールは初めから揃っている", () => {
     expect(new ModuleBuilder(1, 0, 4066).complete).toBe(true);
@@ -504,10 +689,10 @@ describe("ModuleBuilder", () => {
   });
 
   /** DII の言う大きさを先に確保しない。来たブロックの終わりまでで足りる */
-  test("入れ物は届いたブロックのぶんだけ広げる", () => {
+  test("バッファは届いたブロックのぶんだけ広げる", () => {
     const builder = new ModuleBuilder(1, MAX_MODULE_SIZE, 4066);
     expect(builder.add(0, new Uint8Array(4066).fill(7))).toBe(false);
-    // 確保した大きさは外から見えないので、private の入れ物を覗いて確かめる
+    // 確保した大きさは外から見えないので、private のバッファを覗いて確かめる
     expect((builder as unknown as { buffer: Uint8Array }).buffer.length).toBe(
       4066,
     );

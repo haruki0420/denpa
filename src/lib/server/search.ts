@@ -17,9 +17,9 @@ import type { ReservationState, Rule } from "../types";
 import { now, orm } from "./db";
 import { ANY_PAID, compile, haystack, matchesCompiled } from "./rules";
 import {
+  activeEncodeJobId,
   cardContracts,
   HELD_STATES,
-  latestRecordingId,
   latestReservationRecordingId,
   programs,
   recordings,
@@ -41,8 +41,8 @@ import { searchable } from "./title";
  * **SQL で減らしてから JS で当てる。** `GLOB` に掛けられる語 (`fold.globTerms`) で候補を減らし、
  * 当てるのは揃えた文字列。外字に寄せた字 (「吉」) のように SQL に掛けられない語も、JS のほうで当たる。
  *
- * **要るぶんだけ読む。** 当たった行を全部読んでから切っていた頃は、1 字の言葉 (番組表の何千行に当たる) でも
- * 打つたびに全部を読んでいた。いまは並べた順に少しずつ読み (`gather`)、上限に 1 つ足したぶんが揃ったら止める。
+ * **要るぶんだけ読む。** 当たった行を全部読んでから切ると、1 字の言葉 (番組表の何千行に当たる) でも
+ * 打つたびに全部を読む。並べた順に少しずつ読み (`gather`)、上限に 1 つ足したぶんが揃ったら止める。
  * 件数が要るとき (結果の画面) は `count(*)` で数える。SQL の絞り込みが JS の当て方と同じになる言葉 (`exact`)
  * なら行を読まずに数え、そうでない言葉 (外字に寄せた字を含む) だけ全部読んで数える
  */
@@ -165,6 +165,41 @@ function section<T>(
 const counted = (row: { n: number } | undefined): number => Number(row?.n ?? 0);
 
 /**
+ * **これからの放送の行** (番組表の番組と、立っている予約)。検索の結果と、予約の多い番組の節 (`ranking.ts`) で同じ形にする。
+ * 大きな欄 (音声・映像・拡張の説明) は読まない。`service_type`・`service_sid` (局の service_id) は画面に渡す前に外す (`withoutService`)
+ */
+export function programRows(where: SQL | undefined) {
+  const r = alias(reservations, "r");
+  const rec = alias(recordings, "rec");
+  const {
+    audios: _a,
+    video_type: _v,
+    video_resolution: _r,
+    extended: _e,
+    ...light
+  } = getTableColumns(programs);
+  return orm()
+    .select({
+      ...light,
+      service_name: services.name,
+      service_type: services.type,
+      service_sid: services.service_id,
+      has_logo: services.has_logo,
+      reservation_id: r.id,
+      // 番組表のマスと同じ物差し (`reservationState`)。r.state のままでは録画中も「予約済み」に見える
+      reservation_state: sql<ReservationState | null>`CASE WHEN ${r.id} IS NULL THEN NULL ELSE ${reservationState(r, rec)} END`,
+    })
+    .from(programs)
+    .innerJoin(services, eq(services.id, programs.service_id))
+    .leftJoin(
+      r,
+      and(eq(r.program_id, programs.id), inArray(r.state, HELD_STATES)),
+    )
+    .leftJoin(rec, eq(rec.id, latestReservationRecordingId(r.id)))
+    .where(where);
+}
+
+/**
  * **これからの放送** (番組表)。番組名と概要に当てる。判定はルールと同じもの
  * (`rules.matchesCompiled`)。終わっていない番組 (いま放送中も含む) だけ、始まる順。
  * 有料放送も出す。探しているのは人で、録るかどうかはその人が決める
@@ -191,15 +226,6 @@ export function searchPrograms(q: string, options: SearchOptions) {
     created_at: 0,
   };
   const compiled = compile(rule);
-  const r = alias(reservations, "r");
-  const rec = alias(recordings, "rec");
-  const {
-    audios: _a,
-    video_type: _v,
-    video_resolution: _r,
-    extended: _e,
-    ...light
-  } = getTableColumns(programs);
   const where = and(
     gt(programs.end_at, now()),
     narrow(words, [programs.name, programs.description]),
@@ -207,24 +233,7 @@ export function searchPrograms(q: string, options: SearchOptions) {
   const page = (offset: number, size: number) =>
     words.length === 0
       ? []
-      : orm()
-          .select({
-            ...light,
-            service_name: services.name,
-            service_type: services.type,
-            has_logo: services.has_logo,
-            reservation_id: r.id,
-            // 番組表のマスと同じ物差し (`reservationState`)。r.state のままでは録画中も「予約済み」に見える
-            reservation_state: sql<ReservationState | null>`CASE WHEN ${r.id} IS NULL THEN NULL ELSE ${reservationState(r, rec)} END`,
-          })
-          .from(programs)
-          .innerJoin(services, eq(services.id, programs.service_id))
-          .leftJoin(
-            r,
-            and(eq(r.program_id, programs.id), inArray(r.state, HELD_STATES)),
-          )
-          .leftJoin(rec, eq(rec.id, latestRecordingId(programs.id)))
-          .where(where)
+      : programRows(where)
           .orderBy(programs.start_at, programs.id)
           .limit(size)
           .offset(offset)
@@ -253,8 +262,15 @@ export function searchPrograms(q: string, options: SearchOptions) {
   );
   return {
     ...result,
-    rows: result.rows.map(({ service_type: _t, ...program }) => program),
+    rows: result.rows.map(withoutService),
   };
+}
+
+/** 画面に渡す前に、行から局の種別と service_id を外す (`programRows`) */
+export function withoutService<
+  T extends { service_type: unknown; service_sid: unknown },
+>({ service_type: _t, service_sid: _s, ...program }: T) {
+  return program;
 }
 
 /**
@@ -293,6 +309,8 @@ export function searchRecordings(q: string, options: SearchOptions) {
             library_path: recordings.library_path,
             watched_at: recordings.watched_at,
             has_logo: services.has_logo,
+            // エンコード中か。動いている間は削除を出さない (ホームの行と同じ。裏の ffmpeg が元の TS を読んでいる)
+            job_id: activeEncodeJobId(recordings.id),
           })
           .from(recordings)
           .leftJoin(services, eq(services.id, recordings.service_id))
@@ -337,7 +355,7 @@ export function searchReservations(q: string, options: SearchOptions) {
   const where = and(
     or(
       and(inArray(r.state, TO_RECORD_STATES), isNull(r.started_at)),
-      // 録り始めてから同じ回と分かってやめたもの (`recorder.skipDuplicate`) は録り始めた時刻が入っている
+      // 録画しない予約 (コピー禁止の番組と、録り始めてから同じ回と分かってやめた `recorder.skipDuplicate`。後者は録り始めた時刻が入っている)
       eq(r.state, "skipped"),
       eq(rec.state, "recording"),
     ),

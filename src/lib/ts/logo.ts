@@ -4,14 +4,14 @@
  * エージェントは TS を 1 バイトも読まないので、**番組表に出す局ロゴは denpa が
  * 自分で取得する**。番組表の取得などで開いた選局を共有して、ついでに読む (`server/logo.ts`)。
  *
- * 地上波は 2 つの表に分かれて流れてくる。
+ * 地上波 (ケーブルの地上波の再送信・自主放送も) は 2 つの表に分かれて流れてくる。
  *
  * - CDT (PID 0x0029) … ロゴの実体。PNG がそのまま入っている
  * - SDT (PID 0x0011) … どのサービスがどのロゴを使うか (logo_transmission_descriptor)
  *
  * 片方だけでは紐付かないので、両方見て初めて「この局のロゴ」になる。
  *
- * **衛星 (BS/CS) は CDT を使わない。** データカルーセル (DSM-CC) で送るので、
+ * **衛星 (BS/CS。ケーブルの再送信も) は CDT を使わない。** データカルーセル (DSM-CC) で送るので、
  * そちらは別仕立て (`logo-dsmcc.ts`)。どちらのロゴも `LogoCollector` が集める。
  */
 
@@ -159,7 +159,7 @@ interface CollectedLogo {
    *
    * 衛星はロゴ自身が「どのネットワークのどの局か」を持っているので、開いた
    * チャンネルのものとは限らない (1 つの中継に他ネットワークの局が入る)。
-   * 地上波は CDT にその情報が無いので、開いたチャンネルのものを使う。
+   * 地上波は開いたチャンネルの SDT で局と紐付けるので、開いたチャンネルのものを使う。
    */
   networkId: number;
   serviceIds: number[];
@@ -179,14 +179,16 @@ export class LogoCollector {
   /** 衛星ぶん。地上波の TS では何も出てこないので、開いていても害は無い */
   private readonly dsmcc: DsmccLogoCollector;
 
-  /** logo_id ごとの、いま持っている一番大きいロゴ */
+  /** logo_id ごとの、いま持っているロゴ (種類は `replacesLogo` の順に進める) */
   private readonly logos = new Map<number, LogoData>();
   /** service_id → logo_id */
   private readonly links = new Map<number, number>();
+  /** 受け取った CDT のセクションの数 (中身の有無を問わない) */
+  private cdtCount = 0;
 
   /**
-   * @param networkId 開いている物理チャンネルのネットワーク。地上波の CDT には
-   *   ネットワークが入っていないので、呼ぶ側が渡す
+   * @param networkId 開いている物理チャンネルのネットワーク。地上波のロゴはこのネットワークの局として返す
+   *   (CDT の original_network_id は読まない)
    * @param carousel 衛星のカルーセルの読みかけ (`CarouselProgress`)。渡せば、前に開いたときの続きから
    *   読む。渡さなければ一から
    */
@@ -215,9 +217,18 @@ export class LogoCollector {
     return this.dsmcc.counts;
   }
 
+  /**
+   * 受け取った CDT のセクションの数。ケーブルの TS で、開いていた間に CDT が 1 つも来なかったことを
+   * 見分けるのに使う (server/logo.ts の `markNoCdt`)
+   */
+  get cdtSections(): number {
+    return this.cdtCount;
+  }
+
   feed(chunk: Uint8Array): void {
     for (const packet of this.packets.feed(chunk)) {
       for (const section of this.cdt.feed(packet)) {
+        this.cdtCount++;
         const logo = parseCdt(section);
         if (logo !== null && logo.data.length > 0) this.remember(logo);
       }

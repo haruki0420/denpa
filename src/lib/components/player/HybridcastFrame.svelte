@@ -6,7 +6,7 @@
    * - アプリの HTML は中継で取り、差し込み (`#lib/hybridcast/shim.ts`) を入れて sandbox の iframe へ渡す
    * - iframe からのリクエスト (通信・記憶・映像の置き場・選局・字幕・閉じる) は postMessage で受ける。
    *   **送り元が自分の iframe かを必ず見る**
-   * - 通信は中継 (`/api/bml/proxy`・`/api/bml/post`) を通す。決まり (公開アドレスだけ・10 秒・4MB・
+   * - 通信は中継 (`/api/bml/proxy`・`/api/bml/post`) を通す。決まり (公開アドレスだけ・10 秒・4 MB・
    *   cookie も UA も受信機を見分けるものも送らない) はデータ放送と同じ
    * - 受信機の記憶はアプリの配信元 (オリジン) ごとに分けて覚える (`storageKey`)
    * - データ放送の Greg と NVRAM を写して渡し、書かれたら戻す (`broadcast`・`onwrite`。`#lib/hybridcast/compat.ts`)
@@ -37,8 +37,6 @@
   import { read, write } from "#lib/keep.js";
   import type { HybridcastLink } from "#lib/live.js";
 
-  import StageNote from "./StageNote.svelte";
-
   type Place = Extract<FrameMessage, { type: "video" }>["place"];
 
   interface Props {
@@ -61,6 +59,8 @@
     onvideo: (place: Place) => void;
     /** リモコン (AribKeyCode) を渡す関数 (bind で受け取る)。戻る・d は閉じる */
     press?: ((code: number, down: boolean) => void) | null;
+    /** 映像の上に出す読み込みの通知 (bind で受け取る。読み込めたら空)。出すのは `DataBroadcast` を使う画面 (舞台の通知の列) */
+    note?: string;
   }
 
   let {
@@ -73,11 +73,20 @@
     oncaptions,
     onvideo,
     press = $bindable(null),
+    note = $bindable(""),
   }: Props = $props();
 
   let box = $state<HTMLDivElement | null>(null);
   let frame = $state<HTMLIFrameElement | null>(null);
   let phase = $state<"loading" | "ready" | "failed">("loading");
+  $effect(() => {
+    note =
+      phase === "loading"
+        ? "Hybridcast を読み込み中…"
+        : phase === "failed"
+          ? "Hybridcast のアプリを読み込めませんでした。「戻る」で閉じます"
+          : "";
+  });
   let scale = $state("scale(1)");
   /** 渡す HTML (取れたら入る) と、iframe が受け取れるようになったか */
   let html: string | null = null;
@@ -188,8 +197,8 @@
     message: Extract<FrameMessage, { type: "fetch" }>,
   ): Promise<void> {
     /*
-     * **移る前のページの返りは捨てる。** 入れ物を読み直しても `contentWindow` は同じで、
-     * 新しいページは id を 1 から数え直すので、届けると別の通信の返りとして受け取られる
+     * **移る前のページのレスポンスは捨てる。** 入れ物を読み直しても `contentWindow` は同じで、
+     * 新しいページは id を 1 から数え直すので、届けると別の通信のレスポンスとして受け取られる
      */
     const mine = round;
     const reply = (
@@ -328,8 +337,11 @@
     return () => watcher.disconnect();
   });
 
+  /** リモコンの戻ると d。`AribKeyCode` (`bml/engine.ts` の `KEY`) と同じ値 (番号で書く理由は `Remote.svelte`) */
+  const BACK = 19;
+  const DATA_BUTTON = 20;
   press = (code, down) => {
-    if (code === 19 || code === 20) {
+    if (code === BACK || code === DATA_BUTTON) {
       if (down) onclose();
       return;
     }
@@ -367,15 +379,6 @@
     style:height="{VIEWPORT.height}px"
     style:transform={scale}
   ></iframe>
-  {#if phase !== "ready"}
-    <div class="corner">
-      <StageNote>
-        {phase === "loading"
-          ? "Hybridcast を読み込み中…"
-          : "Hybridcast のアプリを読み込めませんでした (戻るで閉じる)"}
-      </StageNote>
-    </div>
-  {/if}
 </div>
 
 <style>
@@ -394,12 +397,5 @@
     background: transparent;
     /* 中の文書と揃える (違うとブラウザが iframe を不透明に塗り、下の映像が隠れる) */
     color-scheme: light;
-  }
-  .corner {
-    position: absolute;
-    top: 0.75rem;
-    right: 0.75rem;
-    z-index: var(--dp-z-stage-controls);
-    display: flex;
   }
 </style>

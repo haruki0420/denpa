@@ -51,11 +51,10 @@
 
   /** 保存の結果 (`autosave`)。節ごとに見出しの横に出す */
   const encodingSave = new SaveState();
-  const cmSave = new SaveState();
   const viewingSave = new SaveState();
 
   /**
-   * 「確かめ直す」は今の値を見せている画面のまま送る。enhance の既定 (成功後に `form.reset()`) だと、
+   * 「再確認」は今の値を見せている画面のまま送る。enhance の既定 (成功後に `form.reset()`) だと、
    * 何も変えずに押しただけで欄が初期値に戻って見える
    */
   const keepValues: SubmitFunction = () => async (options) => {
@@ -66,9 +65,9 @@
 <Toasts {notices} source={form} />
 
 <!--
-    **節ごとにフォームを分け、変えたらその場で保存する** (`autosave`)。保存のボタンは置かない。
-    結果は変えた節の見出しの横に出る。値の渡し方は上の `recording`。
-    どの節もすべての録画に効く。ルールや予約ごとには変えられない
+  **節ごとにフォームを分け、変えたらその場で保存する** (`autosave`)。保存のボタンは置かない。
+  結果は変えた節の見出しの横に出る。値の渡し方は上の `recording`。
+  どの節もすべての録画に効く。ルールや予約ごとには変えられない
 -->
 <div id="encoding" data-part>
   <div class="sections readable">
@@ -85,15 +84,15 @@
         class="fields setting-rows"
       >
         <!--
-                    **コーデックごとに、エンコーダ (ソフトウェア・GPU) を横に置く。録画とライブで別々に選ぶ** (列の見出し「録画」「ライブ」)。
-                    選べるのは、そのコーデックを GPU でエンコードできるデバイスがあるときだけ。持ち方はデバイス × 方式 × コーデックのまま
-                    (`chooseHw`。録画は `hwAllow`、ライブは `liveHwAllow`)。追っかけと録画のその場の変換もライブの列を使う。チェックを外したコーデックもライブは使うので、
-                    選ぶ欄はチェックと関係なく出しておく。
-                    **H.265 は GPU でだけエンコードする**ので、行ごと GPU を確かめてから出し、エンコーダに
-                    「ソフトウェア」を置かない (録画で外すならチェックを外す)。ライブの列は「ソフトウェア」の代わりに「使わない」を置く。
-                    選ぶとライブで H.265 を出さない (`live.liveHevc`)。行を出したときだけ `codecsShown` を送る。
-                    確かめている最中や GPU が無いときに保存しても、H.265 のチェックは前のまま (saveEncoding)
-                -->
+          **コーデックごとに、エンコーダ (ソフトウェア・GPU) を横に置く。録画とライブで別々に選ぶ** (列の見出し「録画」「ライブ」)。
+          選べるのは、そのコーデックを GPU でエンコードできるデバイスがあるときだけ。持ち方はデバイス × 方式 × コーデックのまま
+          (`chooseHw`。録画は `hwAllow`、ライブは `liveHwAllow`)。追っかけと録画のその場の変換もライブの列を使う。チェックを外したコーデックもライブは使うので、
+          選ぶ欄はチェックと関係なく出しておく。
+          **H.265 は GPU でだけエンコードする**ので、行ごと GPU を確かめてから出し、エンコーダに
+          「ソフトウェア」を置かない (録画で外すならチェックを外す)。ライブの列は「ソフトウェア」の代わりに「使わない」を置く。
+          選ぶとライブで H.265 を出さない (`live.liveHevc`)。行を出したときだけ `codecsShown` を送る。
+          確かめている最中や GPU が無いときに保存しても、H.265 のチェックは前のまま (saveEncoding)
+        -->
         {#snippet codecRow(
           codec: (typeof CODECS)[number]["codec"],
           label: string,
@@ -203,25 +202,28 @@
           <!-- 列の右側 (欄の下) に置くため、要点の行は div で包む -->
           <div class="hw-line">
             {#await data.hw}
-              <span class="hint" data-testid="hw-status">GPU を確認中…</span>
+              <span class="hint" data-testid="hw-status"
+                >GPU を確かめています…</span
+              >
             {:then hw}
               <Lead>
                 <span data-testid="hw-status">{hw.message}</span>
                 <!--
-                                    一度だけの操作なので、その場で保存する欄とは別のフォーム (下の `probe-hw`) で送る。
-                                    `form` で指すので、この節の保存には混ざらない
-                                -->
+                  一度だけの操作なので、その場で保存する欄とは別のフォーム (下の `probe-hw`) で送る。
+                  `form` で指すので、この節の保存には混ざらない
+                -->
                 <button
                   type="submit"
                   form="probe-hw"
                   class="text-button"
-                  data-testid="hw-probe">確かめ直す</button
+                  data-testid="hw-probe">再確認</button
                 >
                 {#snippet more()}
                   <p>
                     使える GPU は Intel・AMD (VA-API)・NVIDIA (NVENC)・Rockchip
                     (MPP) です。Windows では Intel (QSV)・AMD (AMF)・NVIDIA
-                    (NVENC)、Mac では Apple (VideoToolbox)
+                    (NVENC)、Mac では Apple (VideoToolbox)、Android
+                    のアプリでは端末のハードウェアのエンコーダ (MediaCodec)
                     です。見つかれば自動で使います。
                   </p>
                   <p>
@@ -277,15 +279,18 @@
                   を飛ばし、ほかに選んだコーデックだけエンコードします。H.265
                   だけを選んでいたらエンコードは失敗し、元の TS が残ります。
                 </p>
-                <p>ライブと追っかけは H.265 では流しません。</p>
+                <p>
+                  ライブは、ライブのエンコーダが GPU のときだけ H.265
+                  でも流します。追っかけは H.265 では流しません。
+                </p>
               {/snippet}
             </Lead>
           {/if}
         </fieldset>
         <!--
-                    その場で変換する本数の上限 (`server/transcode.ts`)。既定が GPU の有無で変わるので、
-                    エンコーダのすぐ下に置く
-                -->
+          その場で変換する本数の上限 (`server/transcode.ts`)。既定が GPU の有無で変わるので、
+          エンコーダのすぐ下に置く
+        -->
         <div class="field">
           <span class="field-label">同時に変換する本数</span>
           <select
@@ -323,23 +328,8 @@
             hint="エンコードしたあとも元の TS を消しません。容量を多く使います"
           />
         </div>
-        <!--
-                    コマ数 (30/60) は本編映像のフィールドを比べて決める (`server/fps.ts`)。
-                    放送は素材が何でも 1080i/60 で来るので、ジャンルにも TS のヘッダにも
-                    本当のコマ数は入っていない
-                -->
-        <div class="field">
-          <span class="field-label">コマ数</span>
-          <CheckRow
-            name="fpsDetect"
-            checked={recording.fpsDetect}
-            title="コマ数を映像から決める"
-            hint="アニメなどは 30 コマにして、時間とサイズを半分にします"
-            detail="同じコマが続く映像 (アニメなど) を見分けて 30 コマでエンコードします。外すとすべて 60 コマになります。"
-          />
-        </div>
       </form>
-      <!-- 「確かめ直す」が送るフォーム。ボタンは映像コーデックの下にあり、`form="probe-hw"` で指す -->
+      <!-- 「再確認」が送るフォーム。ボタンは映像コーデックの下にあり、`form="probe-hw"` で指す -->
       <form
         id="probe-hw"
         method="POST"
@@ -352,8 +342,8 @@
 </div>
 
 <!--
-    視聴 (世帯の設定)。ライブの「自動」が家の中とみる名前 (`#lib/host.ts` の `indoorHost`) と、コーデックのメニューから
-    H.264 と H.265 を外すか (`#lib/live-choice.ts` の `HIDDEN_CODECS`)。名前の欄は離れたときに保存する (打っている途中では送らない)
+  視聴 (世帯の設定)。ライブの「自動」が家の中とみる名前 (`#lib/host.ts` の `indoorHost`)。
+  名前の欄は離れたときに保存する (打っている途中では送らない)
 -->
 <div id="viewing" data-part>
   <div class="sections readable">
@@ -388,63 +378,18 @@
                 家の中では放送のまま (MPEG-2)
                 で流すと、サーバがエンコードせずに済み、画質も放送のままです。外からは
                 AV1、再生できなければ H.265 (ライブのエンコーダが GPU
-                のとき)、それも駄目なら H.264 を選びます。
+                のとき)、それも再生できなければ H.264 を選びます。
               </p>
               <p>
                 家の中かは、開いたアドレスの名前で決めます。192.168.x.x
-                のような家の中の IP アドレス・localhost・.local・.home.arpa
+                のような家の中の IP
+                アドレス・localhost・.local・.lan・.home.arpa・.internal
                 で開いたときは、書かなくても家の中です。VPN のアドレス
                 (100.64.0.0/10) は家の中に入れません。
               </p>
             {/snippet}
           </Lead>
         </div>
-        <div class="field">
-          <span class="field-label">コーデック</span>
-          <CheckRow
-            name="hideH264Hevc"
-            checked={recording.hideH264Hevc}
-            title="コーデックの選択肢に H.264 と H.265 を出さない"
-            hint="AV1 を再生できない端末では、自動で H.265 か H.264 に切り替えます"
-            testid="hide-h264-hevc"
-          />
-        </div>
-      </form>
-    </section>
-  </div>
-</div>
-
-<div id="cm" data-part>
-  <div class="sections readable">
-    <section class="section">
-      <div class="section-head">
-        <h2>CM</h2>
-        <SaveNote status={cmSave} />
-      </div>
-      <form
-        method="POST"
-        action="?/saveCm"
-        use:autosave={cmSave}
-        class="fields setting-rows"
-      >
-        <label class="field">
-          <span class="field-label">CM の扱い</span>
-          <select name="cmCut" class="narrow" data-testid="global-cmcut">
-            <option value="chapter" selected={recording.cmCut === "chapter"}>
-              チャプターを打つだけ (安全)
-            </option>
-            <option value="cut" selected={recording.cmCut === "cut"}
-              >切り取る</option
-            >
-            <option value="off" selected={recording.cmCut === "off"}
-              >何もしない</option
-            >
-          </select>
-          <span class="hint"
-            >局ロゴの消えている所を CM
-            とみます。ロゴが使えなければ無音と長さで決めます</span
-          >
-        </label>
       </form>
     </section>
   </div>
@@ -452,10 +397,10 @@
 
 <style>
   /*
-     * **チェックと、その横のエンコーダ (録画・ライブ)。** 広い幅ではエンコーダを列にして縦に揃え、
-     * 上に列の見出し (「録画」「ライブ」) を置く (行ごとに字の長さが違うので、揃えないと欄が左右にずれる)。
-     * 狭い幅では見出しを出さず、チェックの文の下に「録画」「ライブ」を添えた欄を、文の頭に揃えて置く
-     */
+   * **チェックと、その横のエンコーダ (録画・ライブ)。** 広い幅ではエンコーダを列にして縦に揃え、
+   * 上に列の見出し (「録画」「ライブ」) を置く (行ごとに字の長さが違うので、揃えないと欄が左右にずれる)。
+   * 狭い幅では見出しを出さず、チェックの文の下に「録画」「ライブ」を添えた欄を、文の先頭に揃えて置く
+   */
   .codecs {
     display: flex;
     flex-direction: column;
@@ -465,7 +410,7 @@
     display: flex;
     flex-direction: column;
     align-items: flex-start;
-    gap: 0.25rem;
+    gap: var(--dp-space-1);
   }
   .codec-row > :not(.check) {
     margin-inline-start: 1.75rem;
@@ -493,7 +438,7 @@
     .codec-row {
       display: contents;
     }
-    /* チェックはいつも行の頭から (GPU が無くて欄が無い行が横に並ばないように) */
+    /* チェックはいつも行の先頭から (GPU が無くて欄が無い行が横に並ばないように) */
     .codec-row > .check {
       grid-column: 1;
     }
@@ -507,13 +452,12 @@
       display: none;
     }
   }
+  /* 高さと字の大きさは設定の欄の段のまま (`app.css` の `.sections`。16px より小さいと iPhone が押したときに拡大する) */
   .encoder {
     width: auto;
     max-width: 100%;
-    padding-block: 0.3rem;
-    font-size: var(--dp-text-sm);
   }
   .hw-line {
-    margin-top: 0.25rem;
+    margin-top: var(--dp-space-1);
   }
 </style>

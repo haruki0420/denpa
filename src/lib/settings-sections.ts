@@ -18,13 +18,13 @@ export const SETTINGS_GROUPS = [
     sections: [
       { slug: "encoding", label: "エンコード" },
       { slug: "viewing", label: "視聴" },
-      { slug: "cm", label: "CM" },
     ],
   },
   {
     slug: "reception",
     label: "受信",
     sections: [
+      { slug: "agents", label: "エージェント" },
       { slug: "tuners", label: "チューナー" },
       { slug: "channels", label: "チャンネル" },
       { slug: "broadcast", label: "データ放送" },
@@ -37,6 +37,7 @@ export const SETTINGS_GROUPS = [
       { slug: "notifications", label: "通知" },
       { slug: "tv", label: "テレビのアプリ" },
       { slug: "jikkyo", label: "実況" },
+      { slug: "ranking", label: "予約数ランキング" },
       { slug: "migrate", label: "EPGStation からの引き継ぎ" },
       { slug: "migrate-edcb", label: "EDCB からの引き継ぎ" },
       { slug: "transfer", label: "denpa を別の機械へ移す" },

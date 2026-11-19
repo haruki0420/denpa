@@ -6,7 +6,7 @@ import type { MediaSourceClass } from "./ts/media-source";
 import { AUDIO_TYPE } from "./ts/playback";
 
 /*
- * MSE を真似た最小の入れ物。中身の代わりに「この塊は何秒から何秒か」を Float64 2 つで運ぶ。
+ * MSE を真似た最小の入れ物。中身の代わりに「このチャンクは何秒から何秒か」を Float64 2 つで運ぶ。
  * 足す・捨てるは次の刻みで終わる (本物と同じく、その間は `updating`)
  */
 type Range = [number, number];
@@ -91,6 +91,16 @@ class FakeVideo extends EventTarget {
   src = "";
   error = null;
   disableRemotePlayback = false;
+  paused = true;
+  play(): Promise<void> {
+    this.paused = false;
+    this.dispatchEvent(new Event("play"));
+    return Promise.resolve();
+  }
+  pause(): void {
+    this.paused = true;
+    this.dispatchEvent(new Event("pause"));
+  }
   private at = 0;
   get currentTime(): number {
     return this.at;
@@ -101,7 +111,7 @@ class FakeVideo extends EventTarget {
   }
 }
 
-/** リクエストされた位置から、2 秒ずつの塊を `count` 個流す。`gate` がデコードできるまで 2 つ目から先を止められる */
+/** リクエストされた位置から、2 秒ずつのチャンクを `count` 個流す。`gate` がデコードできるまで 2 つ目から先を止められる */
 let requests: string[] = [];
 let gate: Promise<void> = Promise.resolve();
 const realFetch = globalThis.fetch;
@@ -170,7 +180,7 @@ function start(from = 100, codecs: string | null = H264) {
 }
 
 describe("その場で流すものの受け方 (remuxPlayer)", () => {
-  test("尺を先に言い、続きの位置からリクエストして、尻まで読んだら終わりを言う", async () => {
+  test("尺を先に渡し、続きの位置からリクエストして、末尾まで読んだら endOfStream を呼ぶ", async () => {
     const { video, media } = start(100);
     await settle();
     expect(media().duration).toBe(600);
@@ -178,6 +188,206 @@ describe("その場で流すものの受け方 (remuxPlayer)", () => {
     expect(requests).toEqual(["remux?from=100&audio=0"]);
     expect(media().buffer?.ranges).toEqual([[100, 106]]);
     expect(media().readyState).toBe("ended");
+  });
+
+  test("開く位置は、溜まってから currentTime に入れる。それまでの詰まりでは先頭からリクエストし直さない", async () => {
+    // 応答を止めておき、2 つ目のチャンクから先も止める
+    let respond!: () => void;
+    const held = new Promise<void>((resolve) => {
+      respond = resolve;
+    });
+    globalThis.fetch = (async (url: string, init?: RequestInit) => {
+      await held;
+      return fakeFetch(url, init);
+    }) as typeof fetch;
+    gate = new Promise(() => {});
+    const { video, media, player } = start(100);
+    await settle();
+    // まだ何も足していない。入れると macOS の WebKit が止まることがある
+    expect(video.currentTime).toBe(0);
+    video.dispatchEvent(new Event("waiting"));
+    respond();
+    await settle();
+    // 1 つ目のチャンク (100〜102 秒) を足したところで入れる
+    expect(video.currentTime).toBe(100);
+    expect(requests).toEqual(["remux?from=100&audio=0"]);
+    expect(media().buffer?.ranges).toEqual([[100, 102]]);
+    expect(player.origin()).toContain("100.0");
+    player.destroy();
+  });
+
+  test("開く位置を入れる前に飛ばれたら、飛んだ先を採る", async () => {
+    let respond!: () => void;
+    const held = new Promise<void>((resolve) => {
+      respond = resolve;
+    });
+    globalThis.fetch = (async (url: string, init?: RequestInit) => {
+      await held;
+      return fakeFetch(url, init);
+    }) as typeof fetch;
+    const { video, player } = start(100);
+    await settle();
+    video.currentTime = 300;
+    respond();
+    await settle();
+    expect(video.currentTime).toBe(300);
+    expect(requests).toContain("remux?from=300&audio=0");
+    player.destroy();
+  });
+
+  test("開く位置まで届かずに終わったら、届いた末尾に入れる", async () => {
+    // 応答は 100〜106 秒。尺の端より後ろの 110 秒を開いた
+    globalThis.fetch = (async (url: string, init?: RequestInit) =>
+      fakeFetch(url.replace("from=110", "from=100"), init)) as typeof fetch;
+    const { video, player } = start(110);
+    await settle();
+    expect(video.currentTime).toBe(106);
+    player.destroy();
+  });
+
+  test("開く位置を入れる前に流すようにリクエストされたら止めておき、入れてから流す (先頭から映さない)", async () => {
+    let respond!: () => void;
+    const held = new Promise<void>((resolve) => {
+      respond = resolve;
+    });
+    globalThis.fetch = (async (url: string, init?: RequestInit) => {
+      await held;
+      // 100 秒を開いたが、サーバは 96 秒の始められるキーフレームから送る
+      return fakeFetch(url.replace("from=100", "from=96"), init);
+    }) as typeof fetch;
+    const { video, player } = start(100);
+    // 観る画面は作ってすぐ play() を呼ぶ
+    void video.play();
+    await settle();
+    expect(video.paused).toBe(true);
+    respond();
+    await settle();
+    // 96〜98・98〜100 秒では入れず、100〜102 秒が届いてから入れて流す
+    expect(video.currentTime).toBe(100);
+    expect(video.paused).toBe(false);
+    player.destroy();
+  });
+
+  test("開く位置を入れる前は、ブラウザが送り込みを止めても (ManagedMediaSource) 開く位置まで読む", async () => {
+    class Stopped extends FakeMediaSource {
+      streaming = false;
+    }
+    globalThis.fetch = (async (url: string, init?: RequestInit) =>
+      fakeFetch(url.replace("from=100", "from=96"), init)) as typeof fetch;
+    const video = new FakeVideo();
+    const player = remuxPlayer(
+      video as unknown as HTMLVideoElement,
+      { Source: Stopped as unknown as MediaSourceClass, managed: true },
+      {
+        url: (at, audio) => `remux?from=${at}&audio=${audio}`,
+        codecs: H264,
+        duration: 600,
+        start: 100,
+        audio: "0",
+        state: () => {},
+      },
+    );
+    await settle();
+    expect(video.currentTime).toBe(100);
+    player.destroy();
+  });
+
+  test("止めている間に画面が一時停止したら、開く位置を入れても流さない", async () => {
+    let respond!: () => void;
+    const held = new Promise<void>((resolve) => {
+      respond = resolve;
+    });
+    globalThis.fetch = (async (url: string, init?: RequestInit) => {
+      await held;
+      return fakeFetch(url, init);
+    }) as typeof fetch;
+    const { video, player } = start(100);
+    void video.play();
+    await settle();
+    expect(video.paused).toBe(true);
+    video.pause();
+    respond();
+    await settle();
+    expect(video.currentTime).toBe(100);
+    expect(video.paused).toBe(true);
+    player.destroy();
+  });
+
+  test("止めている間に飛ばれたら、飛んだ先から流す", async () => {
+    let respond!: () => void;
+    const held = new Promise<void>((resolve) => {
+      respond = resolve;
+    });
+    globalThis.fetch = (async (url: string, init?: RequestInit) => {
+      await held;
+      return fakeFetch(url, init);
+    }) as typeof fetch;
+    const { video, player } = start(100);
+    void video.play();
+    await settle();
+    video.currentTime = 300;
+    expect(video.paused).toBe(false);
+    respond();
+    await settle();
+    expect(video.currentTime).toBe(300);
+    player.destroy();
+  });
+
+  test("止めている間に開く位置まで届かずに終わったら、届いた末尾に入れて流す", async () => {
+    globalThis.fetch = (async (url: string, init?: RequestInit) =>
+      fakeFetch(url.replace("from=110", "from=100"), init)) as typeof fetch;
+    const { video, player } = start(110);
+    void video.play();
+    await settle();
+    expect(video.currentTime).toBe(106);
+    expect(video.paused).toBe(false);
+    player.destroy();
+  });
+
+  test("流すようにリクエストされていなければ、入れたあとも止めたまま", async () => {
+    const { video, player } = start(100);
+    await settle();
+    expect(video.currentTime).toBe(100);
+    expect(video.paused).toBe(true);
+    player.destroy();
+  });
+
+  test("大きな塊は 1 MB ずつに分けて足す (空の SourceBuffer に入りきらない塊で止まらない)", async () => {
+    const big = new Uint8Array(2.5 * 1024 * 1024);
+    big.set(new Uint8Array(new Float64Array([100, 102]).buffer));
+    globalThis.fetch = (async (url: string) => {
+      requests.push(url);
+      return new Response(
+        new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.enqueue(big);
+            controller.close();
+          },
+        }),
+      );
+    }) as typeof fetch;
+    const sizes: number[] = [];
+    const original = FakeSourceBuffer.prototype.appendBuffer;
+    FakeSourceBuffer.prototype.appendBuffer = function (data: BufferSource) {
+      const bytes = data as Uint8Array;
+      sizes.push(bytes.byteLength);
+      // 2 つ目からは中身を見ない (範囲は先頭の 16 バイトにだけ書いてある)
+      if (sizes.length === 1) original.call(this, data);
+      else
+        original.call(
+          this,
+          new Uint8Array(new Float64Array([102, 102]).buffer),
+        );
+    };
+    try {
+      const { video, player } = start(100);
+      await settle();
+      expect(sizes).toEqual([1024 * 1024, 1024 * 1024, 0.5 * 1024 * 1024]);
+      expect(video.currentTime).toBe(100);
+      player.destroy();
+    } finally {
+      FakeSourceBuffer.prototype.appendBuffer = original;
+    }
   });
 
   test("溜まっている所・読んでいるストリームの少し先へはリクエストし直さない。遠くへ飛べばリクエストし直して前を捨てる", async () => {
@@ -202,7 +412,7 @@ describe("その場で流すものの受け方 (remuxPlayer)", () => {
     });
     const { video, media } = start(100);
     await settle();
-    // 1 つ目の塊だけ届いて、残りは止まっている
+    // 1 つ目のチャンクだけ届いて、残りは止まっている
     expect(media().buffer?.ranges).toEqual([[100, 102]]);
     video.currentTime = 300;
     open();
@@ -219,7 +429,7 @@ describe("その場で流すものの受け方 (remuxPlayer)", () => {
     expect(requests.at(-1)).toBe("remux?from=103&audio=1");
   });
 
-  test("畳んだら読むのをやめる", async () => {
+  test("閉じたら読むのをやめる", async () => {
     const { video, player } = start(100);
     await settle();
     player.destroy();
@@ -254,6 +464,8 @@ describe("混んでいて断られたとき", () => {
 
 describe("段の切り替え (switchTo)", () => {
   const AV1 = codecsFor("av1");
+  // 小文字の opus を受け取れる端末 (偽の MediaSource はどれも受け取る) には小文字で渡す (`live.ts` の `mseType`)
+  const AV1_MSE = AV1.replace(",Opus", ",opus");
   const rung = (at: number, audio: string) => `rung?from=${at}&audio=${audio}`;
 
   test("いまの位置を含む区間の末尾から新しい段をリクエストし、そこまでは残して続ける。型が違えば changeType で替える", async () => {
@@ -263,7 +475,7 @@ describe("段の切り替え (switchTo)", () => {
     expect(await player.switchTo(AV1, rung)).toBe("switched");
     await settle();
     expect(requests.at(-1)).toBe("rung?from=106&audio=0");
-    expect(media().buffer?.types).toEqual([AV1]);
+    expect(media().buffer?.types).toEqual([AV1_MSE]);
     // 残した 100〜106 に、106 から先が続く
     expect(media().buffer?.ranges).toEqual([[100, 112]]);
   });
@@ -294,7 +506,7 @@ describe("段の切り替え (switchTo)", () => {
     }) as typeof fetch;
     const { player, media, states } = start(100);
     await settle();
-    // 1 つ目の塊だけ届いて、残りは止まっている
+    // 1 つ目のチャンクだけ届いて、残りは止まっている
     expect(media().buffer?.ranges).toEqual([[100, 102]]);
     expect(await player.switchTo(AV1, rung)).toBe("busy");
     open();
@@ -328,7 +540,7 @@ describe("段の切り替え (switchTo)", () => {
     expect(media().buffer?.ranges).toEqual([[300, 306]]);
   });
 
-  test("型を言わずに始めたら、応答の X-Denpa-Codec から SourceBuffer の型を決める。段と送り出しの具合の id も受け取る", async () => {
+  test("型を渡さずに始めたら、応答の X-Denpa-Codec から SourceBuffer の型を決める。段と送り出しの具合の id も受け取る", async () => {
     headers = {
       "X-Denpa-Codec": "av1",
       "X-Denpa-Rung": "2",
@@ -336,7 +548,7 @@ describe("段の切り替え (switchTo)", () => {
     };
     const { media, heard } = start(100, null);
     await settle();
-    expect(media().created).toBe(AV1);
+    expect(media().created).toBe(AV1_MSE);
     expect(heard).toEqual([{ codec: "av1", rung: 2, pace: "p1" }]);
     expect(media().buffer?.ranges).toEqual([[100, 106]]);
   });

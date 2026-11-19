@@ -15,11 +15,19 @@
  */
 
 import { statSync } from "node:fs";
-import { open } from "node:fs/promises";
 
 import { PACKET } from "@danything/arib/psi";
+import { TlvStream } from "@danything/arib/tlv";
 
-import { readHead } from "#lib/ts/seek.js";
+import { lastMediaPts, readHead, sinceHead, tsHead } from "#lib/ts/seek.js";
+
+import type { Recording } from "../types";
+import { keepNewest } from "./expiring";
+import {
+  openRecording,
+  openRecordingSync,
+  type RecordingSyncHandle,
+} from "./recording-io";
 
 /** 1 回に読む量。小さすぎると read の回数だけ損する */
 const READ_SIZE = 256 * 1024;
@@ -40,7 +48,7 @@ const WAIT_READER = 50;
  */
 const PACE = 2;
 
-export interface ChasePlan {
+interface ChasePlan {
   /** 読み始めるバイト位置 (188 に揃えてある) */
   offset: number;
   /** 実際に始まる再生位置 (秒)。リクエストされた位置を録れている範囲に収めた後 */
@@ -56,7 +64,7 @@ export interface ChasePlan {
 /**
  * **番組が替わって作り直したところ** (`live.ts` の `Session.restart`)。録画ごとに覚える。
  *
- * 追っかけのエンコードも、ライブと同じく PMT の並びが変わったら畳んで `restart` を伝える。観ている側は
+ * 追っかけのエンコードも、ライブと同じく PMT の並びが変わったらセッションを終えて `restart` を伝える。観ている側は
  * 届いたぶんを観終えてから、観ていた位置をリクエストし直す (画面もテレビのアプリも)。ただ位置は秒で、
  * バイトへはレートで比例して当てるので、少し手前に当たると前の番組の PMT を読んでからまた変わり、
  * 作り直しを繰り返す。**近くをリクエストされたら、変わったところのバイトから読む** (`resumePlan`)
@@ -135,6 +143,35 @@ export function chasePlan(
   };
 }
 
+/** TLV のパケットの先頭を探す幅 (バイト)。パケットは長くて 65,539 バイトなので、次の先頭まで入る */
+const TLV_SEARCH = 256 * 1024;
+
+/**
+ * **4K の局の録画 (TLV) を途中から流すとき、`offset` から先で最初の TLV パケットの先頭** (HTTP の追っかけの `codec=raw`)。
+ * `chasePlan` は TS の 188 バイトで切るので、パケットの長さが決まっていない TLV ではパケットの途中に当たる。受け取る側は
+ * 先頭をパケットの先頭として読む (ライブの 4K の局の `codec=raw` と同じ)。先頭の探し方は `TlvStream` (次のパケットの先頭も合う所)。
+ * 読めない・見つからなければ `offset` のまま
+ */
+export function tlvStart(path: string, offset: number): number {
+  if (offset === 0) return 0;
+  let file: RecordingSyncHandle;
+  try {
+    file = openRecordingSync(path);
+  } catch {
+    return offset;
+  }
+  try {
+    const buffer = new Uint8Array(TLV_SEARCH);
+    const read = file.read(buffer, 0, buffer.length, offset);
+    const stream = new TlvStream();
+    // 最初のパケットが出た時点で、それより前に読み飛ばした長さが先頭までのずれ
+    const first = stream.feed(buffer.subarray(0, read)).next();
+    return first.done === true ? offset : offset + stream.skipped;
+  } finally {
+    file.close();
+  }
+}
+
 /**
  * 伸びているファイルを読み続けるストリーム。
  *
@@ -145,9 +182,9 @@ export function chasePlan(
  * 先へ進まない間は、こちらも次を読まずに待つ。待たずに読むと、倍速で送り込むぶんが
  * どこかに溜まり続ける。
  *
- * @param done もう書き足されないか (録画が終わったか)。EOF のたびに訊く
+ * @param done もう書き足されないか (録画が終わったか)。EOF のたびに呼ぶ
  * @param hold ほかの理由で止めておくか (HTTP の追っかけで、エンコードした先が読まれていないとき。
- *   WebSocket の元の TS の追っかけで、止めてと言われたとき・詰まったとき。`live.ts` の `chaseStream`・`openChase`)。
+ *   WebSocket の元の TS の追っかけで、画面から止める指示を受けたとき・詰まったとき。`live.ts` の `chaseStream`・`openChase`)。
  *   省けば止めない
  * @param burst 倍速の縛りを掛けずに読む先頭のぶん (バイト)。アプリ向けの字幕 API が、リクエストされた位置より
  *   手前から読み始めて観ている位置を追い越すのに使う (`live.ts` の `recordingCaptions`)。省けば 0
@@ -166,7 +203,7 @@ export function followFile(
       let started = Date.now();
       let sent = 0;
       let position = offset;
-      const handle = await open(path, "r");
+      const handle = await openRecording(path);
       try {
         const buffer = new Uint8Array(READ_SIZE);
         while (!cancelled) {
@@ -211,23 +248,100 @@ export function followFile(
   });
 }
 
-/** いまのファイルの大きさ。無ければ null (消された・まだ書き始めていない) */
-export function fileSize(path: string): number | null {
-  try {
-    return statSync(path).size;
-  } catch {
-    return null;
-  }
-}
-
-/** 読んだ先頭の控え。録画中も先頭は変わらないので、読めたものはパスごとに覚える (追っかけはシークのたびに聞く) */
+/** 読んだ先頭の控え。録画中も先頭は変わらないので、読めたものはパスごとに覚える (追っかけはシークのたびに読む) */
 const heads = new Map<string, number>();
-/** 覚えておく数。録画中の録画は同時にいくつもない */
+/** 控えごとに覚えておく数 (`heads`・`unreadable`・`spans`)。追っかけと字幕で同時に読む録画はいくつもない */
 const HEADS_MOST = 32;
 /** 読めなかったパスと、次に読み直してよい時刻 (ms)。録り始めの数秒は先頭が揃わないので、シークのたびに 4MB 読み直さない */
 const unreadable = new Map<string, number>();
 /** 読めなかったあと、読み直すまで控える長さ (ms) */
 const HEAD_RETRY = 5_000;
+
+/** 尺を測るのに先頭と末尾から読む量。映像と音声の最初の PES、最後の映像 (映像の無い録画は音声) の PES が入る長さ (`playback.ts` の `probeTs` と同じ) */
+const SPAN_BYTES = 4 * 1024 * 1024;
+
+/** 測った尺の控え。同じファイル (大きさ・更新時刻) なら読み直さない */
+const spans = new Map<string, { key: string; seconds: number | null }>();
+
+/** ファイルの `offset` から `length` バイトを同期で読む */
+function readRange(
+  file: RecordingSyncHandle,
+  offset: number,
+  length: number,
+): Uint8Array {
+  const buffer = new Uint8Array(length);
+  return buffer.subarray(0, file.read(buffer, 0, length, offset));
+}
+
+/**
+ * **録り終えた元の TS の尺 (秒)。** 先頭の PTS (`tsHead`) から最後の映像の PES まで (映像の無い録画は最後の音声の PES まで。`lastMediaPts`)。観る画面の物差し
+ * (`playback.ts` の `probeTs`) と同じ測り方。読めない・PES が見つからなければ null。
+ *
+ * 追っかけと録画の字幕は、呼ばれたその場で読み始める位置を決めるので同期で読む (先頭と末尾の 4MB ずつ)。
+ * 測ったものは控える (シークのたびに読み直さない)
+ */
+export function finishedTsSec(path: string): number | null {
+  let size = 0;
+  let key = "";
+  try {
+    const stat = statSync(path);
+    size = stat.size;
+    key = `${stat.size}:${stat.mtimeMs}`;
+  } catch {
+    return null;
+  }
+  const held = spans.get(path);
+  if (held?.key === key) return held.seconds;
+  let seconds: number | null = null;
+  try {
+    const file = openRecordingSync(path);
+    try {
+      const head = tsHead(readRange(file, 0, SPAN_BYTES));
+      const last =
+        head === null
+          ? null
+          : lastMediaPts(
+              readRange(file, Math.max(0, size - SPAN_BYTES), SPAN_BYTES),
+            );
+      const span = head === null || last === null ? 0 : sinceHead(last, head);
+      seconds = span > 0 ? span : null;
+    } finally {
+      file.close();
+    }
+  } catch {
+    seconds = null;
+  }
+  keepNewest(spans, path, { key, seconds }, HEADS_MOST);
+  return seconds;
+}
+
+/**
+ * **元の TS に録れている長さ (秒)。** 追っかけと録画の字幕が、秒をバイトに比例で当てる物差し (`chasePlan`)。
+ *
+ * - 録っている最中は、録り始めてからの経過
+ * - 録り終えたものは、元の TS を測った尺 (`finishedTsSec`)。**`duration_ms` は使わない。** エンコードし終えると
+ *   出来上がりの長さ (先頭を捨てたあと) に書き換わる (`encoder.ts`) ので TS より短く、位置が先へずれていた
+ * - 測れなければ、エンコードしていない録画 (`encode_skip` が NULL) は `duration_ms` (録れた長さ)、それも無ければ番組表の尺
+ */
+export function recordedSec(
+  rec: Pick<
+    Recording,
+    | "finished_at"
+    | "created_at"
+    | "duration_ms"
+    | "encode_skip"
+    | "start_at"
+    | "end_at"
+  >,
+  path: string,
+  now = Date.now(),
+): number {
+  if (rec.finished_at === null) return (now - rec.created_at) / 1000;
+  const measured = finishedTsSec(path);
+  if (measured !== null) return measured;
+  const recorded = rec.encode_skip === null ? rec.duration_ms : null;
+  return (recorded ?? rec.end_at - rec.start_at) / 1000;
+}
 
 /**
  * **元の TS の先頭の PTS** (90kHz。`ts/seek.ts` の `readHead`)。追っかけを元の TS で送るとき、画面が再生位置を
@@ -243,7 +357,7 @@ export async function tsFileHead(
   if ((unreadable.get(path) ?? 0) > now) return null;
   let head: number | null = null;
   try {
-    const handle = await open(path, "r");
+    const handle = await openRecording(path);
     try {
       head = await readHead(async (offset, length) => {
         const buffer = new Uint8Array(length);
@@ -257,14 +371,11 @@ export async function tsFileHead(
     head = null;
   }
   if (head === null) {
-    if (unreadable.size >= HEADS_MOST)
-      unreadable.delete(unreadable.keys().next().value!);
-    unreadable.set(path, now + HEAD_RETRY);
+    keepNewest(unreadable, path, now + HEAD_RETRY, HEADS_MOST);
     return null;
   }
   unreadable.delete(path);
-  if (heads.size >= HEADS_MOST) heads.delete(heads.keys().next().value!);
-  heads.set(path, head);
+  keepNewest(heads, path, head, HEADS_MOST);
   return head;
 }
 
@@ -275,7 +386,7 @@ export async function tsFileHead(
 export function chaseReadHeld(o: {
   /** 画面が止めてほしいと送ってきた (`{ type: 'hold', on: true }`) */
   asked: boolean;
-  /** 送り先の溜まりが捨て始める量を超えている (`ws.ts` の `Connection.congested`。回線が倍速に追いつかない) */
+  /** 送り先のバッファが捨て始める量を超えている (`ws.ts` の `Connection.congested`。回線が倍速に追いつかない) */
   congested: boolean;
   /** 呼ぶ側のほかの理由 (HTTP の追っかけで読まれていない、など) */
   outside: boolean;

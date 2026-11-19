@@ -51,7 +51,7 @@ export function shotName(title: string, at: Date, extension = "png"): string {
       .replace(/\s+/g, " ")
       .trim()
       .slice(0, NAME_MOST)
-      // 末尾の点と空白は Windows が黙って落とす
+      // 末尾の点と空白は Windows が保存するときに削る
       .replace(/[. ]+$/, "") || "denpa";
   const day = `${at.getFullYear()}${pad(at.getMonth() + 1)}${pad(at.getDate())}`;
   const time = `${pad(at.getHours())}${pad(at.getMinutes())}${pad(at.getSeconds())}`;
@@ -59,10 +59,10 @@ export function shotName(title: string, at: Date, extension = "png"): string {
 }
 
 /**
- * **指の端末では共有に渡す。** スマホで `<a download>` に落とすと「ファイル」の奥に
+ * **指の端末では共有に渡す。** スマホで `<a download>` からダウンロードすると「ファイル」の奥に
  * 入るだけで、写真には並ばない (iOS)。共有シートなら「画像を保存」で写真へ、そのまま
  * LINE などへも送れる。PC にも共有の API を持つブラウザがある (Chrome・Safari) が、
- * あちらは落とすほうが早いので使わない
+ * あちらはダウンロードするほうが早いので使わない
  */
 function prefersShare(file: File): boolean {
   if (
@@ -78,7 +78,7 @@ function prefersShare(file: File): boolean {
   }
 }
 
-/** 落とす。**URL はすぐには捨てない**。Safari と Firefox は押した直後に捨てると落とし損ねる */
+/** ダウンロードする。**URL はすぐには捨てない**。Safari と Firefox は押した直後に捨てるとダウンロードし損ねる */
 function download(blob: Blob, name: string): void {
   const url = URL.createObjectURL(blob);
   const link = document.createElement("a");
@@ -146,7 +146,7 @@ export function captionLayer(
 }
 
 /** 画面の上の箱 (CSS px) */
-export interface Box {
+interface Box {
   left: number;
   top: number;
   width: number;
@@ -154,17 +154,17 @@ export interface Box {
 }
 
 /** 画面に出ている実況のコメント 1 件 */
-export interface ShownComment {
+interface ShownComment {
   text: string;
   /** いま見えている箱 (CSS px。`getBoundingClientRect`。流れている途中の位置) */
   box: Box;
-  /** 字の書体 (canvas の `font` の形) と色 */
+  /** 字の書体 (canvas の `font` の形式) と色 */
   font: string;
   color: string;
 }
 
 /** 重ねに描くコメント 1 件。位置は映像の枠の左上からの CSS px */
-export interface CommentSpot {
+interface CommentSpot {
   text: string;
   font: string;
   color: string;
@@ -205,7 +205,7 @@ const COMMENT_OPACITY = 0.5;
 const OUTLINE = 1;
 
 /** 押した瞬間のコメントの枠 (CSS px) と、そこに掛かっているコメント */
-export interface CommentScene {
+interface CommentScene {
   area: Box;
   spots: CommentSpot[];
 }
@@ -474,9 +474,9 @@ export function clipParams(
 
 /**
  * **端末に保存する** (サーバに置けなかったとき)。PNG にして `keepOnDevice` に渡す。
- * 共有シートを閉じられたら何も残らないので、そう言う。
+ * 共有シートを閉じられたら何も残らないので、その旨を通知に出す。
  *
- * 返り値は通知 (トースト)。サーバに置けなかったことは必ず言う (黙ると、一覧に無い理由が分からない)
+ * 返り値は通知 (トースト)。サーバに置けなかったことは必ず通知する (出さないと、一覧に無い理由が分からない)
  */
 export async function saveOnDevice(
   canvas: HTMLCanvasElement,
@@ -497,8 +497,8 @@ export async function saveOnDevice(
 }
 
 /**
- * 画像を端末に渡す。**指の端末は共有シート** (写真へ保存・そのまま送る)、PC はファイルに落とす。
- * 共有を断られたら (押した直後でなくなった・共有できない形式) 落とすほうに倒す。閉じられたら `canceled`
+ * 画像を端末に渡す。**指の端末は共有シート** (写真へ保存・そのまま送る)、PC はダウンロードする。
+ * 共有を断られたら (押した直後でなくなった・共有できない形式) ダウンロードに切り替える。閉じられたら `canceled`
  */
 export async function keepOnDevice(
   blob: Blob,
@@ -513,7 +513,7 @@ export async function keepOnDevice(
       // 閉じた (やめた) なら何も残っていない
       if (error instanceof DOMException && error.name === "AbortError")
         return "canceled";
-      // それ以外は落とす
+      // それ以外はダウンロードする
     }
   }
   download(blob, name);

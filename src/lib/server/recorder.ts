@@ -1,45 +1,60 @@
 import { once } from "node:events";
-import { createWriteStream, mkdirSync } from "node:fs";
-import { dirname } from "node:path";
+import { mkdirSync } from "node:fs";
+import { dirname, extname } from "node:path";
 
 import { type EitEvent, EpgReader } from "@danything/arib/eit";
+import { MmtEpgReader } from "@danything/arib/mh-eit";
+import { MmtServiceFilter } from "@danything/arib/mmt-service-filter";
 import { ServiceFilter } from "@danything/arib/service-filter";
 import { and, eq, sql } from "drizzle-orm";
 
+import { RECORDED_EXT } from "#lib/source.js";
 import { TsHead } from "#lib/ts/ts-head.js";
 
-import type { Recording, Reservation } from "../types";
-import { fileSize } from "./chase";
+import {
+  isSatellite,
+  type Recording,
+  type Reservation,
+  type Transport,
+} from "../types";
+import { NO_CHANNEL, placesOfService } from "./agent-channels";
+import type { Place } from "./agent-order";
 import { config } from "./config";
 import { now, orm } from "./db";
-import { enqueue } from "./encoder";
+import { aribServiceId, encodeInput, enqueue } from "./encoder";
 import { savePrograms } from "./epg";
 import { emit } from "./events";
-import { moveFile, removeIfExists } from "./fsx";
+import { fileSize, moveFile, removeIfExists } from "./fsx";
 import { libraryPath, recordedPath } from "./library";
 import { refreshLineup } from "./lineup-follow";
-import { writeThumbnail } from "./metadata";
+import { sidecarPaths, writeThumbnail } from "./metadata";
 import { PfEvent } from "./pf-event";
+import { saveRecordedBml } from "./recorded-bml";
+import { recordedMedia } from "./recorded-broadcast";
 import { fillTsHead, recordingSummary } from "./recording";
+import { appendRecording } from "./recording-io";
 import { duplicateAtStart } from "./rules";
 import { programs, recordings, reservations, rules, services } from "./schema";
+import { settings } from "./settings";
 import { chunks } from "./stream";
 import { parseTitle } from "./title";
 import {
-  openChannelStream,
+  expectTransport,
+  openChannel,
   recordingUse,
   type StreamUse,
+  TransportChangedError,
   TuneError,
 } from "./tuner";
 import { notify } from "./webhook";
 
 /**
  * 録り始めてから PMT でコピー禁止と分かり、1 バイトも保存しなかった録画の理由
- * (番組表が古い・無かったとき。ふだんは予約の時点で止まる: `format.COPY_NEVER_REASON`)
+ * (番組表が古い・無かったとき。ふだんは予約の時点で止まる。`format.COPY_NEVER_REASON`)
  */
 const COPY_NEVER_RECORDING = "コピー禁止の番組なので録画しませんでした";
 
-/** 録画中のストリームを止めるための手段。プロセス内にしか無いので再起動で失われる (起動時に回収する: recoverOrphanedRecordings) */
+/** 録画中のストリームを止めるための手段。プロセス内にしか無いので再起動で失われる (起動時に回収する。`recoverOrphanedRecordings`) */
 const active = new Map<number, AbortController>();
 
 export function activeRecordingIds(): number[] {
@@ -145,13 +160,19 @@ function createRecording(reservation: Reservation): Recording {
     })
     .returning({ id: recordings.id })
     .get()!;
-  // ファイル名は録画 ID を含めるため、行を作ってからでないと決まらない
-  const path = recordedPath({
-    id,
-    series: parsed.series,
-    subtitle: parsed.subtitle,
-    start_at: reservation.start_at,
-  });
+  /*
+   * ファイル名は録画 ID を含めるため、行を作ってからでないと決まらない。
+   * 拡張子は伝送の形式で決まる (`RECORDED_EXT`。4K の局は 1 局に絞った TLV を `.mmts` で置く)
+   */
+  const path = recordedPath(
+    {
+      id,
+      series: parsed.series,
+      subtitle: parsed.subtitle,
+      start_at: reservation.start_at,
+    },
+    RECORDED_EXT[service?.transport ?? "ts"],
+  );
   orm()
     .update(recordings)
     .set({ ts_path: path })
@@ -307,21 +328,22 @@ function skipDuplicate(recording: Recording, reason: string): void {
       .run();
   }
   console.log(
-    `[rec] 録画をやめました: ${recording.name} (${recording.service_name})。${reason}`,
+    `[recorder] 録画をやめました: ${recording.name} (${recording.service_name})。${reason}`,
   );
   emit("recordings");
   emit("reservations");
 }
 
+/** 選局を試す回数と、次に試すまでの間 (ms) */
+const OPEN_RETRIES = 5;
+const OPEN_RETRY_WAIT = 2000;
+
 /**
  * チューナーが空くのを少し待つ。
  *
  * 使えない理由は「本当に足りない」だけとは限らない。番組の先頭を数秒落としてでも
- * 録れたほうがいいので、すぐには諦めない。
+ * 録れたほうがいいので、すぐには打ち切らない。
  */
-const OPEN_RETRIES = 5;
-const OPEN_RETRY_WAIT = 2000;
-
 async function openWithRetry(
   open: (signal: AbortSignal) => Promise<ReadableStream<Uint8Array>>,
   signal: AbortSignal,
@@ -332,6 +354,8 @@ async function openWithRetry(
     try {
       return await open(signal);
     } catch (error) {
+      // 形式が変わったのは、掛け直しても変わらない (スキャンし直すまで)
+      if (error instanceof TransportChangedError) throw error;
       last = error;
       if (attempt < OPEN_RETRIES - 1) {
         await Bun.sleep(OPEN_RETRY_WAIT);
@@ -374,7 +398,9 @@ function extendIfLonger(recording: Recording, endAt: number): void {
       .run();
   }
   const minutes = Math.round((endAt - current.end_at) / 60000);
-  console.log(`[rec] 放送が延びました: ${recording.name} (+${minutes} 分)`);
+  console.log(
+    `[recorder] 放送が延びました: ${recording.name} (+${minutes} 分)`,
+  );
   emit("recordings");
   emit("reservations");
 }
@@ -429,24 +455,27 @@ async function pump(
     active.delete(recording.id);
     return;
   }
-
   /*
    * **物理チャンネルを丸ごと開いて、こちらで局を選り分ける。**
    *
    * エージェントは中身を読まないので、1 本の TS にその中継に入っている局が
    * 全部流れてくる。そのまま保存すると 1 つの録画に複数の番組が入る
    * (実機の TOKYO MX は MX1 と MX2 が同居している)。
+   * 4K の局 (TLV) も同じで、1 局に絞った TLV のまま置く (`MmtServiceFilter`。画質を落とさない。docs/library.md)
    */
-  const filter = new ServiceFilter(service.service_id);
+  const filter = recordFilter(service.transport, service.service_id);
   /*
    * 同じ TS から番組表も読む。**延長の追従はここから。**
-   * 番組情報を誰かに聞き直す必要は無い
+   * 番組情報を誰かに聞き直す必要は無い。4K の局は MH-EIT を読む (`MmtEpgReader`)
    */
-  const epg = new EpgReader();
+  const epg =
+    service.transport === "tlv" ? new MmtEpgReader() : new EpgReader();
   const eventId =
     recording.program_id === null ? null : recording.program_id % 100000;
 
   let written = 0;
+  /** 選局の答えの形式が控えと違った (`expectTransport`)。そこで録画を終える */
+  let transportChanged: TransportChangedError | null = null;
   /** いまコピー禁止で保存を止めているか (変わり目でだけログに出す) */
   let copyNever = false;
   /**
@@ -461,10 +490,13 @@ async function pump(
   /*
    * **書いた TS の先頭の放送時刻を測る** (`recordings.ts_head`。実況のコメントを録画中の追っかけでも合わせるため)。
    * 測れるのはファイルの先頭から書くときだけ。再起動をまたいで続きを足すときは、もう先頭が過ぎている
-   * (そのときはエンコードのときに測る。`recorded-bml.ts`)。測れたら行に書いて、あとは渡さない
+   * (そのときはエンコードのときに測る。`recorded-bml.ts`)。測れたら行に書いて、あとは渡さない。
+   * 4K の局 (TLV) は PCR を持たないので測らない (実況のコメントは録り始める予定の時刻で合わせる。`recording.tsHeadOf`)
    */
   let measure =
-    recording.ts_head === null && (fileSize(path) ?? 0) === 0
+    service.transport === "ts" &&
+    recording.ts_head === null &&
+    (fileSize(path) ?? 0) === 0
       ? new TsHead()
       : null;
   /*
@@ -474,7 +506,7 @@ async function pump(
    */
   let pf =
     eventId !== null && (fileSize(path) ?? 0) === 0
-      ? new PfEvent(service.service_id, eventId)
+      ? new PfEvent(service.service_id, eventId, service.transport)
       : null;
   // p/f を読まないものは、同じ回を確かめ直せないので録ると決まっている。開始はすぐ知らせる
   if (pf === null) announceOnce();
@@ -487,9 +519,8 @@ async function pump(
   const use = recordingUse(recording.id);
 
   try {
-    // 追記で開く。再起動をまたいで録画を再開したときに、それまでの分を消さないため
-    // (MPEG-TS は 188 バイトのパケットの並びなので、そのまま繋げても読める)
-    const sink = createWriteStream(path, { flags: "a" });
+    // 追記で開く (再起動をまたいで再開したときに、それまでの分を消さない。`appendRecording`)
+    const sink = appendRecording(path);
     // 実際に受け取っていた時間を測る。番組表の尺は予定でしかなく、
     // 途中で止めたときやチューナーを取るのに手間取ったときは実物と合わない。
     // 再開したときは足していく (ファイルも追記なので合計が実物になる)
@@ -501,13 +532,14 @@ async function pump(
       /*
        * **選局は自分から切るまで終わらない。** 向こうから終わったなら (EOF でも
        * 例外でも) チューナーを取り上げられたか切れたかで、終了時刻 (自分の abort) までは取り直す。
-       * EOF を正常終了と読んでいた頃は、チューナーを取り上げられた録画が末尾の欠けたまま「録れた」に
-       * なり (HTTP 越しでは失敗も正常終了に見える。`agent/conformance.test.ts`)、
-       * 例外で抜けていた頃はエージェントの Pod を入れ替えただけで番組が丸ごと
-       * 失敗した (実機)
+       * EOF を正常終了と読むと、チューナーを取り上げられた録画が末尾の欠けたまま「録れた」に
+       * なる (HTTP 越しでは失敗も正常終了に見える。`agent/conformance.test.ts`)。
+       * 例外で抜けると、エージェントの Pod を入れ替えただけで番組が丸ごと失敗する (実機)
        */
       // 引き継ぎは最初に使うときだけ。取り直すころには、止めた録画はもう離れている
       let handoff = after;
+      /** いま録っているエージェント (`recordings.agent_id`) */
+      let agentId: number | null = null;
       while (!controller.signal.aborted) {
         /** 切れた理由。EOF なら null のまま */
         let broke: unknown = null;
@@ -518,35 +550,63 @@ async function pump(
           handoff = [];
           stream = await openWithRetry(
             (signal) =>
-              openChannelStream(
+              openChannel(
                 service.type,
-                // 掛け直すたびに引き直す。放送の一覧が変わってチャンネルを書き換えたら、新しいほうへ行く
-                channelOf(service.id) ?? service.channel,
+                /*
+                 * 掛け直すたびに引き直す。放送の一覧が変わってチャンネルを書き換えたら、新しいほうへ行く。
+                 * どのエージェントに送るかも掛け直すたびに決める (`tuner.openChannel`)。エージェントが落ちて切れた録画は、
+                 * 同じ TS を受けられるほかのエージェントに空きがあればそちらで続く
+                 */
+                placesOf(service.id),
                 signal,
                 use,
                 undefined,
                 leaving,
-              ).catch((error: unknown) => {
-                /*
-                 * **衛星で選局できなかったら、放送の一覧を読み直す** (`lineup-follow.refreshLineup`)。
-                 * 再編で TS が移ったのなら、書き換えたあとの掛け直しで録れる
-                 */
-                if (
-                  error instanceof TuneError &&
-                  (service.type === "BS" || service.type === "CS")
-                ) {
-                  void refreshLineup(service.type).catch(() => undefined);
-                }
-                throw error;
-              }),
+                null,
+                null,
+                null,
+                // 有料の局は、契約のあるカードで復号するエージェントに振り分ける (`agent-cards.keyRanks`)
+                service.id,
+              )
+                // 選局の答えの形式が控えと違えば録らない。TS の読み方で TLV を読んでも、その逆でも、1 バイトも書けない
+                .then((opened) => {
+                  // どのエージェントで録ったかを残す (有料の番組を復号できたとき、そのエージェントのカードを契約中にする。`contracts.noteDecoded`)
+                  if (opened.place.agent !== agentId) {
+                    agentId = opened.place.agent;
+                    orm()
+                      .update(recordings)
+                      .set({ agent_id: agentId })
+                      .where(eq(recordings.id, recording.id))
+                      .run();
+                  }
+                  return expectTransport(opened, service.transport);
+                })
+                .catch((error: unknown) => {
+                  /*
+                   * **衛星で選局できなかったら、放送の一覧を読み直す** (`lineup-follow.refreshLineup`)。
+                   * 再編で TS が移ったのなら、書き換えたあとの掛け直しで録れる
+                   */
+                  if (error instanceof TuneError && isSatellite(service.type)) {
+                    void refreshLineup(service.type).catch(() => undefined);
+                  }
+                  throw error;
+                }),
             controller.signal,
           );
         } catch (error) {
-          // **取り直せなくても諦めない。** エージェントの Pod 入れ替えは
+          // **取り直せなくても失敗にしない。** エージェントの Pod 入れ替えは
           // openWithRetry の数十秒を超えることがあり、そこで失敗にすると
           // 「終了時刻まで掛け直す」という上の約束を破って番組を丸ごと
           // 落とす。終了時刻 (自分での abort) が来るまでは待って掛け直す
           if (controller.signal.aborted) break;
+          /*
+           * **形式が変わったと分かったら、そこで録画を終える。** スキャンし直すまで何度掛け直しても同じ答えが返り、
+           * そのたびにチューナーを取る。それまでに録れたぶんは残す
+           */
+          if (error instanceof TransportChangedError) {
+            transportChanged = error;
+            break;
+          }
           interrupted++;
           console.warn(
             `[recorder] 録画 ${recording.id}: 選局を取り直せません (${interrupted} 回目: ${error})。` +
@@ -556,7 +616,7 @@ async function pump(
           continue;
         }
 
-        // 取り直したら PCR が飛ぶので、そこまでに測れていなければ諦める (エンコードのときに測る)
+        // 取り直したら PCR が飛ぶので、そこまでに測れていなければ測るのをやめる (エンコードのときに測る)
         if (written > 0) measure = null;
 
         try {
@@ -596,7 +656,7 @@ async function pump(
               }
               if (Date.now() - savedEpgAt >= EPG_SAVE_INTERVAL) {
                 savedEpgAt = Date.now();
-                savePrograms(epg.all());
+                savePrograms(epg.all(), { type: service.type });
               }
             }
 
@@ -671,7 +731,7 @@ async function pump(
         sink.end((error?: Error | null) => (error ? reject(error) : resolve()));
       });
       // 途中で終わっても、読めたぶんの番組表は残す
-      savePrograms(epg.all());
+      savePrograms(epg.all(), { type: service.type });
     }
   } catch (error) {
     // 終了時刻に達して自分で abort した場合は正常終了。それ以外だけ失敗にする
@@ -702,9 +762,17 @@ async function pump(
 
   // 統計が取れなくても書き込み量で代用する
   const size = fileSize(path) ?? written;
+  if (transportChanged !== null)
+    console.warn(
+      `[recorder] 録画 ${recording.id}: ${transportChanged.message}。ここで録画を終えます`,
+    );
 
   if (size === 0) {
-    fail(recording.id, "ストリームから 1 バイトも受信できませんでした");
+    fail(
+      recording.id,
+      transportChanged?.message ??
+        "ストリームから 1 バイトも受信できませんでした",
+    );
     return;
   }
 
@@ -738,15 +806,47 @@ function finish(recordingId: number, size: number): void {
     recording: recordingSummary(recording),
   });
 
-  if (reservation === undefined || reservation.encode) {
+  /*
+   * **エンコードするのは、予約と録り終えたときの設定のどちらもエンコードするときだけ。** 予約したあとに
+   * 設定を「エンコードしない」に変えたら、前からある予約も元の TS をそのまま置く (`encoder.runJob` と同じ決まり)。
+   * **映像の無い録画 (ラジオ・データ放送の局) はエンコードしない** (`recorded-broadcast.recordedMedia`)。
+   * 映像をエンコードできないので、エンコードする設定でも元の TS をそのまま置く
+   */
+  const program = aribServiceId(recording.service_id);
+  const { video } = recordedMedia(recording.ts_path!, program);
+  if (video && (reservation?.encode ?? true) && settings().encode) {
     enqueue(recording.id);
     return;
   }
 
-  // エンコードしない設定なら元の TS をそのまま保存先へ移す
-  const dest = libraryPath(recording, ".m2ts");
+  // エンコードしないなら元の TS をそのまま保存先へ移す。拡張子 (伝送の形式) はそのまま (`.m2ts`・`.mmts`)
+  const dest = libraryPath(recording, extname(recording.ts_path!));
   moveFile(recording.ts_path!, dest);
-  void writeThumbnail(dest, (recording.end_at - recording.start_at) / 1000);
+  /*
+   * 4K の局の録画 (TLV) は ffmpeg が読めないので、サムネイルを作らない (エンコードすれば、詰め替えた MP4 から作る。`encoder.ts`)。
+   * TS で送る 4K の局の録画は、縮めて SDR に直して取る (`encoder.encodeInput` の `uhd`)。映像の無い録画には作るものが無い
+   */
+  const kind = encodeInput(dest, program);
+  if (!video) {
+    /*
+     * 映像の無い録画のデータ放送は、エンコードするときと同じくサイドカーに取り出す (`recorded-bml.ts`)。観る画面の物差しは元の TS なので
+     * 先頭で捨てた長さは 0。付け足しなので、失敗しても録画は失敗にしない
+     */
+    void saveRecordedBml(dest, sidecarPaths(dest).dataBroadcast, recording, 0)
+      .then(() => emit("recordings"))
+      .catch((error: unknown) =>
+        console.warn(
+          `[recorder] 録画 ${recording.id} のデータ放送を取り出せませんでした: ${String(error)}`,
+        ),
+      );
+  } else if (!kind.tlv)
+    void writeThumbnail(
+      dest,
+      // 録れた長さ (測れていなければ予定の尺)。途中で切れた録画で、位置が尺を超えないように
+      (recording.duration_ms || recording.end_at - recording.start_at) / 1000,
+      undefined,
+      kind.uhd,
+    );
   // 保存先に置いた時点で「視聴可能」になる
   orm()
     .update(recordings)
@@ -758,7 +858,7 @@ function finish(recordingId: number, size: number): void {
 /**
  * その録画が終わっているべき時刻。**末尾を譲っていればそこまで** (`record_to`)。
  *
- * 止めるとき (`scheduler.tick`)・起動時に回収するとき・持ち主のいない行を畳むとき
+ * 止めるとき (`scheduler.tick`)・起動時に回収するとき・持ち主のいない行を終えるとき
  * (`failStrayRecordings`) で同じ物差しを使う。書き写していると、片方だけ直したときに
  * 「止めた時刻」と「終わっているはずの時刻」がずれる
  */
@@ -806,22 +906,22 @@ export function recoverOrphanedRecordings(): {
 }
 
 /**
- * 終了時刻を過ぎてから畳むまでの猶予。**正常に終わる録画に手を出さないため。**
+ * 終了時刻を過ぎてから終えるまでの猶予。**正常に終わる録画に手を出さないため。**
  *
  * 止めてから `finish` までは同じ処理の中で続けて終わるので実際には重ならないが、
- * 急いで畳んで得るものが何も無い
+ * 急いで終えて得るものが何も無い
  */
 const STRAY_GRACE = 60_000;
 
 /**
- * **持ち主のいない「録画中」を畳む。**
+ * **持ち主のいない「録画中」を終える。**
  *
  * 録っている最中の録画はプロセスの中にしか無い (`active`)。ノードごと落とした・Pod を強制終了したなど、
- * **畳む前にプロセスが止まった**ときは、DB の行だけが録画中で残る。
+ * **終える前にプロセスが止まった**ときは、DB の行だけが録画中で残る。
  * 起動時にも同じ片付けをするが (`recoverOrphanedRecordings`)、そのとき**まだ放送中なら
- * 録り直す**ので、再開した先でまたプロセスが止まると次の起動まで畳まれない。
+ * 録り直す**ので、再開した先でまたプロセスが止まると次の起動まで終わらない。
  *
- * 畳まれない行は**一覧の予約の側に残り、録画の側には出てこない**。どちらの振り分けも
+ * 終わらない行は**一覧の予約の側に残り、録画の側には出てこない**。どちらの振り分けも
  * `recordings.state = 'recording'` で決まっている (`routes/+page.server.ts`)。放送は
  * とうに終わっているのに「録画中」と出たままで、取り消す以外に消す方法が無い。
  *
@@ -856,13 +956,39 @@ export function failStrayRecordings(
   return stray.length;
 }
 
-/** 局のいまのチャンネルの名前 (`services.channel`)。局が無ければ null */
-function channelOf(serviceId: number): string | null {
-  return (
-    orm()
-      .select({ channel: services.channel })
-      .from(services)
-      .where(eq(services.id, serviceId))
-      .get()?.channel ?? null
-  );
+/** 録画が通す、1 局に絞るフィルタ (`ServiceFilter`・`MmtServiceFilter`) の共通の形 */
+interface RecordFilter {
+  /** 塊を受けて、その局のぶんだけを返す */
+  filter(chunk: Uint8Array): Uint8Array;
+  /** 局の並び (PMT・MPT) を読めたか。読めるまでは書かない */
+  readonly ready: boolean;
+  /** いまの番組がコピー禁止か (PMT のデジタルコピー制御記述子) */
+  readonly copyNever: boolean;
+}
+
+/**
+ * **伝送の形式ごとに、1 局に絞るフィルタを選ぶ。** TS は `ServiceFilter`、4K の局 (TLV) は `MmtServiceFilter`。
+ * 4K の局のコピー禁止は番組表 (MH-EIT のコンテンツコピー制御記述子) で予約の時点に止める (`format.COPY_NEVER_REASON`)。
+ * 録っている最中に MPT からは読まない (MPT のコピー制御の読み方を確かめていない)
+ */
+function recordFilter(transport: Transport, serviceId: number): RecordFilter {
+  if (transport === "ts") return new ServiceFilter(serviceId);
+  const mmt = new MmtServiceFilter(serviceId);
+  return {
+    filter: (chunk) => mmt.filter(chunk),
+    get ready() {
+      return mmt.ready;
+    },
+    copyNever: false,
+  };
+}
+
+/**
+ * 局をいま受けられる所 (`agent-channels.placesOfService`)。**分からなければ送出する** (呼ぶ側の掛け直しに任せる)。
+ * 上げた直後は、最初の局の取り込みが終わるまでエージェントの控えの写しが無い
+ */
+function placesOf(serviceId: number): Place[] {
+  const places = placesOfService(serviceId);
+  if (places.length === 0) throw new Error(NO_CHANNEL);
+  return places;
 }

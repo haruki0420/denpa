@@ -3,14 +3,16 @@ import { existsSync } from "node:fs";
 import { error, fail, redirect } from "@sveltejs/kit";
 import { eq, getTableColumns } from "drizzle-orm";
 
+import { parseId } from "#lib/id.js";
 import { countClips, sceneTime } from "#lib/server/clips.js";
 import { orm } from "#lib/server/db.js";
-import { deleteRecordingFiles } from "#lib/server/files.js";
+import { removeRecording } from "#lib/server/files.js";
 import { recordingJikkyo } from "#lib/server/jikkyo.js";
 import { encodedFile } from "#lib/server/library.js";
 import { sidecarPaths } from "#lib/server/metadata.js";
 import { relative } from "#lib/server/paths.js";
 import { rulerOf } from "#lib/server/playback.js";
+import { recordedAutoStart } from "#lib/server/recorded-bml.js";
 import { recordingFromForm, tsHeadOf } from "#lib/server/recording.js";
 import { lastEncodeError, recordings } from "#lib/server/schema.js";
 import { settings } from "#lib/server/settings.js";
@@ -30,9 +32,9 @@ interface WatchRow extends Recording {
   encode_error: string | null;
 }
 
-export function load({ params, url }) {
-  const id = Number(params.id);
-  if (!Number.isFinite(id)) error(404, "録画が見つかりません");
+export async function load({ params, url }) {
+  const id = parseId(params.id);
+  if (id === null) error(404, "録画が見つかりません");
 
   const recording: WatchRow | undefined = orm()
     .select({
@@ -52,10 +54,19 @@ export function load({ params, url }) {
 
   /*
    * データ放送を取り出してあるか (無い局・古い録画では出さない)。中身は d ボタンで別に取る。
-   * **エンコード済みの時刻で書いてある**ので、まだエンコードしていない録画では出さない
+   * **エンコード済みの時刻で書いてある**ので、まだエンコードしていない録画では出さない。
+   * 映像の無い録画はエンコードせず、保存先の TS (`library_path`) の隣に元の TS の時刻で置く (`recorder.ts`。読み出す API と同じ場所)
    */
-  const hasData =
-    encoded !== null && existsSync(sidecarPaths(encoded).dataBroadcast);
+  const dataBase = encoded ?? recording.library_path;
+  const dataPath =
+    dataBase === null ? null : sidecarPaths(dataBase).dataBroadcast;
+  const hasData = dataPath !== null && existsSync(dataPath);
+  /*
+   * 入口に自動起動の指定があるか (変化ログの PMT。`recordedAutoStart`)。データ放送を自動で受信する端末は、これが true の録画でだけ
+   * 開く前から変化ログを取得する。指定の無い録画の入口は d を押すまで始まらない
+   */
+  const autoStart =
+    dataPath !== null && hasData && (await recordedAutoStart(dataPath));
 
   // 続きの位置は元の TS の物差しで覚えている。この画面の物差し (`playbackPlan` の `axis`) に直して渡す
   if (recording.resume_ms !== null) {
@@ -84,6 +95,8 @@ export function load({ params, url }) {
     playable: encoded !== null || ts !== null,
     broadcast: { postalCode, prefecture },
     hasData,
+    /** データ放送の入口に自動起動の指定があるか (データ放送を自動で受信する端末が、開く前から受信するか) */
+    autoStart,
     /** 元の TS の先頭の放送時刻 (unix ms)。データ放送の時計 (`clock`) を再生位置から出すのに使う */
     head: tsHeadOf(recording),
     /** 実況を流せるか (世帯の設定)。オンのときだけ ⚙ に「実況」の行を出す */
@@ -96,8 +109,6 @@ export function load({ params, url }) {
     scene,
     /** この録画の切り抜きの数 (右の列の「この録画の切り抜き」) */
     clips: countClips({ recording: id }),
-    /** コーデックのメニューから外すもの (世帯の設定。`#lib/live-choice.ts` の `HIDDEN_CODECS`) */
-    hidden: viewing.hidden,
     /** 開いた名前が家の中か (`#lib/host.ts` の `indoorHost`)。録画しか無いときの「自動」の順に効く (`ts/playback.ts` の `pickOffer`) */
     indoor: viewing.indoor,
   };
@@ -110,7 +121,8 @@ export const actions = {
     const recording = recordingFromForm(form);
     if (recording === undefined)
       return fail(400, { message: "録画が見つかりません" });
-    deleteRecordingFiles(recording, "手動削除");
+    if (!removeRecording(recording, "手動削除"))
+      return fail(409, { message: "録画中は消せません" });
     /*
      * 消したら一覧へ戻す。ここで返すと SvelteKit が `load` を回し直し、消えた録画に 410 を返して
      * 観ていた画面がエラー画面に変わる

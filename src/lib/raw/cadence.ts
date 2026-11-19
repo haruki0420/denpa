@@ -2,21 +2,21 @@
  * **コマを出す間合い。** 何を描くかを「いま」ではなく「次に画面が切り替わる時刻」で決める。
  *
  * 60i の放送はフィールドごとに出す (bob) ので 59.94 回/秒、画面はたいてい 60 回/秒で、
- * ほぼ同じ間隔で並ぶ。worker は細かい時計 (4ms ごと) で刻み、1 枚のデコードに数 ms (重いもので
- * 10ms 近く) かかるので、刻んだ時刻で「いまの番」を見ると、フィールドの切り替わりが画面の切り替わりの
+ * ほぼ同じ間隔で並ぶ。worker は細かい時計 (4 ms ごと) で刻み、1 枚のデコードに数 ms (重いもので
+ * 10 ms 近く) かかるので、刻んだ時刻で「いまの番」を見ると、フィールドの切り替わりが画面の切り替わりの
  * 前後に揺れる。手前に来れば次の画面に出て、後ろへずれれば 1 回ぶん遅れる。同じフィールドが
  * 2 回出て、次のフィールドが飛ぶ。動いている映像ではこれがカクつきに見える。
  *
  * - 画面の切り替わり (`Vsync`): 画面の requestAnimationFrame の時刻から間隔と位置を覚え、
  *   次の切り替わりの時刻を出す。**同じ画面の切り替わりには、いつ刻んでも同じフィールドが選ばれる**
- * - 時計 (`SmoothClock`): 画面から 20ms ごとに届く「鳴っている PTS」の組は数 ms ずつ揺れる。
+ * - 時計 (`SmoothClock`): 画面から 20 ms ごとに届く「鳴っている PTS」の組は数 ms ずつ揺れる。
  *   そのまま差し替えると番が前後に飛ぶので、小さなずれは少しずつ寄せる。大きく飛んだ (シークした・
  *   貯め直した) ときだけ合わせ直す
  */
 
 import { CLOCK } from "@danything/arib/pes";
 
-/** 画面の切り替わりの間隔として受け取る幅 (ms)。240Hz〜20Hz */
+/** 画面の切り替わりの間隔として受け取る幅 (ms)。240 Hz〜20 Hz */
 const PERIOD_MIN = 4;
 const PERIOD_MAX = 50;
 /** 新しい間隔をどれだけ混ぜるか */
@@ -25,7 +25,7 @@ const PERIOD_GAIN = 0.1;
 const STALE_MS = 1000;
 /**
  * 続けてこれだけ 2 回ぶん以上と割ったら、覚えた間隔のほうが短すぎるとみて測り直す。混んだ CI で
- * 150 回のうち 40〜90 回落としても、0.5 秒 (60Hz で 30 回) の間に 1 回ぶんの間が 1 つも無いことはまず無い
+ * 150 回のうち 40〜90 回落としても、0.5 秒 (60 Hz で 30 回) の間に 1 回ぶんの間が 1 つも無いことはまず無い
  */
 const RESEED_RUN = 30;
 
@@ -42,7 +42,7 @@ export class Vsync {
     this.anchor = at;
     if (last === null) return;
     const gap = at - last;
-    // 裏から戻った (rAF が止まっていた) なら位置だけ覚え直す。長く空くと何回ぶんかの割り戻しがずれる
+    // 裏から戻った (rAF が止まっていた) なら位置だけ覚え直す。長く空くと、何回ぶんかで割り戻した間隔がずれる
     if (gap <= 0 || gap > STALE_MS) {
       this.run = [];
       return;
@@ -52,7 +52,7 @@ export class Vsync {
     const count = Math.max(1, Math.round(gap / guess));
     const one = gap / count;
     if (one < PERIOD_MIN || one > PERIOD_MAX) return;
-    // 覚えた間隔が本当の 2/3 より短くなる (混んで短い間が続いた・120Hz から 60Hz に変わった) と、
+    // 覚えた間隔が本当の 2/3 より短くなる (混んで短い間が続いた・120 Hz から 60 Hz に変わった) と、
     // ふつうの間を毎回 2 回ぶんと割って半分に寄せ、戻らない。続いたら、来た間の真ん中から測り直す
     if (count === 1) this.run = [];
     else {
@@ -86,22 +86,72 @@ export class Vsync {
     return this.anchor + count * this.interval;
   }
 
-  /**
-   * **いまデコードを始めてよいか。** 切り替わりの直後 (間隔の前半) だけ。1 枚のデコードは重いもので
-   * 10ms 近く掛かるので、後半に始めると、その次の切り替わりに出すフィールドを描く前に
-   * 回が延びる。切り替わりが分からなければいつでもよい
-   */
-  settled(at: number): boolean {
-    const next = this.next(at);
-    if (next === null || this.interval === null) return true;
-    return next - at > this.interval * SETTLED;
-  }
-
   clear(): void {
     this.anchor = null;
     this.interval = null;
     this.run = [];
   }
+}
+
+/**
+ * **描くものが次に変わる画面の切り替わりまでの時間 (ms)。** `at` は次の切り替わりの時点の PTS、`frame` は 1 コマの長さ (90 kHz)。
+ * 飛び越し走査はフィールドの境目 (半コマごと)、プログレッシブはコマの境目で変わる。切り替わりが分からない・まだ何も出していなければ null
+ */
+export function untilChange(
+  vsync: Vsync,
+  wall: number,
+  at: number,
+  shown: Shown | null,
+  frame: number,
+): number | null {
+  const next = vsync.next(wall);
+  const period = vsync.period;
+  if (next === null || period === null || shown === null) return null;
+  const step = shown.interlaced ? frame / 2 : frame;
+  const boundary = shown.pts + (Math.floor((at - shown.pts) / step) + 1) * step;
+  const count = Math.max(
+    0,
+    Math.ceil((boundary - at) / (CLOCK / 1000) / period),
+  );
+  return next + count * period - wall;
+}
+
+/** デコードに掛かる時間の見積もりに使う、直近のデコードの数 */
+export const COST_SAMPLES = 8;
+/**
+ * 見積もりは直近の平均の (1 + これ × デコードできて待っているコマの数) 倍。平均より重いコマ (I フレーム・動きの多いコマ) でも
+ * 間に合うように、待っているコマが多いうちは余裕のある間だけで始める。少なくなったら狭い間でも始める
+ */
+const COST_STEP = 0.15;
+/** 見積もりの倍率の上限 */
+const COST_MOST = 2;
+/** 見積もりに足す時間 (ms)。デコードしたあと、テクスチャを上げて描き、画面へ渡すまでのぶん */
+const COST_MARGIN = 2;
+
+/**
+ * **いまデコードを始めてよいか。** 描くものが次に変わる切り替わり (`untilChange`) までに、デコードを終えて
+ * 描けるときだけ。デコードしている間は描けないので、間に合わないと描くのが 1 回ぶん遅れ、同じフィールドが
+ * 余分に出て次が飛ぶ。同じフィールドを続けて出す切り替わり (120 Hz なら 1 回おき) はまたいでよい。
+ * 間に合うかは、直近のデコード (`recent`。ms) の平均と、デコードできて待っているコマの数 (`ready`) から見積もる。
+ * 切り替わりが分からなければいつでもよい
+ */
+export function mayDecode(
+  vsync: Vsync,
+  wall: number,
+  at: number,
+  shown: Shown | null,
+  frame: number,
+  recent: readonly number[],
+  ready: number,
+): boolean {
+  const left = untilChange(vsync, wall, at, shown, frame);
+  if (left === null) return true;
+  const mean =
+    recent.length === 0
+      ? 0
+      : recent.reduce((sum, ms) => sum + ms, 0) / recent.length;
+  const scale = Math.min(COST_MOST, 1 + COST_STEP * ready);
+  return left > mean * scale + COST_MARGIN;
 }
 
 /** 真ん中の値。いちばん短い間は揺れて短く来たものかもしれないので使わない */
@@ -110,10 +160,7 @@ function median(values: number[]): number {
   return sorted[Math.floor(sorted.length / 2)]!;
 }
 
-/** 切り替わりの間隔のうち、デコードを始めてよい前半の割合 (`settled`) */
-const SETTLED = 0.5;
-
-/** これより大きく食い違えば寄せずに合わせ直す (90kHz。50ms) */
+/** これより大きく食い違えば寄せずに合わせ直す (90 kHz。50 ms) */
 const SNAP = 0.05 * CLOCK;
 /** 届いた組へどれだけ寄せるか */
 const CLOCK_GAIN = 0.1;
@@ -147,13 +194,13 @@ export class SmoothClock {
   }
 }
 
-/** これより食い違えば合わせ直す (90kHz。8ms) */
+/** これより食い違えば合わせ直す (90 kHz。8 ms) */
 const LOCK_SNAP = 0.008 * CLOCK;
 /** 時計へどれだけ寄せるか (切り替わり 1 回ごと) */
 const LOCK_GAIN = 0.01;
 
 /**
- * **画面の切り替わりごとの PTS を、切り替わりの間隔ぶんずつ進める。** 時計は寄せてもなお 1ms 足らず
+ * **画面の切り替わりごとの PTS を、切り替わりの間隔ぶんずつ進める。** 時計は寄せてもなお 1 ms 足らず
  * 揺れ、フィールドの切れ目が画面の切り替わりのすぐそばにある間 (59.94 と 60 の差で約 17 秒ごとに来る)
  * は、その揺れで選ぶフィールドが行き来する (同じものが 2 回出て、次が飛ぶ)。切り替わりの時刻から
  * 決まる PTS を使い、時計へはごく少しずつ寄せる。大きく食い違えば (飛んだ・貯め直した) 合わせ直す

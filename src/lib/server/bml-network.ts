@@ -85,7 +85,7 @@ function relayBody(status: number, body: Uint8Array): BodyInit | null {
 }
 
 /** 中継の返りに付ける CSP と `cache-control` */
-export interface RelayHeaders {
+interface RelayHeaders {
   csp: string;
   cache: string;
 }
@@ -153,7 +153,7 @@ export function requireBmlNetwork(): void {
  * (0.0.0.0 / ::) に落とすことがある。実測で `view.fujitv.co.jp` と
  * `recv-entry.tbs.co.jp` がそうなり、下の SSRF 防御が「内側のアドレス」として
  * 正しく断った結果、TBS の TVer リンクが NAP エラーになっていた。
- * 上流が複数あると答えがフラつくので、放送アプリの通信はここで固定する。
+ * 上流が複数あると問い合わせごとに答えが変わるので、放送アプリの通信はここで固定する。
  *
  * **繋ぐのも引いたアドレスへ直に繋ぐ** (`doRequest` の host に IP を渡す)。
  * 引き直しを OS に任せると、確かめたアドレスと繋ぐアドレスがずれる (TOCTOU)
@@ -394,18 +394,16 @@ function doRequest(
  * 手で追いかけて、行き先ごとに `allowed` を通します
  */
 export function fetchForBml(raw: string): Promise<Fetched> {
-  return follow(raw, "GET", undefined);
+  return limited(() => hops(raw, "GET", undefined, FORM));
 }
 
 /**
  * 送る (`browser.transmitTextDataOverIP`)。
  *
- * **「応募・投票」の API だと思っていたら、疎通の判定そのものだった。**
- * NHK のデータ放送は `isIPConnected` に 1 と答えても信じず、ここへ一度
+ * **「応募・投票」だけでなく、疎通の判定にも使われる。**
+ * NHK のデータ放送は `isIPConnected` が 1 を返しても、ここへ一度
  * 送ってみて、返らなければ「インターネットに接続されていません」と案内
- * します (実機で確かめた。`confirmIPNetwork` は呼びに来もしない)。
- * 最初は実装しないと決めていて、それでは双方向を入れても入っていないのと同じ
- * でした。
+ * します (実機で確かめた。`confirmIPNetwork` は呼ばない)。
  *
  * **中身は組み立てません。** エンジン (`src/lib/bml/`) が `Denbun=<EUC-JP を
  * %xx にしたもの>` まで作ってから渡してくるので、denpa はそれを
@@ -420,7 +418,7 @@ export function postForBml(
   body: Uint8Array,
   contentType = FORM,
 ): Promise<Fetched> {
-  return follow(raw, "POST", body, contentType);
+  return limited(() => hops(raw, "POST", body, contentType));
 }
 
 /** いま中継している数 (`CONCURRENCY` まで) */
@@ -443,16 +441,25 @@ export async function limited<T>(task: () => Promise<T>): Promise<T> {
   }
 }
 
-/** 飛ばされるのを 1 つずつ確かめながら追いかける (`fetchForBml` / `postForBml` の本体) */
-function follow(
-  raw: string,
-  first: "GET" | "POST",
-  body: Uint8Array | undefined,
-  contentType = FORM,
-): Promise<Fetched> {
-  return limited(() => hops(raw, first, body, contentType));
+/**
+ * 締め切り (`Date.now()` の値) までに終わらなければ「時間切れ」で断る。**名前を引くのに使う。**
+ * DNS の問い合わせは自分で再試行するので、答えない DNS だと `TIMEOUT` を超えて待たされる
+ */
+export function beforeDeadline<T>(
+  deadline: number,
+  task: Promise<T>,
+): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const late = new Promise<never>((_, reject) => {
+    timer = setTimeout(
+      () => reject(new Refused("時間切れです")),
+      Math.max(0, deadline - Date.now()),
+    );
+  });
+  return Promise.race([task, late]).finally(() => clearTimeout(timer));
 }
 
+/** 飛ばされるのを 1 つずつ確かめながら追いかける (`fetchForBml` / `postForBml` の本体) */
 async function hops(
   raw: string,
   first: "GET" | "POST",
@@ -461,7 +468,7 @@ async function hops(
 ): Promise<Fetched> {
   // 名前を引くのも含めて、全体で `TIMEOUT` まで
   const deadline = Date.now() + TIMEOUT;
-  let { url, address } = await allowed(raw);
+  let { url, address } = await beforeDeadline(deadline, allowed(raw));
   let method = first;
   for (let hop = 0; ; hop++) {
     const got = await doRequest(
@@ -476,11 +483,30 @@ async function hops(
     if (got.status >= 300 && got.status < 400 && got.location !== null) {
       if (hop >= HOPS) throw new Refused("リダイレクトが多すぎます");
       if (got.status !== 307 && got.status !== 308) method = "GET";
-      ({ url, address } = await allowed(new URL(got.location, url).toString()));
+      ({ url, address } = await beforeDeadline(
+        deadline,
+        allowed(new URL(got.location, url).toString()),
+      ));
       continue;
     }
     return { status: got.status, contentType: got.contentType, body: got.body };
   }
+}
+
+/**
+ * `confirmReachable` の宛先から名前 (か IP) だけを取り出す。読めなければ空文字 (URL として読めないものも)。
+ * `example.jp` でも `example.jp:443` でも `https://example.jp/x` でも受ける (繋ぐのはどれも 443 番)。
+ * IPv6 は括弧付きで返し (`[2001:db8::1]:443` → `[2001:db8::1]`)、括弧は `resolvable` が外す
+ */
+export function reachHost(destination: string): string {
+  if (destination.includes("://")) {
+    // URL として読めなければ空 (呼ぶ側が「宛先がありません」で断る)
+    return URL.canParse(destination) ? new URL(destination).hostname : "";
+  }
+  const bare = destination.replace(/^\/+/, "").split("/")[0] ?? "";
+  return bare
+    .replace(/^(\[[^\]]*\]):\d+$/, "$1")
+    .replace(/^([^:[\]]+):\d+$/, "$1");
 }
 
 /**
@@ -504,23 +530,16 @@ export async function confirmReachable(
   ipAddress: string | null;
   responseTimeMillis: number | null;
 }> {
-  // `example.jp` でも `example.jp:443` でも `https://example.jp/x` でも受ける (繋ぐのはどれも 443 番)
-  const bare = destination.replace(/^\/+/, "").split("/")[0] ?? "";
-  const host = destination.includes("://")
-    ? new URL(destination).hostname
-    : bare.replace(/^([^:[\]]+):\d+$/, "$1");
+  const host = reachHost(destination);
   if (host === "") throw new Refused("宛先がありません");
 
   return limited(async () => {
     const started = Date.now();
+    const wait = Math.max(1000, Math.min(timeoutMs, TIMEOUT));
     // 確かめたアドレスへ直に繋ぐ (名前で繋ぎ直すと、フィルタされた DNS が別のアドレスを返しうる)
-    const address = await resolvable(host);
+    const address = await beforeDeadline(started + wait, resolvable(host));
     return await new Promise((resolve) => {
-      const socket = connect({
-        host: address,
-        port: 443,
-        timeout: Math.max(1000, Math.min(timeoutMs, TIMEOUT)),
-      });
+      const socket = connect({ host: address, port: 443, timeout: wait });
       const done = (success: boolean) => {
         socket.destroy();
         resolve({

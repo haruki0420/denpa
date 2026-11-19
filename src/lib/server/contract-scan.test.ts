@@ -12,6 +12,7 @@ config.dataDir = testDir;
 config.dbPath = join(testDir, "denpa.db");
 
 const { orm } = await import("./db");
+const { placeServices } = await import("./fake-channels");
 const { cardContracts, services } = await import("./schema");
 const { buildScanQueue, getJstDateString, isWithinScanWindow } =
   await import("./contract-scan");
@@ -64,7 +65,6 @@ describe("定期スキャンの時間・キュー判定 (contract-scan)", () => 
         network_id: 7,
         name: "CS局A",
         type: "CS",
-        channel: "CS02",
         updated_at: now,
       })
       .run();
@@ -76,7 +76,6 @@ describe("定期スキャンの時間・キュー判定 (contract-scan)", () => 
         network_id: 7,
         name: "CS局B",
         type: "CS",
-        channel: "CS02",
         updated_at: now,
       })
       .run();
@@ -88,10 +87,14 @@ describe("定期スキャンの時間・キュー判定 (contract-scan)", () => 
         network_id: 7,
         name: "CS局C",
         type: "CS",
-        channel: "CS04",
         updated_at: now,
       })
       .run();
+    placeServices([
+      { id: 700101, channel: "CS02" },
+      { id: 700102, channel: "CS02" },
+      { id: 700201, channel: "CS04" },
+    ]);
 
     // 未確認行
     orm()

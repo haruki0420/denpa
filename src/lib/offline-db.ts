@@ -5,7 +5,7 @@
  * - `videos` … 落とした録画。動画の blob と、観るのに要る付属のデータ
  *   (字幕・チャプター・データ放送・ポスター) を 1 行にまとめて持つ
  * - `parts` … ページで受け取った動画の塊 (`OfflineVideo.parts`)。読むときに `videos` が
- *   1 本の `video` につないで出すので、観る側は塊を知らなくてよい
+ *   1 本の `video` につないで出すので、観る側は塊を扱わなくてよい
  * - `outbox` … オンラインに戻ったときにサーバへ伝えること (いまは削除だけ)
  * - `resume` … オフライン中に進んだ視聴位置。復帰時にまとめて送る
  */
@@ -160,7 +160,7 @@ export function parseFetchId(
 /**
  * 落とすものの一覧。動画 + 観るのに要る付属のデータ。
  *
- * **頭 (前段の接頭辞。server/paths.ts) は呼ぶ側 (offline.svelte.ts) が付ける。** ここは
+ * **先頭に付ける接頭辞 (前段のもの。server/paths.ts) は呼ぶ側 (offline.svelte.ts) が付ける。** ここは
  * Service Worker からも読まれ、パスの形でどのデータかを見分ける (`kindOf`) ので、ルートからのパスのまま持つ
  */
 export function downloadRequests(id: number, source: EncodedSource): string[] {
@@ -308,7 +308,7 @@ const videoRows = table<OfflineVideo>("videos");
 
 /**
  * 落とした録画。**塊で持っているものも、読むときは `video` がつながった形で出す**
- * (観る画面・/offline・SW は塊を知らない)。書くときはつないだ `video` を行に戻さない
+ * (観る画面・/offline・SW は塊を扱わない)。書くときはつないだ `video` を行に戻さない
  * (塊と二重に持つことになる)。消すときは塊も消す
  */
 export const videos = {

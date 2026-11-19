@@ -8,11 +8,17 @@ import {
   readInit,
 } from "#lib/ts/fmp4.js";
 
-import { audioCodec, audioFrame, type Fmp4Host, Fmp4Video } from "./fmp4";
+import {
+  audioCodec,
+  audioFrame,
+  type Fmp4Host,
+  Fmp4Video,
+  newestKey,
+} from "./fmp4";
 
 /**
  * **追っかけで抱えきれなくなったとき** (`follow`)。圧縮のまま持つのが上限を超えたら、受け取るのを
- * やめて `full` を 1 回だけ返し、以降は捨てる。リクエストし直し (`reset` → 新しい init) で元に戻る。
+ * やめて `full` を 1 回だけ返し、以降は捨てる。リクエストし直す (`reset` → 新しい init) と元に戻る。
  *
  * 映像はデコードさせない (刻まないので VideoDecoder に渡らない)。VideoDecoder と 2D のコンテキストは形だけの偽物。
  * 流すのは E2E と同じ作り置き (本物の ffmpeg が書いた AV1 + Opus。`tests/fake/fmp4-loop.ts`)
@@ -33,17 +39,33 @@ class FakeDecoder {
   reset(): void {
     this.state = "unconfigured";
   }
-  decode(): void {}
+  decode(): void {
+    decoded++;
+  }
+  flush(): Promise<void> {
+    flushes.push(decoded);
+    return Promise.resolve();
+  }
 }
+/** 渡したコマの数と、flush を呼んだときにそれまで渡していた数 */
+let decoded = 0;
+let flushes: number[] = [];
 
-const globals = globalThis as { VideoDecoder?: unknown };
+const globals = globalThis as {
+  VideoDecoder?: unknown;
+  EncodedVideoChunk?: unknown;
+};
 let saved: unknown;
+let savedChunk: unknown;
 beforeAll(() => {
   saved = globals.VideoDecoder;
+  savedChunk = globals.EncodedVideoChunk;
   globals.VideoDecoder = FakeDecoder;
+  globals.EncodedVideoChunk = class {};
 });
 afterAll(() => {
   globals.VideoDecoder = saved;
+  globals.EncodedVideoChunk = savedChunk;
 });
 
 const file = new Uint8Array(
@@ -82,7 +104,7 @@ describe("Fmp4Video (追っかけで抱えきれないとき)", () => {
   test("上限を超えたら full を 1 回だけ返し、以降は音も映像も捨てる。リクエストし直せば戻る", () => {
     const { video, seen } = watcher(true);
     video.feed(init);
-    // 作り置きは 2 秒で 140KB ほど。120MB を超えるまで流す
+    // 作り置きは 2 秒で 140 KB ほど。120 MB を超えるまで流す
     for (let round = 0; round < 2_000 && seen.full === 0; round++)
       feedRounds(video, 1);
     expect(seen.full).toBe(1);
@@ -93,7 +115,7 @@ describe("Fmp4Video (追っかけで抱えきれないとき)", () => {
     expect(seen.full).toBe(1);
     expect(seen.sounds).toBe(sounds);
 
-    // リクエストし直し: 選局し直しと同じく reset のあとに新しい init
+    // リクエストし直す。選局し直すときと同じく reset のあとに新しい init
     video.reset();
     video.feed(init);
     feedRounds(video, 1);
@@ -106,6 +128,46 @@ describe("Fmp4Video (追っかけで抱えきれないとき)", () => {
     video.feed(init);
     feedRounds(video, 50);
     expect(seen.full).toBe(0);
+  });
+});
+
+/*
+ * **末尾まで読んだら、渡しきってから 1 回だけ flush する** (`finish`)。B フレームを並べ替えるデコーダは
+ * 最後の数枚を次のコマが来るまで持っているので、呼ばないと録画の最後の数コマが描かれない
+ */
+describe("Fmp4Video (末尾)", () => {
+  /** 時計をずっと先に進めて刻む (待たせているコマを全部渡す) */
+  const drain = (video: Fmp4Video) => {
+    for (let i = 0; i < 200; i++) video.tick(2 ** 40);
+  };
+
+  test("finish のあと、待たせているコマを渡しきってから flush を 1 回呼ぶ", () => {
+    decoded = 0;
+    flushes = [];
+    const { video } = watcher(false);
+    video.feed(init);
+    for (const data of media) video.feed(data);
+    video.finish();
+    drain(video);
+    expect(decoded).toBeGreaterThan(1);
+    expect(flushes).toEqual([decoded]);
+  });
+
+  test("finish が無ければ flush しない。reset で取り消す", () => {
+    decoded = 0;
+    flushes = [];
+    const { video } = watcher(false);
+    video.feed(init);
+    for (const data of media) video.feed(data);
+    drain(video);
+    expect(flushes).toEqual([]);
+
+    video.finish();
+    video.reset();
+    video.feed(init);
+    for (const data of media) video.feed(data);
+    drain(video);
+    expect(flushes).toEqual([]);
   });
 });
 
@@ -123,8 +185,6 @@ describe("Fmp4Video (描く大きさ)", () => {
     width: 1440,
     height: 1080,
     ...(displayWidth === undefined ? {} : { displayWidth }),
-    channels: 0,
-    sampleRate: 0,
     defaults: { duration: 1500, size: 0, flags: 0 },
   });
 
@@ -181,7 +241,7 @@ describe("Fmp4Video (描く大きさ)", () => {
 });
 
 /**
- * **音の開き方と 1 コマの形** (`audioCodec`・`audioFrame`)。canvas に描く worker とライブの音だけの worker が
+ * **音の開き方と 1 コマの渡し方** (`audioCodec`・`audioFrame`)。canvas に描く worker とライブの音だけの worker が
  * 同じものを使う。作り置きの H.264 は AAC、AV1 は Opus (本物の ffmpeg が書いたもの)
  */
 describe("audioCodec・audioFrame", () => {
@@ -222,5 +282,26 @@ describe("audioCodec・audioFrame", () => {
   test("OpusHead を組めない Opus は開かない", () => {
     const { track } = audioOf("live-av1.mp4");
     expect(audioCodec({ ...track, config: new Uint8Array(2) })).toBeNull();
+  });
+});
+
+describe("newestKey", () => {
+  const items = [
+    { dts: 0, key: true },
+    { dts: 10, key: false },
+    { dts: 20, key: true },
+    { dts: 30, key: false },
+    { dts: 40, key: true },
+  ];
+
+  test("dts が飛び先までのうち、いちばん新しいキーフレームの位置を返す", () => {
+    expect(newestKey(items, 35)).toBe(2);
+    expect(newestKey(items, Number.POSITIVE_INFINITY)).toBe(4);
+  });
+
+  test("先頭より後ろにキーフレームが無ければ 0 以下を返す (飛ばない)", () => {
+    expect(newestKey(items, 15)).toBe(0);
+    expect(newestKey([{ dts: 0, key: false }], 10)).toBe(-1);
+    expect(newestKey([], 10)).toBe(-1);
   });
 });

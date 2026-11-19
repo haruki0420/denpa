@@ -25,6 +25,7 @@ import { Outlet, playbackSession } from "#lib/sound.js";
 
 import type { FromWorker, GrabSize, RawInput, ToWorker } from "./messages";
 import { type Chunk, Playout, type Scheduled } from "./playout";
+import { audioContext, Seam } from "./seam";
 
 /** 刻み (ms)。音の予約と時計の配り直しをここで回す */
 const TICK = 20;
@@ -34,13 +35,18 @@ const NO_AUDIO = 5_000;
 const GRAB_WAIT = 2_000;
 /** デコーダの置き場 (`routes/api/live/mpeg2`) */
 const DECODER = "/api/live/mpeg2";
+
+/** デコーダの置き場の URL (置いたパスの下)。WebKit のライブで音を別に鳴らす経路 (`native-audio.ts`) も同じものを読む */
+export function decoderBase(): string {
+  return `${resolve("")}${DECODER.slice(1)}`;
+}
 /**
  * **`<audio>` を通したとき、出口から耳までの遅れの見込み (秒)** (`Outlet.route`)。
  *
  * ストリーム (MediaStream) へ出した音は、Web Audio が組んだその場でストリームに乗る。ページから直に
  * 鳴らすときの出口の遅れ (`baseLatency + outputLatency`。`latencyHint: 'playback'` で
  * 大きめ) を通らず、代わりに `<audio>` の側の出口を通る。その遅れはページから読めないので
- * 見込みで置く。**少なめに置く**。外れても「音が映像より遅れる」側に倒れる (人は音が先に
+ * 見込みで置く。**少なめに置く**。外れても「音が映像より遅れる」側にずれる (人は音が先に
  * 来るほうに気づきやすい)。実測は docs/stream.md#時計は鳴っている音-リップシンク
  */
 const STREAM_OUT = 0.03;
@@ -53,10 +59,13 @@ interface AudioChunk extends Chunk {
 interface RawEvents {
   /** 選局し直してから最初のフレームが出た */
   shown(): void;
-  /** 貯めを使い切って止まった (エンコードする経路の `waiting` にあたる) */
+  /** バッファを使い切って止まった (エンコードする経路の `waiting` にあたる) */
   stalled(): void;
-  /** **使えなくなった。** 次の方式に移るか止まるかは画面が決める (理由は画面に出す) */
-  gaveUp(reason: string): void;
+  /**
+   * **使えなくなった。** 次の方式に移るか止まるかは画面が決める (理由は画面に出す)。`slow` は間に合わずに打ち切ったときだけ付く、
+   * 掛かった条件 (`DecodeBudget.why`)
+   */
+  gaveUp(reason: string, slow?: string): void;
   /**
    * 外から止められた・再開された (`paused`)。**`<audio>` を通している間だけ**。
    * ロック画面・車のハンドルの再生ボタン・ブラウザの再生中の通知は `<audio>` を直に
@@ -82,6 +91,8 @@ export class RawEngine {
   private readonly outlet: Outlet;
   private readonly playout: Playout<AudioChunk>;
   private readonly nodes = new Set<AudioBufferSourceNode>();
+  /** 予約したコマを継ぎ目なく並べる (`seam.ts`)。止めたら保持していた終わりを破棄する (`stopAll`) */
+  private readonly seam: Seam;
   private readonly timer: ReturnType<typeof setInterval>;
   /** 画面の切り替わりを worker へ知らせる requestAnimationFrame (`cadence.ts`) */
   private frame = 0;
@@ -168,7 +179,8 @@ export class RawEngine {
        * (`background`)。切っているのに言うと、裏で鳴らす音として扱われる
        */
       playbackSession(background);
-      this.context = context = new AudioContext({ latencyHint: "playback" });
+      this.context = context = audioContext("playback");
+      this.seam = new Seam(context.sampleRate);
       this.gain = context.createGain();
       this.outlet = new Outlet(
         context,
@@ -201,7 +213,7 @@ export class RawEngine {
         {
           type: "init",
           canvas: offscreen,
-          decoder: `${resolve("")}${DECODER.slice(1)}`,
+          decoder: decoderBase(),
           input,
           follow: chase,
         },
@@ -231,7 +243,7 @@ export class RawEngine {
     this.outlet.want(background);
   }
 
-  /** 見えているかを worker へ (`visible`)。見えていない間は映像をデコードしない */
+  /** 見えているかを worker へ (`visible`)。見えていない間は映像をデコードしない (放送のままの MPEG-2 のとき) */
   private readonly onVisibility = (): void => {
     this.send({ type: "visible", on: document.visibilityState === "visible" });
   };
@@ -261,7 +273,7 @@ export class RawEngine {
     return this.context.state !== "running";
   }
 
-  /** 届いた TS を渡す。**写さずに worker へ移す** (1 局 15Mbit/s ぶんを毎秒写さない) */
+  /** 届いたものを `offset` から渡す (`messages.ts` の `data`)。**写さずに worker へ移す** (1 局 15 Mbit/s ぶんを毎秒写さない) */
   feed(buffer: ArrayBuffer, offset: number): void {
     this.send({ type: "data", buffer, offset }, [buffer]);
   }
@@ -269,7 +281,7 @@ export class RawEngine {
   /**
    * 選局し直した・録画で飛んだ。**前の局の音も映像の待ちも捨てる** (いま出ているフレームは、次が出るまで残る)。
    *
-   * `from` (90kHz。届くものの PTS の物差し。元の TS なら一周の中) を渡すと、そこから鳴らし・描き始める
+   * `from` (90 kHz。届くものの PTS の物差し。元の TS なら一周の中) を渡すと、そこから鳴らし・描き始める
    * (録画。`canvas-player.ts`)。サーバは飛び先の少し手前から流すので、手前のコマは描かずに捨て、
    * 音もそこから鳴らす。一周をまたぐかもしれないので、届いた最初のコマの近くに伸ばしてから決める
    */
@@ -285,6 +297,14 @@ export class RawEngine {
     this.finishing = false;
     if (!this.gone) this.resetting++;
     this.send({ type: "reset", from });
+  }
+
+  /**
+   * いま出ているフレームを隠す (映像の無い局を開いた)。**次のコマを描いたら (`shown`) また出す**。
+   * フレームは worker の canvas にあって画面の側から消せないので、canvas ごと見えなくする
+   */
+  hide(): void {
+    this.canvas.style.visibility = "hidden";
   }
 
   /**
@@ -359,7 +379,7 @@ export class RawEngine {
     return this.playout.playing;
   }
 
-  /** 放送の PTS (90kHz、一周の中) を、いま出しているものの近くへ伸ばす。**字幕と時計の通知用** */
+  /** 放送の PTS (90 kHz、一周の中) を、いま出しているものの近くへ伸ばす。**字幕と時計の通知用** */
   unwrap(pts: number): number {
     return this.near === null ? pts : unwrap(pts, this.near);
   }
@@ -440,9 +460,9 @@ export class RawEngine {
     if (!this.gone) this.worker.postMessage(message, transfer);
   }
 
-  private giveUp(reason: string): void {
+  private giveUp(reason: string, slow?: string): void {
     if (this.gone) return;
-    this.events.gaveUp(reason);
+    this.events.gaveUp(reason, slow);
   }
 
   private receive(message: FromWorker): void {
@@ -480,6 +500,8 @@ export class RawEngine {
         break;
       case "shown":
         this.shownAt = Date.now();
+        // 映像の無い局で隠した canvas を、映像のある局の 1 枚目で出し直す (`hide`)
+        this.canvas.style.visibility = "";
         this.events.shown();
         break;
       case "size":
@@ -494,7 +516,7 @@ export class RawEngine {
         this.decodeMs = message.p95;
         this.thinned = message.thinned;
         /*
-         * **外から読める形で出しておく。** 映像は worker の canvas にあって、画面の側からは
+         * **外から読めるように出しておく。** 映像は worker の canvas にあって、画面の側からは
          * 画素を読めない。描いたコマ数とデコードできた音のコマ数が進んでいれば、変換しない経路は動いている
          * (E2E が見る。手元で切り分けるときも DevTools で読める)
          */
@@ -503,7 +525,7 @@ export class RawEngine {
         this.canvas.dataset["thinned"] = String(message.thinned);
         break;
       case "fail":
-        this.giveUp(message.reason);
+        this.giveUp(message.reason, message.slow);
         break;
       case "full":
         if (!this.gone) this.events.full();
@@ -625,11 +647,16 @@ export class RawEngine {
     node.buffer = buffer;
     node.connect(this.gain);
     node.onended = () => this.nodes.delete(node);
-    node.start(scheduled.when, scheduled.offset);
+    const when = this.seam.place(
+      scheduled.when,
+      frames / chunk.sampleRate - scheduled.offset,
+    );
+    node.start(when, scheduled.offset);
     this.nodes.add(node);
   }
 
   private stopAll(): void {
+    this.seam.reset();
     for (const node of this.nodes) {
       try {
         node.stop();

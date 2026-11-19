@@ -2,7 +2,7 @@
  * 新しいバージョンが出ているか。**動いているバージョンと GitHub の最新のリリースを数で比べる。**
  *
  * 動いているバージョン (`config.version`) はリリースのイメージと、Mac・Windows のインストーラが書く
- * 起動スクリプトにだけ入っている。GitHub の
+ * 起動スクリプト、Android のリリースの APK にだけ入っている。GitHub の
  * 「最新のリリース」のタグを 1 時間に 1 度取り、向こうが新しければ設定の入口に点を付ける
  * (`+layout.svelte`)。Windows の通知領域と Mac のメニューバーのアプリ (`tray/`) は、同じものを `/api/health` で読む。
  *
@@ -35,7 +35,7 @@ interface Available {
 type Fetcher = (url: string, init: RequestInit) => Promise<Response>;
 
 let available: Available | null = null;
-/** 繋がらなかった。1 回だけ言う (1 時間おきに同じことを言わない) */
+/** 繋がらないことを警告したか。警告は 1 回だけ出す (1 時間おきに同じ警告を出さない) */
 let warned = false;
 
 /** 直近に見比べた結果。画面はこれを読むだけ */
@@ -83,7 +83,7 @@ export async function checkForUpdate(
       signal: AbortSignal.timeout(10_000),
     });
     if (res.status === 404) {
-      // 繋がった (リリースが 1 つも無いだけ)。次に繋がらなくなったら、また言う
+      // 繋がった (リリースが 1 つも無いだけ)。次に繋がらなくなったら、また警告する
       available = null;
       warned = false;
       return available;

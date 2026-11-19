@@ -6,6 +6,8 @@ import {
   audioLabel,
   audioTitles,
   audioTracks,
+  broadcastTrack,
+  dataAudio,
   genreLabel,
   genreName,
   parseAudios,
@@ -75,7 +77,7 @@ describe("audioLabel", () => {
     expect(audioLabel({ componentType: 1 })).toBe("モノラル");
   });
 
-  test("知らない種別は番号のまま残す", () => {
+  test("表に無い種別は番号のまま残す", () => {
     expect(audioLabel({ componentType: 99, langs: ["xyz"] })).toBe(
       "種別 99 (xyz)",
     );
@@ -120,7 +122,7 @@ describe("audioLabel", () => {
  */
 describe("audioTracks", () => {
   /** 普通のステレオ。選ぶものが無いので 1 つだけ = 画面は切り替えを出さない */
-  test("1本のステレオは1つだけ", () => {
+  test("1 本のステレオは 1 つだけ", () => {
     const tracks = audioTracks([{ componentType: 3, langs: ["jpn"] }]);
     expect(tracks).toHaveLength(1);
     expect(tracks[0]).toMatchObject({
@@ -134,7 +136,7 @@ describe("audioTracks", () => {
    * **デュアルモノは 1 本から 3 つ出る。** 音声は 1 本しか無く、左に主音声・右に
    * 副音声が入っている。テレビの「音声切換」と同じ 3 択に見せる
    */
-  test("デュアルモノは主・副・主+副の3つ", () => {
+  test("デュアルモノは主・副・主+副の 3 つ", () => {
     const tracks = audioTracks([{ componentType: 2, langs: ["jpn", "eng"] }]);
     expect(tracks.map((track) => track.label)).toEqual([
       "主音声 (日本語)",
@@ -157,7 +159,7 @@ describe("audioTracks", () => {
   });
 
   /** 音声そのものが 2 本以上。解説放送など。何本目かを添えないと見分けられない */
-  test("音声が2本あれば番号を添える", () => {
+  test("音声が 2 本あれば番号を添える", () => {
     const tracks = audioTracks([
       { componentType: 3, langs: ["jpn"] },
       { componentType: 3, langs: ["eng"] },
@@ -185,7 +187,7 @@ describe("audioTracks", () => {
   });
 
   /** 2 本目がデュアルモノということもある。**どちらの数え方も同時に効く** */
-  test("2本目がデュアルモノでも展開する", () => {
+  test("2 本目がデュアルモノでも展開する", () => {
     const tracks = audioTracks([
       { componentType: 3, langs: ["jpn"] },
       { componentType: 2, langs: ["jpn", "eng"] },
@@ -199,10 +201,76 @@ describe("audioTracks", () => {
    * **番組表が何も言っていなくても 1 つ返す。** 音声が無い放送は無いので、
    * 何も出せないより「そのまま出す」1 つを置くほうが確か
    */
-  test("何も分からなければそのまま出す1つ", () => {
+  test("何も分からなければそのまま出す 1 つ", () => {
     expect(audioTracks([])).toEqual([
       { id: "0:both", stream: 0, side: "both", label: "音声" },
     ]);
+  });
+});
+
+/**
+ * **PMT を読んだら、並びと本数は PMT に従う。** 番組表が主音声しか載せていなくても、
+ * 副音声の ES が PMT にあれば選べる (スポーツ中継の副音声で、番組表に載っていないもの)
+ */
+describe("audioTracks (PMT の音声の ES と突き合わせる)", () => {
+  const main = { componentType: 3, componentTag: 0x10, langs: ["jpn"] };
+
+  test("番組表に無い ES も「音声 N」として並べる", () => {
+    const tracks = audioTracks([{ ...main, main: true }], [0x10, 0x11]);
+    expect(tracks).toEqual([
+      {
+        id: "0:both",
+        stream: 0,
+        side: "both",
+        label: "音声 1 ステレオ (日本語)",
+        main: true,
+      },
+      { id: "1:both", stream: 1, side: "both", label: "音声 2" },
+    ]);
+  });
+
+  test("部品タグで突き合わせ、何本目かは PMT の並びで数える", () => {
+    const tracks = audioTracks(
+      [
+        { ...main, text: "主音声" },
+        { componentType: 3, componentTag: 0x11, langs: ["jpn"], text: "解説" },
+      ],
+      [0x11, 0x10],
+    );
+    expect(tracks.map((track) => [track.id, track.label])).toEqual([
+      ["0:both", "解説 (日本語)"],
+      ["1:both", "主音声 (日本語)"],
+    ]);
+  });
+
+  test("PMT に無い音声は並べない", () => {
+    const tracks = audioTracks(
+      [main, { componentType: 3, componentTag: 0x11, langs: ["eng"] }],
+      [0x10],
+    );
+    expect(tracks.map((track) => track.label)).toEqual(["ステレオ (日本語)"]);
+  });
+
+  test("部品タグを持たない番組表 (古い行) は、並びが PMT と同じとみなす", () => {
+    const tracks = audioTracks(
+      [{ componentType: 2, langs: ["jpn", "eng"] }],
+      [0x10, 0x11],
+    );
+    expect(tracks.map((track) => track.id)).toEqual([
+      "0:main",
+      "0:sub",
+      "0:both",
+      "1:both",
+    ]);
+  });
+
+  test("PMT に音声が無いか、音声に部品タグが 1 つも無ければ、番組表だけで決める", () => {
+    expect(audioTracks([main], [])).toEqual(audioTracks([main]));
+    const two = [
+      main,
+      { componentType: 3, componentTag: 0x11, langs: ["jpn"] },
+    ];
+    expect(audioTracks(two, [null])).toEqual(audioTracks(two));
   });
 });
 
@@ -218,9 +286,20 @@ describe("pickTrack", () => {
     expect(pickTrack(tracks, "0:sub").side).toBe("sub");
   });
 
-  test("無いものを指定されたら先頭", () => {
+  test("無いものを指定されたら、主音声を言っていなければ先頭", () => {
     expect(pickTrack(tracks, "1:sub").id).toBe("0:main");
     expect(pickTrack(tracks, undefined).id).toBe("0:main");
+  });
+
+  // データ放送が選んだ音声 (`N:es`。J:COM テレビのラジオ選局) は番組表に無くても、その ES を選ぶ
+  test("データ放送が選んだ音声は、番組表の一覧に無くても PMT の音声の N 本目を選ぶ", () => {
+    expect(pickTrack(tracks, "2:es")).toEqual({
+      id: "2:es",
+      stream: 2,
+      side: "both",
+      label: "データ放送の音声",
+    });
+    expect(askedTrack("2:es")).toBe("2:es");
   });
 
   /*
@@ -260,7 +339,7 @@ describe("parseAudios", () => {
     ).toEqual(["0:main", "0:sub", "0:both"]);
   });
 
-  test("どちらも無ければ空 (audioTracks は「音声」を1つ返す)", () => {
+  test("どちらも無ければ空 (audioTracks は「音声」を 1 つ返す)", () => {
     expect(parseAudios({ audio_type: null, audios: null })).toEqual([]);
     expect(parseAudios(undefined)).toEqual([]);
   });
@@ -318,7 +397,7 @@ describe("videoLabel", () => {
  */
 describe("audioTitles", () => {
   /** デュアルモノは 1 本を左右に割るので、出てくるのは**必ず 2 本** */
-  test("デュアルモノは主音声と副音声の2本", () => {
+  test("デュアルモノは主音声と副音声の 2 本", () => {
     expect(
       audioTitles([{ componentType: 2, langs: ["jpn", "eng"] }], true),
     ).toEqual(["主音声 (日本語)", "副音声 (英語)"]);
@@ -343,13 +422,13 @@ describe("audioTitles", () => {
   });
 
   /** 1 本だけのときは「音声 1」のような番号を足さない。長いだけで何も増えない */
-  test("1本なら番号を足さない", () => {
+  test("1 本なら番号を足さない", () => {
     expect(audioTitles([{ componentType: 3, langs: ["jpn"] }], false)).toEqual([
       "ステレオ (日本語)",
     ]);
   });
 
-  /** 古い録画には写しが無い。**それでも名前は付ける** */
+  /** 古い録画には `audios` が無い。**それでも名前は付ける** */
   test("何も分からなければ「音声」", () => {
     expect(audioTitles([], false)).toEqual(["音声"]);
   });
@@ -390,7 +469,7 @@ describe("seriesLabels", () => {
     expect(labels(null)).toEqual([]);
   });
 
-  test("再放送の印が 0 でなければ再放送。0 (オリジナル) と NULL (記述子なし) は何も言わない", () => {
+  test("再放送の印が 0 でなければ再放送。0 と NULL (記述子なし) は何も言わない", () => {
     expect(labels(3, null, 1)).toEqual(["第 3 話", "再放送"]);
     expect(labels(3, null, 0)).toEqual(["第 3 話"]);
     expect(labels(null, null, null)).toEqual([]);
@@ -404,5 +483,30 @@ describe("audioChannels", () => {
     expect(audioChannels(9)).toBe(6);
     expect(audioChannels(2)).toBeUndefined();
     expect(audioChannels(7)).toBeUndefined();
+  });
+});
+
+/**
+ * データ放送が主音声を替えたときにライブで選ぶ音声 (`dataAudio`)。戻したときは、見ている人が選び直していればそちらを残す
+ */
+describe("dataAudio", () => {
+  const tracks = [
+    ...audioTracks([
+      { componentType: 3, main: false },
+      { componentType: 3, main: true },
+    ]),
+    broadcastTrack("2:es")!,
+  ];
+
+  test("替えたら N:es を選ぶ", () => {
+    expect(dataAudio(2, "1:both", tracks)).toBe("2:es");
+  });
+
+  test("戻したら、データ放送の音声のままなら番組表の主音声に戻す", () => {
+    expect(dataAudio(null, "2:es", tracks)).toBe("1:both");
+  });
+
+  test("戻したとき、見ている人が選び直していればそのまま (null)", () => {
+    expect(dataAudio(null, "0:both", tracks)).toBeNull();
   });
 });

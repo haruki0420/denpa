@@ -1,15 +1,28 @@
 import { read, write } from "#lib/keep.js";
-import { type GrabSize, shrink } from "#lib/raw/messages.js";
+import type { GrabSize } from "#lib/raw/messages.js";
 
 import { AMBIENT_KEY, storedAmbient } from "./ambient";
 import type { GlanceReply, GlanceRequest } from "./glance-worker";
+
+/**
+ * `createImageBitmap` に渡す縮め方。**`VideoFrame` の無いブラウザで、画面の側で `<video>` を縮めるときだけ使う**
+ * (worker の中は `#lib/raw/downscale.ts`、`<video>` のコマは `glance-worker.ts`)。`high` で縮める。低いほど 1920 から 32 へ点で間引き、
+ * 写すたびに色が揺れる
+ */
+function shrink(size: GrabSize): ImageBitmapOptions {
+  return {
+    resizeWidth: size.width,
+    resizeHeight: size.height,
+    resizeQuality: "high",
+  };
+}
 
 /**
  * アンビエントモード。**映像の色を、枠の周りにぼかして広げる。3 画面 (ライブ・追っかけ・観る画面) で同じもの。既定はオン。**
  *
  * 光を描くのは `AmbientGlow.svelte` (舞台 `PlayerStage` が枠の周りに置く。テーブルトップの間は代わりに
  * 反射の `FoldReflection.svelte`)。ここが持つのは
- * オン/オフと、いまのコマを小さく写す手立て:
+ * オン/オフと、いまのコマを小さく写す手立て。
  *
  * - `<video>` で観ているとき … コマ (`VideoFrame`) を worker に渡して縮めてもらう (`glance-worker.ts`)。
  *   `VideoFrame` の無いブラウザは画面の側で `createImageBitmap` で縮める
@@ -45,12 +58,12 @@ export function ambientMode(options: Options): Ambient {
     on = storedAmbient(read(AMBIENT_KEY));
   });
 
-  /** `<video>` のコマを縮める worker。初めて要るときに作り、画面を離れたら畳む */
+  /** `<video>` のコマを縮める worker。初めて要るときに作り、画面を離れたら終了する */
   let worker: Worker | null = null;
   let broken = false;
   let asked = 0;
   const waiting = new Map<number, (bitmap: ImageBitmap | null) => void>();
-  /** worker を畳み、待っているものには null を返す */
+  /** worker を終了し、待っているものには null を返す */
   function retire(): void {
     worker?.terminate();
     worker = null;
@@ -85,7 +98,7 @@ export function ambientMode(options: Options): Ambient {
         if (settle === undefined) event.data.bitmap?.close();
         else settle(event.data.bitmap);
       };
-      // 読み込めない (CSP など) なら、もう使わない。worker は畳み、画面の側で縮める
+      // 読み込めない (CSP など) なら、もう使わない。worker は終了し、画面の側で縮める
       worker.onerror = () => {
         broken = true;
         retire();

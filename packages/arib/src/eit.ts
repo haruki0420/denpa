@@ -66,6 +66,12 @@ const OTHER_SHIFT = SCHEDULE_OTHER_MIN - SCHEDULE_ACTUAL_MIN;
 
 interface EventAudio {
   componentType: number;
+  /**
+   * 部品タグ (component_tag)。**PMT の音声の ES と突き合わせる** (PMT の stream_identifier_descriptor と同じ値)。
+   * 番組表の並びと PMT の並びは揃うとは限らず、番組表に無い音声の ES が PMT にだけあることもある。
+   * 4K の局 (MH-EIT。`mh-eit.ts`) は PMT が無いので持たない
+   */
+  componentTag?: number;
   langs: string[];
   samplingRate?: number;
   /**
@@ -124,7 +130,7 @@ export interface EitEvent {
   /** 尺 (ms)。未定なら null。番組表に入れられるのは決まっているものだけ */
   duration: number | null;
   isFree: boolean;
-  /** 1=まもなく 2=停止中 3=一時停止 4=放送中。p/f の「いま」を見分けるのに使う */
+  /** 0=未定義 1=非実行中 2=数秒以内に開始 3=停止中 4=放送中 (STD-B10)。p/f の「いま」を見分けるのに使う */
   runningStatus: number;
   name: string;
   description: string;
@@ -150,7 +156,7 @@ export interface EitEvent {
    */
   series?: EitSeries | null;
   /**
-   * CA契約情報記述子 (0xCB) の contract_verification_info。
+   * CA 契約情報記述子 (0xCB) の contract_verification_info。
    * 有料放送の契約確認・復号判定に使う (B-CAS の 0x90 0x3C コマンド)。
    * 載っていなければ null。詳細の表では言っていないので undefined。
    */
@@ -187,10 +193,10 @@ const TABLE_TOT = 0x73;
 /**
  * TDT / TOT のセクションから**放送の実時刻**を読む。別のテーブルなら null。
  *
- * 頭 3 バイトのあとに MJD + BCD が 5 バイト。**TOT も同じ並び**で、後ろに
+ * 先頭 3 バイトのあとに MJD + BCD が 5 バイト。**TOT も同じ並び**で、後ろに
  * 時差の記述子が付くだけなので同じに読める。
  *
- * データ放送 (`bml.ts` の `onTime`) が読み、BML の時計にします
+ * データ放送 (`bml.ts` の `onTime`) が読んで、BML の時計にする
  */
 export function parseTimeTable(section: Uint8Array): number | null {
   if (section[0] !== TABLE_TDT && section[0] !== TABLE_TOT) return null;
@@ -249,8 +255,8 @@ const VIDEO_CODEC: Record<number, string> = {
   9: "h.265",
 };
 
-/** audio_component_descriptor の sampling_rate。3 ビットの符号 */
-const SAMPLING_RATE: Record<number, number> = {
+/** audio_component_descriptor の sampling_rate。3 ビットの符号 (MH-音声コンポーネント記述子も同じ符号。`mh-eit.ts`) */
+export const SAMPLING_RATE: Record<number, number> = {
   1: 16000,
   2: 22050,
   3: 24000,
@@ -259,7 +265,40 @@ const SAMPLING_RATE: Record<number, number> = {
   7: 48000,
 };
 
-const lang = (data: Uint8Array, at: number) => ascii(data, at, 3).toLowerCase();
+/** ISO 639-2 の言語の符号 (3 文字) を小文字で読む */
+export const languageCode = (data: Uint8Array, at: number): string =>
+  ascii(data, at, 3).toLowerCase();
+
+/**
+ * 拡張形式イベントの項目を見出しごとに集める。**部分はバイトのまま持ち、項目の部分が全部揃ってから文字にする**
+ * (理由は `readDescriptors`)。見出しが空の項目は直前の項目の続き。見出しがあれば、同じ見出しでも新しい項目。
+ * MH-EIT (`mh-eit.ts`) も同じ決まりで使う
+ */
+export class ExtendedItems {
+  /** 見出しごとの項目。項目はバイト列の部分の並び (Map なので見出しの出てきた順に並ぶ) */
+  private readonly items = new Map<string, Uint8Array[][]>();
+  private lastHeading = "";
+
+  add(heading: string, text: Uint8Array): void {
+    if (heading === "") {
+      if (this.lastHeading === "") return;
+      this.items.get(this.lastHeading)!.at(-1)!.push(text);
+      return;
+    }
+    const items = this.items.get(heading);
+    if (items === undefined) this.items.set(heading, [[text]]);
+    else items.push([text]);
+    this.lastHeading = heading;
+  }
+
+  /** 項目ごとに文字にして、同じ見出しの項目は文字で繋ぐ */
+  decode(decode: (bytes: Uint8Array) => string): Record<string, string> {
+    const result: Record<string, string> = {};
+    for (const [heading, items] of this.items)
+      result[heading] = items.map((parts) => decode(joinBytes(parts))).join("");
+    return result;
+  }
+}
 
 /**
  * 記述子を読んで番組の中身を埋める。
@@ -268,37 +307,33 @@ const lang = (data: Uint8Array, at: number) => ascii(data, at, 3).toLowerCase();
  * 見出しごとに繋ぎ直さないと、長い説明が途中で切れる。見出しが空の項目は
  * 「直前の項目の続き」という意味なので、そこにも繋ぐ。
  *
- * **繋ぐのはデコードする前、バイトのうちに。** 部分ごとにデコードして文字列を繋いで
- * いた頃は、続きが**別の文字で出て**いました (実機の「音楽制作ずはのづ ねふびどっ」。
+ * **繋ぐのはデコードする前、バイトのうちに。** 部分ごとにデコードして文字列を繋ぐと、
+ * 続きが**別の文字で出る** (実機の「音楽制作ずはのづ ねふびどっ」。
  * 正しくは「音楽制作:ONE MUSIC」)。分割点は
  *
  * - **二バイト文字の途中**に来ることがある (片割れだけでは字にならない)
  * - **文字集合の状態を持ち越す。** G0〜G3 の指示も GL/GR の呼び出しも、
  *   続きの側には書き直されない。前の状態のまま読む前提で送られてくる
  *
- * ので、部分だけを単独でデコードすると、そこから先が崩れます。
+ * ので、部分だけを単独でデコードすると、そこから先が崩れる。
  *
  * **ただし見出しのある項目は、同じ見出しでも別の項目として最初の状態から読む。** 見出しが同じ
  * 項目が 2 つ続けて来る局があり (BS日テレの「番組内容」)、2 つ目は最初の状態 (漢字) から読む前提で
  * 送られている。1 つ目が英数字に切り替えたまま (`0e 21 3f` = LS1 のあと「!?」) 終わっていると、
- * バイトのまま繋いだ頃は 2 つ目の漢字が英数字で出ていた (実機の「いずれ「６＇ＭｐＮａ＞ｎ」と８Ｆばれる」。
+ * バイトのまま繋ぐと 2 つ目の漢字が英数字で出る (実機の「いずれ「６＇ＭｐＮａ＞ｎ」と８Ｆばれる」。
  * 正しくは「いずれ「凶乱令嬢」と呼ばれる」)。項目ごとにデコードして、文字で繋ぐ
  */
 function readDescriptors(event: EitEvent, body: Uint8Array): void {
-  /**
-   * 見出しごとの項目。項目はバイト列の部分の並びで、**項目の部分が全部揃ってからデコードする**
-   * (Map なので見出しの出てきた順に並ぶ)
-   */
-  const pending = new Map<string, Uint8Array[][]>();
-  let lastHeading = "";
+  const extended = new ExtendedItems();
 
   for (const [tag, data] of descriptors(body)) {
     switch (tag) {
       case DESC_SHORT_EVENT: {
+        if (data.length < 4) break;
         const nameLength = data[3]!;
         const textAt = 4 + nameLength;
         event.name = decodeAribText(data.subarray(4, textAt));
-        const textLength = data[textAt]!;
+        const textLength = data[textAt] ?? 0;
         event.description = decodeAribText(
           data.subarray(textAt + 1, textAt + 1 + textLength),
         );
@@ -316,17 +351,7 @@ function readDescriptors(event: EitEvent, body: Uint8Array): void {
           const textLength = data[at]!;
           const text = data.subarray(at + 1, at + 1 + textLength);
           at += 1 + textLength;
-
-          // 見出しが空なら前の項目の続き (バイトのまま繋ぐ)。見出しがあれば、同じ見出しでも新しい項目
-          if (heading === "") {
-            if (lastHeading === "") continue;
-            pending.get(lastHeading)!.at(-1)!.push(text);
-            continue;
-          }
-          const items = pending.get(heading);
-          if (items === undefined) pending.set(heading, [[text]]);
-          else items.push([text]);
-          lastHeading = heading;
+          extended.add(heading, text);
         }
         break;
       }
@@ -337,6 +362,8 @@ function readDescriptors(event: EitEvent, body: Uint8Array): void {
         break;
       }
       case DESC_COMPONENT: {
+        // 短いものを読むと、種別 0 の「480i」と出る
+        if (data.length < 2) break;
         const streamContent = data[0]! & 0x0f;
         const componentType = data[1]!;
         event.video = {
@@ -359,16 +386,19 @@ function readDescriptors(event: EitEvent, body: Uint8Array): void {
        *     [残り]   text_char … **放送が付けた名前**
        */
       case DESC_AUDIO_COMPONENT: {
+        // 言語の符号まで無いものを読むと、言語が空の音声が 1 本増える
+        if (data.length < 9) break;
         const flags = data[5]!;
         const multiLingual = (flags & 0x80) !== 0;
-        const langs = [lang(data, 6)];
-        if (multiLingual) langs.push(lang(data, 9));
+        const langs = [languageCode(data, 6)];
+        if (multiLingual) langs.push(languageCode(data, 9));
         const text = decodeAribText(
           data.subarray(6 + (multiLingual ? 6 : 3)),
         ).trim();
         const samplingRate = SAMPLING_RATE[(flags >> 1) & 0x07];
         event.audios.push({
           componentType: data[1]!,
+          componentTag: data[2]!,
           langs,
           // 表に無い符号 (予約) なら付けない
           ...(samplingRate === undefined ? {} : { samplingRate }),
@@ -383,7 +413,7 @@ function readDescriptors(event: EitEvent, body: Uint8Array): void {
       }
       case DESC_CA_CONTRACT_INFO: {
         if (data.length < 4) break;
-        const caSystemId = (data[0]! << 8) | data[1]!;
+        const caSystemId = u16(data, 0);
         const numOfComponent = data[2]! & 0x0f;
         let at = 3 + numOfComponent;
         if (at >= data.length) break;
@@ -391,7 +421,7 @@ function readDescriptors(event: EitEvent, body: Uint8Array): void {
         at++;
         if (at + cviLength <= data.length && cviLength > 0) {
           const cvi = data.subarray(at, at + cviLength);
-          // B-CAS (0x0005) を優先。まだ無ければ拾う
+          // B-CAS (0x0005) を優先。まだ無ければこれを使う
           if (
             caSystemId === 0x0005 ||
             event.contractVerification === undefined ||
@@ -431,10 +461,68 @@ function readDescriptors(event: EitEvent, body: Uint8Array): void {
   }
 
   // 項目ごとに、部分が全部揃ってからデコードする (分割点が二バイト文字や文字集合の途中に来るため)
-  for (const [heading, items] of pending)
-    event.extended[heading] = items
-      .map((parts) => decodeAribText(joinBytes(parts)))
-      .join("");
+  event.extended = extended.decode(decodeAribText);
+}
+
+/**
+ * EIT と MH-EIT のセクションの見出しと番組の並びを読む。**並びは同じで、違うのは記述子の読み方** (`read`)。
+ * `tableId`・`lastTableId` は TS の番号に直したもの。詳細の表 (0x58〜) は基本の記述子を載せないので、
+ * コピー制御は null (「この表は言っていない」)、基本の表だけに付ける項目 (`basic`) は付けない。
+ * 長さの合わない番組の手前まで返す
+ */
+export function readEitSection(
+  section: Uint8Array,
+  tableId: number,
+  lastTableId: number,
+  basic: Partial<EitEvent>,
+  read: (event: EitEvent, body: Uint8Array) => void,
+): EitSection {
+  const extended = tableId >= SCHEDULE_ACTUAL_EXTENDED;
+  const result: EitSection = {
+    tableId,
+    serviceId: u16(section, 3),
+    version: (section[5]! >> 1) & 0x1f,
+    sectionNumber: section[6]!,
+    lastSectionNumber: section[7]!,
+    transportStreamId: u16(section, 8),
+    originalNetworkId: u16(section, 10),
+    segmentLastSectionNumber: section[12]!,
+    lastTableId,
+    events: [],
+  };
+
+  let at = 14;
+  const end = section.length - 4;
+  while (at + 12 <= end) {
+    const descriptorsLength = u16(section, at + 10) & 0x0fff;
+    const body = section.subarray(at + 12, at + 12 + descriptorsLength);
+    const event: EitEvent = {
+      serviceId: result.serviceId,
+      transportStreamId: result.transportStreamId,
+      originalNetworkId: result.originalNetworkId,
+      eventId: u16(section, at),
+      startAt: parseMjdTime(section, at + 2),
+      duration: parseBcdDuration(section, at + 7),
+      runningStatus: (section[at + 10]! >> 5) & 0x07,
+      isFree: (section[at + 10]! & 0x10) === 0,
+      name: "",
+      description: "",
+      extended: {},
+      genres: [],
+      audios: [],
+      video: null,
+      // 記述子が無ければ「禁止ではない」。詳細の表はもとから載せないので「言っていない」
+      copyNever: extended ? null : false,
+      ...(extended ? {} : basic),
+    };
+    at += 12 + descriptorsLength;
+    if (body.length < descriptorsLength) break;
+
+    read(event, body);
+    result.events.push(event);
+  }
+
+  return result;
 }
 
 /**
@@ -460,57 +548,14 @@ export function parseEit(
     raw <= SCHEDULE_OTHER_MAX;
   if (!other && !isEitActual(raw)) return null;
   const shift = other ? OTHER_SHIFT : 0;
-  const tableId = raw - shift;
-
-  const result: EitSection = {
-    tableId,
-    serviceId: u16(section, 3),
-    version: (section[5]! >> 1) & 0x1f,
-    sectionNumber: section[6]!,
-    lastSectionNumber: section[7]!,
-    transportStreamId: u16(section, 8),
-    originalNetworkId: u16(section, 10),
-    segmentLastSectionNumber: section[12]!,
-    lastTableId: section[13]! - shift,
-    events: [],
-  };
-
-  let at = 14;
-  const end = section.length - 4;
-  while (at + 12 <= end) {
-    const descriptorsLength = u16(section, at + 10) & 0x0fff;
-    const body = section.subarray(at + 12, at + 12 + descriptorsLength);
-    const event: EitEvent = {
-      serviceId: result.serviceId,
-      transportStreamId: result.transportStreamId,
-      originalNetworkId: result.originalNetworkId,
-      eventId: u16(section, at),
-      startAt: parseMjdTime(section, at + 2),
-      duration: parseBcdDuration(section, at + 7),
-      runningStatus: (section[at + 10]! >> 5) & 0x07,
-      isFree: (section[at + 10]! & 0x10) === 0,
-      name: "",
-      description: "",
-      extended: {},
-      genres: [],
-      audios: [],
-      video: null,
-      // 記述子が無ければ「禁止ではない」。詳細の表はもとから載せないので「言っていない」
-      copyNever: tableId >= SCHEDULE_ACTUAL_EXTENDED ? null : false,
-      // シリーズも同じ。載っていなければ「シリーズではない」、詳細の表なら「言っていない」
-      ...(tableId >= SCHEDULE_ACTUAL_EXTENDED ? {} : { series: null }),
-      ...(tableId >= SCHEDULE_ACTUAL_EXTENDED
-        ? {}
-        : { contractVerification: null }),
-    };
-    at += 12 + descriptorsLength;
-    if (body.length < descriptorsLength) break;
-
-    readDescriptors(event, body);
-    result.events.push(event);
-  }
-
-  return result;
+  return readEitSection(
+    section,
+    raw - shift,
+    section[13]! - shift,
+    // シリーズもコピー制御と同じ。載っていなければ「シリーズではない」、詳細の表なら「言っていない」
+    { series: null, contractVerification: null },
+    readDescriptors,
+  );
 }
 
 /**
@@ -524,9 +569,8 @@ export function parseEit(
  * 使われている最後の番号が `segment_last_section_number`。使われていない番号は
  * 永久に来ないので、そこまで揃えばそのセグメントは終わり。
  *
- * **過ぎた時間帯のセグメントは流れてこない** (`stale`)。空でも先頭の 1 本は必ず
- * 来るものとして待っていた頃は、**どのチャンネルも例外なく上限まで
- * 開きっぱなし**になっていた (実機 14 チャンネル、揃って離せたのは 0 本)。
+ * **過ぎた時間帯のセグメントは流れてこない** (`stale`)。空でも先頭の 1 本は必ず来るものとして
+ * 待つと、どのチャンネルも上限まで開いたままになる (実機の 14 チャンネルで、揃って離せたのは 0)。
  */
 export class ScheduleProgress {
   /** `table_id` → 受け取ったセクション番号 */
@@ -541,9 +585,9 @@ export class ScheduleProgress {
    *
    * **バージョンは `table_id` ごとに別々に振られる。** 番組表の 1 つの表 (sub_table) は
    * `table_id` + 局 + TS で決まり、`version_number` はその単位で動く。
-   * 局に 1 つだけ持っていた頃は、**基本 (0x50〜) と詳細 (0x58〜) を行き来する
-   * たびにバージョンが違って数えたものを全部捨てて**いた。揃ったと分かることが
-   * 二度と無いので、どのチャンネルも上限の 10 分 (denpa の `epgChannelTimeout`) まで開きっぱなしになる。
+   * 局に 1 つだけ持つと、**基本 (0x50〜) と詳細 (0x58〜) を行き来するたびにバージョンが違い、
+   * 数えたものを全部捨てる。** 揃ったと分かることが無く、どのチャンネルも上限の 10 分
+   * (denpa の `epgChannelTimeout`) まで開いたままになる。
    */
   private readonly version = new Map<number, number>();
 
@@ -582,13 +626,13 @@ export class ScheduleProgress {
    * **番号が飛ぶ。** 1 つの `table_id` が受け持つのは 4 日ぶんで、基本は
    * `0x50` から、詳細は `0x58` から始まる。日本の放送は 8 日ぶんなので、
    * 実際に流れてくるのは `0x50` `0x51` と `0x58` `0x59` あたりだけで、
-   * **`0x52`〜`0x57` は永久に来ません**。
+   * **`0x52`〜`0x57` は永久に来ない**。
    *
-   * `0x50` から `last_table_id` まで全部を待っていた頃は、詳細を積んでいる局が
-   * **一度も「揃った」にならず**、どのチャンネルも上限の 10 分 (denpa の `epgChannelTimeout`) まで開きっぱなしに
-   * なっていました (実機で、詳細の無い BS11 だけが早く閉じていた)。
+   * `0x50` から `last_table_id` まで全部を待つと、詳細を持つ局が**一度も「揃った」にならず**、
+   * どのチャンネルも上限の 10 分 (denpa の `epgChannelTimeout`) まで開いたままになる
+   * (実機で、詳細の無い BS11 だけが早く閉じていた)。
    *
-   * 見かけた表と、`last_table_id` が指す表だけを見ます。
+   * 見かけた表と、`last_table_id` が指す表だけを見る。
    */
   get complete(): boolean {
     if (this.seen.size === 0) return false;
@@ -600,7 +644,7 @@ export class ScheduleProgress {
     return true;
   }
 
-  /** その表でまだ来ていない節。セグメントの先頭すら来ていなければ、先頭の番号を数える */
+  /** その表でまだ来ていないセクション。セグメントの先頭すら来ていなければ、先頭の番号を数える */
   private holes(tableId: number): number[] {
     const numbers = this.seen.get(tableId) ?? new Set<number>();
     const last = this.lastSection.get(tableId) ?? 0;
@@ -622,10 +666,10 @@ export class ScheduleProgress {
   /**
    * そのセグメントの時間帯がもう過ぎているか。**過ぎたものは待たない。**
    *
-   * セグメントは 0:00 から 3 時間ずつの枠で、`table_id` と節番号から
+   * セグメントは 0:00 から 3 時間ずつの枠で、`table_id` とセクション番号から
    * それがいつの枠なのかが決まる。基本は `0x50` が当日 0:00 から 4 日ぶん、
    * `0x51` がその次の 4 日ぶん。詳細 (`0x58`〜) も同じ並びをもう一度たどる。
-   * 終わった枠は放送に乗らない (クラスの説明)。そのぶんの番組は、そこが未来だった数日前に取り込んである。
+   * 終わった枠は放送されない (クラスの説明)。そのぶんの番組は、そこが未来だった数日前に取り込んである。
    */
   private stale(tableId: number, start: number): boolean {
     const base =
@@ -643,12 +687,10 @@ export class ScheduleProgress {
   /**
    * 何が足りないか。**上限まで開いても揃わなかったときに出す。**
    *
-   * 揃ったかどうかしか分からなかった頃は、上限まで開きっぱなしになっている局を
-   * 見つけても**その先を追えなかった。** 電波が弱くて欠けているのか、
-   * こちらが来ない表を待っているのかで、直し方がまるで違う。
+   * 電波が弱くて欠けているのか、こちらが来ない表を待っているのかで、直し方がまるで違う。
    */
   report(): string {
-    if (this.seen.size === 0) return "EIT[schedule] が1つも来ていない";
+    if (this.seen.size === 0) return "EIT[schedule] が 1 つも来ていない";
     if (!this.seen.has(this.lastTableId)) {
       const seen = [...this.seen.keys()].map(hex).join(",");
       return `最後の表 ${hex(this.lastTableId)} が一度も来ない (来たのは ${seen})`;
@@ -660,13 +702,13 @@ export class ScheduleProgress {
       if (holes.length > 0) {
         const head = holes.slice(0, 8).join(",");
         missing.push(
-          `${hex(tableId)} の ${head}${holes.length > 8 ? ` ほか${holes.length - 8}` : ""}`,
+          `${hex(tableId)} の ${head}${holes.length > 8 ? ` ほか ${holes.length - 8}` : ""}`,
         );
       }
     }
     return missing.length === 0
       ? "揃っている"
-      : `来ていない節: ${missing.join(" / ")}`;
+      : `来ていないセクション: ${missing.join(" / ")}`;
   }
 }
 
@@ -718,28 +760,33 @@ export class EpgReader {
     for (const packet of this.packets.feed(chunk)) {
       for (const raw of this.sections.feed(packet)) {
         const section = parseEit(raw, this.options);
-        if (section === null) continue;
-        if (section.tableId >= SCHEDULE_ACTUAL_MIN) {
-          if (!this.progress.has(section.serviceId))
-            this.lastNewService = this.now();
-          const progress =
-            this.progress.get(section.serviceId) ??
-            new ScheduleProgress(this.now);
-          progress.add(section);
-          this.progress.set(section.serviceId, progress);
-        }
-        for (const event of section.events) {
-          if (
-            section.tableId === TABLE_PF_ACTUAL &&
-            this.onAir(section, event)
-          ) {
-            this.present.set(event.serviceId, event);
-          }
-          if (event.startAt === null || event.duration === null) continue;
-          this.merge(event);
-          added = true;
-        }
+        if (section !== null && this.add(section)) added = true;
       }
+    }
+    return added;
+  }
+
+  /**
+   * 読んだセクションを 1 つ足す。番組が 1 つでも増えたら true。
+   * 4K の放送の番組表 (`mh-eit.ts` の `MmtEpgReader`) は、読み方だけを替えてここに渡す
+   */
+  protected add(section: EitSection): boolean {
+    let added = false;
+    if (section.tableId >= SCHEDULE_ACTUAL_MIN) {
+      if (!this.progress.has(section.serviceId))
+        this.lastNewService = this.now();
+      const progress =
+        this.progress.get(section.serviceId) ?? new ScheduleProgress(this.now);
+      progress.add(section);
+      this.progress.set(section.serviceId, progress);
+    }
+    for (const event of section.events) {
+      if (section.tableId === TABLE_PF_ACTUAL && this.onAir(section, event)) {
+        this.present.set(event.serviceId, event);
+      }
+      if (event.startAt === null || event.duration === null) continue;
+      this.merge(event);
+      added = true;
     }
     return added;
   }
@@ -753,8 +800,8 @@ export class EpgReader {
    * - **基本** (table_id 0x50〜0x57) … タイトルと短い説明 (short_event_descriptor)
    * - **詳細** (0x58〜0x5F) … 「番組内容」「出演者」など (extended_event_descriptor)
    *
-   * あとから来たもので丸ごと置き換えていた頃は、**詳細のほうが後に届いた番組の
-   * タイトルが空になっていた**。実機では番組 23,000 件のうち 11,000 件が名無しで、
+   * あとから来たもので丸ごと置き換えると、**詳細のほうが後に届いた番組の
+   * タイトルが空になる**。実機では番組 23,000 件のうち 11,000 件が名無しで、
    * うち 2,700 件は「タイトルは無いのに番組内容だけある」状態で、詳細に上書きされた
    * 跡そのもの。番組表には「(番組情報なし)」の列が並んでいた。
    *
@@ -796,13 +843,13 @@ export class EpgReader {
    * p/f で「いま流れている」と言えるか。
    *
    * **`running_status` を当てにしきれない。** 4 (放送中) を入れてくる局も
-   * あれば、**0 (未定義) しか入れてこない局もある。** 実機の NHK は 74 節
+   * あれば、**0 (未定義) しか入れてこない局もある。** 実機の NHK は 74 セクション
    * ぜんぶ 0 だった。4 だけを見ていると、そういう局では延長追従が丸ごと
    * 効かなくなる (denpa の docs/data.md)。
    *
-   * そこで 0 のときは**節の番号で決める**。p/f は仕様で
+   * そこで 0 のときは**セクションの番号で決める**。p/f は仕様で
    * **section 0 が現在・section 1 が次**と決まっていて、こちらは局の都合で
-   * 変わらない。1 (まもなく) や 2 (停止中) は今までどおり入れない。
+   * 変わらない。1〜3 (非実行中・数秒以内に開始・停止中) は今までどおり入れない。
    */
   private onAir(section: EitSection, event: EitEvent): boolean {
     if (event.runningStatus === 4) return true;
@@ -850,7 +897,7 @@ export class EpgReader {
     /*
      * ほかの TS の局まで読むときは、**来るはずの局が全部見えるか、しばらく新しい局が
      * 出てこないことも待つ。** 局ごとに流れてくる順はばらばらで、見かけた局が
-     * 揃っただけではまだ 1 度も来ていない局を置いていく。来るはずの局を知っていれば
+     * 揃っただけではまだ 1 度も来ていない局を置いていく。来るはずの局 (`expect`) が渡されていれば
      * すぐ閉じられる (WebTS.app・Mirakurun と同じ)
      */
     if (
@@ -901,7 +948,9 @@ export class EpgReader {
  *
  * **中身で比べる。** 書き換われば version が上がるはずだが、上げずに中身だけ替える
  * 送り手を当てにしないよう、番組の番号・時刻・尺・タイトルで比べる。p/f は 1 局ぶん数百バイトが
- * 数秒おきに来るだけなので、毎回読んでも軽い
+ * 数秒おきに来るだけなので、毎回読んでも軽い。
+ *
+ * 4K の放送 (MMT/TLV) の MH-EIT[p/f] は、読み方だけを替えた `mh-eit.ts` の `MmtPresentFollowing` で追う
  */
 export class PresentFollowing {
   private readonly sections = new SectionAssembler(PID_EIT);
@@ -911,7 +960,7 @@ export class PresentFollowing {
   private readonly marks: [string | null, string | null] = [null, null];
 
   /** @param serviceId 追う局 (放送が名乗っている service_id) */
-  constructor(private readonly serviceId: number) {}
+  constructor(protected readonly serviceId: number) {}
 
   /** いま流れている番組。まだ来ていない・放送が空けているなら null */
   get present(): EitEvent | null {
@@ -925,7 +974,7 @@ export class PresentFollowing {
 
   /**
    * 188 バイトのパケットを 1 つ。**いまか次のどちらかが変わったら true**。
-   * 最初に読めたときも true (知らなかったものが分かった)
+   * 最初に読めたときも true
    */
   feedPacket(packet: Uint8Array): boolean {
     let changed = false;
@@ -933,21 +982,28 @@ export class PresentFollowing {
       // 番組表 (schedule) と他局の p/f は読まずに捨てる。同じ PID に流れてくる
       if (raw[0] !== TABLE_PF_ACTUAL || raw.length < 18) continue;
       if (u16(raw, 3) !== this.serviceId) continue;
-      const section = parseEit(raw);
-      if (section === null || section.sectionNumber > 1) continue;
-      const slot = section.sectionNumber as 0 | 1;
-      const event = section.events[0] ?? null;
-      const mark = event === null ? "" : markOf(event);
-      if (this.marks[slot] === mark) continue;
-      this.marks[slot] = mark;
-      this.held[slot] = event;
-      changed = true;
+      if (this.hold(parseEit(raw))) changed = true;
     }
     return changed;
   }
+
+  /**
+   * 読んだ p/f[actual] のセクションを 1 本覚える。**いまか次のどちらかが変わったら true**。
+   * 渡すのは追う局のものだけ (table_id と service_id は呼ぶ側が確かめる)
+   */
+  protected hold(section: EitSection | null): boolean {
+    if (section === null || section.sectionNumber > 1) return false;
+    const slot = section.sectionNumber as 0 | 1;
+    const event = section.events[0] ?? null;
+    const mark = event === null ? "" : markOf(event);
+    if (this.marks[slot] === mark) return false;
+    this.marks[slot] = mark;
+    this.held[slot] = event;
+    return true;
+  }
 }
 
-/** 変わったかどうかを見る中身。**番号・時刻・尺・タイトルだけ** (番組表に写して画面に出るもの) */
+/** 変わったかどうかを見る中身。**番号・時刻・尺・タイトルだけ** (番組表に入れて画面に出るもの) */
 function markOf(event: EitEvent): string {
   return `${event.eventId}:${event.startAt}:${event.duration}:${event.name}`;
 }

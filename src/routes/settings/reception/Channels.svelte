@@ -5,7 +5,9 @@
   import { resolve } from "$app/paths";
 
   import { submitting } from "#lib/actions.js";
+  import { arming } from "#lib/arming.svelte.js";
   import ActionButton from "#lib/components/ActionButton.svelte";
+  import ArmedDelete from "#lib/components/ArmedDelete.svelte";
   import JobProgress from "#lib/components/JobProgress.svelte";
   import Lead from "#lib/components/Lead.svelte";
   import LogoZoom from "#lib/components/LogoZoom.svelte";
@@ -16,7 +18,9 @@
     signalText,
     stateLabel,
   } from "#lib/format.js";
+  import { held } from "#lib/live-updates.svelte.js";
   import type { SignalQuality } from "#lib/server/signal-quality.js";
+  import { ALL_CHANNEL_TYPES, type ChannelType } from "#lib/types.js";
 
   import type { ActionData, PageData } from "./$types";
 
@@ -25,6 +29,7 @@
   /*
    * **チャンネルを書き換えたお知らせは、この画面を開いたら消す** (書き換えたチャンネルはここに並んでいる)。
    * load で消すと先読みでも消えるので、開いた画面からリクエストする (`channels.server.ts` の `seenLineup`)
+   * 消したあとも読み直さない。この画面にいる間は、見出しの下の文 (下の `channelAlert`) とヘッダーの印を残して読めるようにし、次に画面を移ったときに消える
    */
   $effect(() => {
     if (!data.lineupChanged) return;
@@ -69,17 +74,126 @@
   const scan = $derived(data.scan);
 
   /**
-   * スキャンする種別の選び方。値はそのまま `types` で送る (「すべて」はカンマで 3 つ)。
-   * 先頭の「すべて」が初めの選び方。衛星は放送の NIT からすぐ作れるので、全部まとめて回しても時間はほぼ地上波のぶんだけ
+   * CATV (ケーブル) と SKY (スカパー！プレミアム) のうち、受信できる種別に選んだ (使う) チューナーがある種別。
+   * あるものだけ、スキャンの選び方に足す (受けられる機材が無い人の選び方は変えない)。
+   * チューナーの一覧はエージェントの答え待ちなので、届くまでは無いものとする
    */
-  const SCAN_CHOICES = [
-    { value: "GR,BS,CS", label: "すべて" },
+  const tunerList = held(() => data.tuners);
+  const extraScans = $derived(
+    (["CATV", "SKY"] as const).filter((type) =>
+      (tunerList.value?.list ?? []).some(
+        (tuner) => !tuner.disabled && tuner.types.includes(type),
+      ),
+    ),
+  );
+
+  /**
+   * スキャンする種別の選び方。値はそのまま `types` で送る (「すべて」はカンマで並べる)。
+   * 先頭の「すべて」が初めの選び方。衛星は放送の NIT からすぐ作れるので、全部まとめて回しても時間はほぼ地上波のぶんだけ。
+   * CATV はケーブル局の NIT を読めるまで QC13〜QC63・QU13〜QU62・QV1〜QV12 の 113 チャンネルを総当たりし、SKY (H01〜H105) は総当たりなので、「すべて」に入れるとそれぞれ地上波と同じくらい延びる
+   */
+  const SCAN_CHOICES = $derived([
+    { value: ["GR", "BS", "CS", ...extraScans].join(","), label: "すべて" },
     { value: "GR", label: SERVICE_TYPE_LABEL["GR"] },
-    // CATV の周波数変換パススルー。UHF に加えて C13〜C63 も回す (`scan.ts` の `SCAN_KINDS`)
-    { value: "CATV", label: `${SERVICE_TYPE_LABEL["GR"]} (CATV)` },
+    // ケーブルテレビの周波数変換パススルー。UHF に加えて C13〜C63 も回す (`scan.ts` の `SCAN_KINDS`)
+    {
+      value: "PASSTHROUGH",
+      label: `${SERVICE_TYPE_LABEL["GR"]} (パススルーも)`,
+    },
     { value: "BS", label: SERVICE_TYPE_LABEL["BS"] },
     { value: "CS", label: SERVICE_TYPE_LABEL["CS"] },
-  ];
+    ...extraScans.map((type) => ({
+      value: type,
+      label: SERVICE_TYPE_LABEL[type] ?? type,
+    })),
+  ]);
+
+  /**
+   * 受信できるチャンネルに、ライブと録画に使えない局 (復号できない局) があるか。種別ごとにわけを表のすぐ上に添える。
+   * SKY の局はどれも復号できない。CATV は B-CAS 以外の方式でスクランブルされた局と、4K の局 (ACAS) だけ (`services.decodable`)
+   */
+  const hasSky = $derived(
+    data.channels.some((channel) => channel.type === "SKY"),
+  );
+  const hasCatv = $derived(
+    data.channels.some((channel) => channel.type === "CATV"),
+  );
+  /**
+   * 局を削除できる種別 (`channels.server.ts` の `removeType`)。局がある種別なら、チューナーの有無によらずどれでも選べる。
+   * スキャンし直しても 1 件も見つからない結果は書かないので、ケーブルの回線が無くなったとき (引っ越しなど) はここで消す
+   */
+  const removableTypes = $derived(
+    ALL_CHANNEL_TYPES.filter((type) =>
+      data.channels.some((channel) => channel.type === type),
+    ),
+  );
+  /** 削除する種別の欄で選んだもの。選んだ種別の局が無くなったら、残っている先頭の種別に戻す */
+  let removeChoice = $state<ChannelType | null>(null);
+  const removeTarget = $derived(
+    removeChoice !== null && removableTypes.includes(removeChoice)
+      ? removeChoice
+      : (removableTypes[0] ?? null),
+  );
+  const removing = arming('[data-testid^="remove-type"]');
+
+  /**
+   * **スキャンと局の削除で対象にするエージェント** (チップ。2 台以上のときだけ出す。既定は全部)。
+   * 選んだものを `agents` にカンマで並べて送る (`channels.server.ts` の `chosenAgents`)。1 台なら送らない (全部)
+   */
+  let unchecked = $state<number[]>([]);
+  /** 受信の様子の前に付けるエージェントの名前 (「書斎: 」)。1 台なら付けない */
+  const agentPrefix = (id: number): string => {
+    if (data.agents.length < 2) return "";
+    const name = data.agents.find((agent) => agent.id === id)?.name;
+    return name === undefined ? "" : `${name}: `;
+  };
+  const scanAgents = $derived(
+    data.agents.length > 1
+      ? data.agents
+          .map((agent) => agent.id)
+          .filter((id) => !unchecked.includes(id))
+          .join(",")
+      : null,
+  );
+
+  /** 復号できない局のあるケーブルのチャンネル。TS (B-CAS 以外の方式) と TLV (4K の放送) でわけが違うので分けて言う */
+  const undecodableCatv = (transport: "ts" | "tlv") =>
+    data.channels.some(
+      (channel) =>
+        channel.type === "CATV" &&
+        channel.transport === transport &&
+        channel.services.some((service) => !service.decodable),
+    );
+  const hasUndecodableCatv = $derived(undecodableCatv("ts"));
+  const hasUndecodable4k = $derived(undecodableCatv("tlv"));
+
+  /**
+   * 復号できない局のわけ。番組表を読める局 (`services.epg_readable`) は番組表に出るので、最後にそのことを足す
+   */
+  const undecodableNote = $derived(
+    [
+      hasSky
+        ? "スカパー！プレミアムの局は、スクランブルを復号できないため、ライブと録画に使えません。スカパー！プレミアムのカードには、これから対応する予定です"
+        : null,
+      hasUndecodableCatv
+        ? "ケーブルの局のうち「復号できません」の局は、B-CAS 以外の方式でスクランブルされているため、ライブと録画に使えません"
+        : null,
+      hasUndecodable4k
+        ? "ケーブルの 4K の局のうち「復号できません」の局は、4K の放送のスクランブル (ACAS) にまだ対応していないため、ライブと録画に使えません"
+        : null,
+      "番組表を読める局は、番組表に「観られません」の列で出します",
+    ]
+      .filter((text) => text !== null)
+      .join("。"),
+  );
+
+  /** CATV のチャンネルが再送信している元の放送。チャンネルの名前の下に出す。自主放送には何も付けない */
+  const ORIGIN_TEXT = {
+    GR: "地上波の再送信",
+    BS: "BS の再送信",
+    BS4K: "BS4K の再送信",
+    CS: "CS の再送信",
+  } as const;
   /*
    * 物理チャンネルと、そこに入っている局。**denpa 自身の DB から来る。**
    * エージェントにも控えはあるが、問い合わせない (`channels.server.ts`)
@@ -101,8 +215,13 @@
         : [
             `誤り ${rate(quality.errors, quality.packets)}`,
             `ドロップ ${rate(quality.drops, quality.packets + quality.drops)}`,
-            `${quality.mbps.toFixed(1)} Mbps`,
+            ...(quality.mbps === null
+              ? []
+              : [`${quality.mbps.toFixed(1)} Mbps`]),
           ];
+    // 同期が外れるなどで途中で止まったら、止まったことを出す (速さは 1 秒に満たないと出さない)
+    if (quality.packets > 0 && quality.stopped)
+      parts.push("測り終える前に受信が止まりました");
     if (quality.signal !== null) parts.push(signalText(quality.signal));
     return parts.join("・");
   }
@@ -115,16 +234,44 @@
 </script>
 
 <!--
-    **スキャンは種別を選ぶ欄とボタンの 1 組。** 回っている間は「中断」に替わる。
-    探す範囲は決め打ち (放送で使う物理チャンネルは決まっていて、狭めても総当たりの時間が少し減るだけ)
+  **スキャンは種別を選ぶ欄とボタンの 1 組。** 回っている間は「中断」に替わる。
+  探す範囲は決め打ち (放送で使う物理チャンネルは決まっていて、狭めても総当たりの時間が少し減るだけ)
 -->
 {#snippet scanControl()}
+  <!-- 2 台以上なら、スキャンと局の削除で対象にするエージェントを選ぶチップ (既定は全部) -->
+  {#if data.agents.length > 1 && scan.state !== "running"}
+    <div
+      class="chips scan-agents"
+      role="group"
+      aria-label="スキャンするエージェント"
+      data-testid="scan-agents"
+    >
+      {#each data.agents as agent (agent.id)}
+        <label class="chip">
+          <input
+            type="checkbox"
+            checked={!unchecked.includes(agent.id)}
+            onchange={(event) =>
+              (unchecked = event.currentTarget.checked
+                ? unchecked.filter((id) => id !== agent.id)
+                : [...unchecked, agent.id])}
+          />
+          {agent.name}
+        </label>
+      {/each}
+    </div>
+  {/if}
   <form method="POST" action="?/scan" use:submitting class="scan-control">
+    {#if scanAgents !== null}<input
+        type="hidden"
+        name="agents"
+        value={scanAgents}
+      />{/if}
     {#if scan.state === "running"}
       <!--
-                十数分かかるので、途中で降りられるようにしてある。中断しても設定は書き換えない
-                (途中までの結果で上書きすると、まだ回っていない局の定義が消える)
-            -->
+        十数分かかるので、途中で中断できるようにしてある。中断しても設定は書き換えない
+        (途中までの結果で上書きすると、まだ回っていない局の定義が消える)
+      -->
       <button type="submit" class="small outline danger" formaction="?/scanStop"
         >中断</button
       >
@@ -142,9 +289,46 @@
 {/snippet}
 
 <!--
-    **スキャンも、受信できるチャンネルの節の中に。** 押すものは見出しの行にまとめ (スキャン・番組表。スマホの形では下のタブの上)、
-    回っている間の進み具合は見出しのすぐ下。チャンネルが 1 つも無いときは、空の表の場所の真ん中に
-    スキャンの欄を出す (局が無いときの案内 `ChannelNotice` の行き先がここ)
+  **局の削除は、種別を選ぶ欄と「局を削除」の 1 組。** スキャンの欄の隣に置き、スキャンの実行中は出さない。
+  消すのはその種別のチャンネルと局だけで、録画は残り、スキャンし直せば戻る (`scan.ts` の `removeType`)
+-->
+{#snippet removeControl()}
+  {#if scan.state !== "running" && removeTarget !== null}
+    <div class="scan-control">
+      <select
+        aria-label="局を削除する種別"
+        value={removeTarget}
+        onchange={(event) => {
+          removeChoice = event.currentTarget.value as ChannelType;
+          removing.fire();
+        }}
+        data-testid="remove-type-select"
+      >
+        {#each removableTypes as type (type)}
+          <option value={type}>{SERVICE_TYPE_LABEL[type] ?? type}</option>
+        {/each}
+      </select>
+      <ArmedDelete
+        deleting={removing}
+        armKey={0}
+        action="?/removeType"
+        fields={scanAgents === null
+          ? { type: removeTarget }
+          : { type: removeTarget, agents: scanAgents }}
+        class="small"
+        testid="remove-type"
+        label="局を削除"
+      />
+    </div>
+  {/if}
+{/snippet}
+
+<svelte:window onclick={removing.stand} />
+
+<!--
+  **スキャンも、受信できるチャンネルの節の中に。** 押すものは見出しの行にまとめ (スキャン・局の削除・番組表とロゴの取得。スマホの形では下のタブの上)、
+  回っている間の進み具合は見出しのすぐ下。チャンネルが 1 つも無いときは、表を置く場所の真ん中に
+  スキャンの欄を出す (局が無いときの案内 `ChannelNotice` の行き先がここ)
 -->
 <div class="sections">
   <section class="section" data-testid="channel-section">
@@ -153,6 +337,7 @@
       {#if coverage.length > 0}
         <div class="cluster section-bar dock" data-testid="channel-actions">
           {@render scanControl()}
+          {@render removeControl()}
           <!-- 入れたばかりのとき用 (`channels.server.ts` の `collectNow`) -->
           <ActionButton
             action="?/collectNow"
@@ -163,10 +348,10 @@
             {data.collect.boosted ? "集めています…" : "番組表をいますぐ集める"}
           </ActionButton>
           <!--
-                        取得するものが無ければボタンも出さない。押しても「もう全部持っています」と
-                        断るだけになる。**走っている最中でも押せる**。押されたほうが譲る作りなので、
-                        使えなくすると「BS を取っている間ずっと押せない」に逆戻りする
-                    -->
+            取得するものが無ければボタンも出さない。押しても「もう全部持っています」と
+            断るだけになる。**走っている最中でも押せる**。押されたほうが譲る作りなので、
+            使えなくすると「BS を取っている間ずっと押せない」に逆戻りする
+          -->
           {#if data.logos.pending > 0}
             <ActionButton
               action="?/logoSweep"
@@ -182,17 +367,32 @@
       {/if}
     </div>
 
+    <!--
+      **チャンネルのお知らせ** (ヘッダーの印と、スマホの形で設定の入口に付く印と同じ文。`server/channel-alert.ts`)。
+      スマホの形はヘッダーを隠すので、文はここで読む。スキャンは見出しの行のボタン
+    -->
+    {#if data.channelAlert !== null}
+      <p
+        class="notice {data.channelAlert.kind === 'ground'
+          ? 'warning'
+          : 'info'}"
+        data-testid="channel-alert-notice"
+      >
+        {data.channelAlert.text}
+      </p>
+    {/if}
+
     {#if coverage.length > 0}
       <!-- 番組表がもう入っている局の数。下の表の右端を全部見なくても分かるように -->
       {@const withEpg = services.filter(
         (service) => service.programs > 0,
       ).length}
       <!--
-                **入れ子になった 3 つの数を、その順に並べる。** チャンネル (T19, BS15:16625) の中に
-                局 (TOKYO MX1, MX2) があり、局ごとに番組表がある。「50 / 59 ・ 124 局」とだけ
-                出していた頃は、59 と 124 が同じものの数に見えた。局はスキャンで、番組表は
-                そのあと denpa が集めるもので、埋まる時期がずれる (局はあるのに番組表が空、が普通にある)
-            -->
+        **入れ子になった 3 つの数を、その順に並べる。** チャンネル (T19, BS15:16625) の中に
+        局 (TOKYO MX1, MX2) があり、局ごとに番組表がある。「50 / 59 ・ 124 局」とだけ
+        出していた頃は、59 と 124 が同じものの数に見えた。局はスキャンで、番組表は
+        そのあと denpa が取得するもので、埋まる時期がずれる (局はあるのに番組表が空、が普通にある)
+      -->
       <div class="small" data-testid="channel-coverage">
         <span class="muted">チャンネル</span>
         <strong>{coverage.length}</strong>
@@ -203,9 +403,9 @@
         <span class="muted">番組表のある局</span>
         <strong>{withEpg}</strong>
         <!--
-                    ロゴの数も同じ行に、ほかの数と同じ形で (事実はバッジにしない。docs/design.md の「印の意味」)。
-                    取れないぶんは下の行で断る。CM ロゴは CM 検出のために覚えたもので、局ロゴとは別物 (logo-data.ts)
-                -->
+          ロゴの数も同じ行に、ほかの数と同じ形で (事実はバッジにしない。docs/design.md の「印の意味」)。
+          取れないぶんは下の行で断る。CM ロゴは CM 検出のために覚えたもので、局ロゴとは別物 (logo-data.ts)
+        -->
         <span class="logo-counts">
           <span class="muted">局ロゴ</span>
           <strong class="num" data-testid="status-logos">
@@ -219,10 +419,10 @@
       </div>
       {#if data.logos.unavailable > 0}
         <!--
-                    取れないものを「まだ取れていない」と出し続けると、こちらの不具合と見分けが付かない。
-                    **中継にロゴが無いことでは数えない。** CS の中継にはロゴが流れていないが、
-                    CS のロゴは BS の中継で送られてくる
-                -->
+          取れないものを「まだ取れていない」と出し続けると、こちらの不具合と見分けが付かない。
+          **中継にロゴが無いことでは数えない。** CS の中継にはロゴが流れていないが、
+          CS のロゴは BS の中継で送られてくる
+        -->
         <div class="tiny muted" data-testid="logo-unavailable">
           <span class="num">{data.logos.unavailable}</span> 局はロゴが放送に載っていないため取れません
           (1 週間後にまた確かめます)
@@ -230,16 +430,17 @@
       {/if}
       {#if data.logos.satellite.missing > 0 && !data.logoSweep.running}
         <!--
-                    衛星のロゴはダウンロードの期間にしか流れてこず、揃うまで何回か開き直すことがある。
-                    いつ続きを読むのかを言わないと、止まっているように見える (logo.awaitCarousel)
-                -->
+          衛星のロゴはダウンロードの期間にしか流れてこず、揃うまで何回か開き直すことがある。
+          いつ続きを読むのかを言わないと、止まっているように見える (logo.awaitCarousel)
+        -->
         <div class="tiny muted" data-testid="logo-satellite-waiting">
           BS・CS の <span class="num">{data.logos.satellite.missing}</span>
           局は、{#if data.logos.satellite.carrier !== null}
             {data.logos.satellite.carrier} にときどきまとめて流れてくるのを待っています。
             番組表を集めるときにこの中継を開いたときと、チューナーが空いているときに、続きから読みます
           {:else}
-            ロゴを流している中継をまだ探しています。チューナーが空いているときと、番組表を集めるときに衛星の中継を開いたときに確かめます
+            ロゴを流している中継をまだ探しています。チューナーが空いているときと、番組表を集めるときに衛星の中継かケーブルの
+            BS の再送信を開いたときに確かめます
           {/if}
         </div>
       {/if}
@@ -251,11 +452,12 @@
         <JobProgress
           done={data.logoSweep.done}
           total={data.logoSweep.total}
+          running={data.logoSweep.running}
           unit="チャンネル"
         >
           ・ロゴ <strong>{data.logoSweep.found} 局</strong
           >{#if data.logoSweep.channels.length > 0}・受信中 {data.logoSweep.channels.join(
-              ", ",
+              "、",
             )}{/if}
         </JobProgress>
         {#if data.logoSweep.message !== ""}
@@ -283,9 +485,24 @@
         <JobProgress
           done={scan.scanned}
           total={scan.total}
+          running={scan.state === "running"}
           unit="チャンネル"
           testid="scan-count"
         />
+        {#if scan.agents.length > 1}
+          <!-- エージェントごとの進み具合 (「居間 8 / 40 チャンネル」) -->
+          <ul
+            class="agent-progress small muted num"
+            data-testid="scan-agent-progress"
+          >
+            {#each scan.agents as entry (entry.id)}
+              <li>
+                {entry.name}
+                {entry.scanned} / {entry.total} チャンネル・見つかったチャンネル {entry.channels}
+              </li>
+            {/each}
+          </ul>
+        {/if}
         {#if scan.error}
           <div class="notice error">{scan.error}</div>
         {/if}
@@ -298,13 +515,13 @@
       </div>
     {/if}
     {#if data.collect.running}
-      <!-- 1 チャンネルに数分かかる。黙っていると止まって見える -->
+      <!-- 1 チャンネルに数分かかる。出さないと止まって見える -->
       <div class="progress-block" data-testid="epg-collect">
         <div class="small muted num">
           {data.collect.boosted
-            ? "最優先で集めています"
+            ? "録画とライブ視聴の次に優先して集めています"
             : "番組表を集めています"}
-          ({data.collect.active.join(", ") || "準備中"})・残り {data.collect
+          ({data.collect.active.join("、") || "準備中"})・残り {data.collect
             .pending} チャンネル
         </div>
         <progress
@@ -332,7 +549,7 @@
         {#snippet more()}
           <p>
             スキャンは空いているチューナーを全部使います
-            (録画中のチューナーは使いません)。録画中でも実行でき、
+            (録画・ライブ視聴・「番組表をいますぐ集める」に使っているチューナーは使いません)。録画中でも実行でき、
             画面を閉じてもサーバで続きます。終わると番組表も集め直します。
           </p>
           <p>
@@ -341,6 +558,14 @@
             2
             回続けて受信できなかったチャンネルは「受信できません」と出し、その局を番組表・ライブ・ルールの対象から外します。受信できるようになれば戻ります。
           </p>
+          {#if hasCatv}
+            <p>
+              ケーブルの局は、番組表とライブでは「ケーブル」にまとめて並べます。
+              地上波や BS を再送信しているチャンネルには、ch の下に「BS
+              の再送信」のように元の放送を出します。
+              アンテナで受けている同じ局とは別の局として扱います。局ロゴは、アンテナで同じ局のロゴが取れていればそれを使い、無ければケーブルのチャンネルから集めます。
+            </p>
+          {/if}
           <p>
             番組表はスキャンのあと、局ごとに埋まっていきます。BS の初回は、1
             つの中継から全局の番組名を先に入れ (数分)、
@@ -353,11 +578,13 @@
           </p>
           <p>
             チャンネルの<strong>「測定」</strong
-            >は、空いているチューナーでそのチャンネルを 5 秒ほど受信し、 誤り
+            >は、空いているチューナーでそのチャンネルを 5 秒ほど受信し、誤り
             (誤りの印が立っていたパケットの割合)・ドロップ
             (欠けたパケットの割合)・受信した速さと、受信の状態と C/N
-            を行の下に出します。
+            を行の下に出します。強度 (dBm) は測れるチューナーだけ出します。
             録画・ライブ視聴・スキャン・「番組表をいますぐ集める」に使っているチューナーは取り上げません。
+            強度と C/N
+            はチューナーから読んだ値で、機種ごとに校正されておらず、テレビの「アンテナレベル」とも比べられないので、同じチューナーで配線を変える前とあとを比べてください。
           </p>
           <p>
             <strong>局ロゴ</strong
@@ -370,7 +597,7 @@
           <p>
             「ロゴをいますぐ集める」では衛星の分も集めます。<strong
               >BS と CS のロゴは同じ 1 つの中継で流れる</strong
-            >ため、そこだけ最大 20 分かかります (他の中継は数秒で終わります)。
+            >ため、そこだけ最大 20 分かかります (ほかの中継は数秒で終わります)。
           </p>
           <p>
             <strong>CM ロゴ</strong>は、CM
@@ -384,12 +611,20 @@
     {#if coverage.length === 0}
       <!-- まだ 1 つも無い。表の場所の真ん中に、スキャンの欄と 1 行の案内 -->
       <div class="empty-state glow">
-        <p class="small muted">
-          チャンネルがまだありません。種別を選んでスキャンしてください
-        </p>
-        {@render scanControl()}
+        <p class="bold">チャンネルがまだありません</p>
+        <p class="small muted">種別を選んでスキャンしてください</p>
+        <div class="actions">{@render scanControl()}</div>
       </div>
     {:else}
+      {#if hasSky || hasUndecodableCatv || hasUndecodable4k}
+        <!--
+          復号できない局はライブと録画に使えない。そのわけを、表のすぐ上で言う (`services.decodable`)。
+          どの局かは、局名の後ろの「復号できません」で示す
+        -->
+        <p class="small muted" data-testid="undecodable-note">
+          {undecodableNote}
+        </p>
+      {/if}
       <div class="table-wrap channels-wrap">
         <table>
           <thead>
@@ -403,9 +638,9 @@
             </tr>
           </thead>
           <!--
-                        **1 行に 1 局。** 種別と ch はチャンネルの局の数だけ縦につなぐ (`rowspan`)。
-                        ロゴは局ごとのものなので、局の行に 1 つずつ置く (チャンネルの行に並べると、どれがどの局か読めない)
-                    -->
+            **1 行に 1 局。** 種別と ch はチャンネルの局の数だけ縦につなぐ (`rowspan`)。
+            ロゴは局ごとのものなので、局の行に 1 つずつ置く (チャンネルの行に並べると、どれがどの局か読めない)
+          -->
           <tbody data-testid="channel-list">
             {#each coverage as channel (`${channel.type}:${channel.channel}`)}
               {#each channel.services as service, index (service.id)}
@@ -427,11 +662,31 @@
                       data-reception={channel.reception}
                     >
                       {channel.channel}
-                      <!-- 受信できるかは番組表集めのついでに確かめる (reception.ts)。受信できるものには何も付けない -->
+                      <!-- 受信できるかは番組表の取得のついでに確かめる (reception.ts)。受信できるものには何も付けない -->
+                      <!-- 2 台以上なら、受信の様子がどのエージェントのものかを添え、受けられるエージェントの名前を並べる -->
                       {#if channel.reception === "unreceivable"}
-                        <span class="reception tiny muted">受信できません</span>
+                        <span class="reception tiny muted"
+                          >{agentPrefix(channel.agent)}受信できません</span
+                        >
                       {:else if channel.reception === "checking"}
-                        <span class="reception tiny faint">確認中</span>
+                        <span class="reception tiny muted"
+                          >{agentPrefix(channel.agent)}確認中</span
+                        >
+                      {/if}
+                      {#if data.agents.length > 1 && channel.agents.length > 0}
+                        <span
+                          class="reception tiny muted"
+                          data-testid="channel-agents"
+                          >{channel.agents.join("・")}</span
+                        >
+                      {/if}
+                      <!-- CATV で地上波・BS・CS を再送信しているチャンネル。番組表とライブではケーブルの局として並ぶ -->
+                      {#if channel.origin !== null}
+                        <span
+                          class="reception tiny muted"
+                          data-testid="channel-origin"
+                          >{ORIGIN_TEXT[channel.origin]}</span
+                        >
                       {/if}
                       <!-- 空いているチューナーで 5 秒ほど受信する。結果はこのチャンネルの行の下 -->
                       <ActionButton
@@ -453,6 +708,13 @@
                         {@render cmLogo(service.id, service.name, false)}
                       </span>
                       <span class="broadcast">{service.name}</span>
+                      <!-- ライブと録画に使えない局 (わけは表の上の 1 行) -->
+                      {#if !service.decodable}
+                        <span
+                          class="tiny muted nowrap"
+                          data-testid="service-undecodable">復号できません</span
+                        >
+                      {/if}
                     </span>
                   </td>
                   <td class="logo-col"
@@ -474,6 +736,21 @@
                   </td>
                 </tr>
               {/each}
+              <!-- SKY と CATV のチャンネルは、最後のスキャンで分かったこと (CA_system_id と番組表・ロゴが来ているか。`ca-observe.ts`) を行の下に出す -->
+              {#if channel.observed !== null}
+                <tr data-testid="ca-observed" data-channel={channel.channel}>
+                  <td colspan="6" class="small">
+                    <span class="muted">スキャンで分かったこと</span>
+                    {[
+                      channel.observed.caSystemIds.length === 0
+                        ? "CA 記述子なし"
+                        : `CA_system_id ${channel.observed.caSystemIds.join(" ")}`,
+                      channel.observed.epg,
+                      channel.observed.logo,
+                    ].join("、")}
+                  </td>
+                </tr>
+              {/if}
               {#if measured?.type === channel.type && measured.channel === channel.channel}
                 <tr data-testid="signal-result" data-channel={channel.channel}>
                   <td colspan="6" class="small">
@@ -496,8 +773,8 @@
 <LogoZoom target={zoomTarget} onclose={() => (zoom = null)} />
 
 <!--
-    局ロゴ。押すと大きく見る (`LogoZoom`)。まだのものは点線の枠、放送に載っていないものは列では「—」。
-    `column` が偽のものは狭い幅で局名の前に出す写し (テスト ID は列のほうにだけ付ける)
+  局ロゴ。押すと大きく見る (`LogoZoom`)。まだのものは点線の枠、放送に載っていないものは列では「—」。
+  `column` が偽のものは狭い幅で局名の前に出す写し (テスト ID は列のほうにだけ付ける)
 -->
 {#snippet stationLogo(id: number, name: string, column: boolean)}
   {@const state = logoOf.get(id)?.logo}
@@ -515,6 +792,14 @@
     <span class="logo-slot" title="ロゴはまだ取れていません">
       <span class="visually-hidden">ロゴはまだ取れていません</span>
     </span>
+  {:else if state === "skipped" && column}
+    <!-- ロゴを取得しない局 (`logos.server.ts` の `logoOf`。復号できない局・4K の局・SKY の局・CDT が来なかったケーブルの TS の局) -->
+    <span
+      class="muted small"
+      title={logoOf.get(id)?.type === "SKY"
+        ? "スカパー！プレミアムの局のロゴは集めません"
+        : "この局のロゴは集めていません"}>—</span
+    >
   {:else if column}
     <span class="muted small" title="ロゴは放送に載っていません">—</span>
   {:else}
@@ -524,8 +809,8 @@
 {/snippet}
 
 <!--
-    CM 検出のために覚えたロゴ。線の向きがどのコマでも揃うところを白く出した画像で、ロゴの形になっていれば合っている。
-    書き直すたびに URL を変えて、古い画像を出し続けないようにする。覚えていなければ何も出さない
+  CM 検出のために覚えたロゴ。線の向きがどのコマでも揃うところを白く出した画像で、ロゴの形になっていれば合っている。
+  書き直すたびに URL を変えて、古い画像を出し続けないようにする。覚えていなければ何も出さない
 -->
 {#snippet cmLogo(id: number, name: string, column: boolean)}
   {@const at = logoOf.get(id)?.cm ?? null}
@@ -547,7 +832,22 @@
 {/snippet}
 
 <style>
-  /* 種別を選ぶ欄とボタンを 1 組に。高さは隣の小さなボタンにそろえる */
+  /* チップは字の幅のまま (操作の 1 行に並べても伸ばさない) */
+  .scan-agents {
+    flex: none;
+  }
+  /* Pico の `[role="group"] > *` が伸ばすので戻す */
+  .scan-agents .chip {
+    flex: none;
+    width: auto;
+    margin: 0;
+  }
+  .agent-progress {
+    margin: 0;
+    padding: 0;
+    list-style: none;
+  }
+  /* 種別を選ぶ欄とボタンを 1 組に (スキャンと局の削除)。高さは隣の小さなボタンにそろえる */
   .scan-control {
     display: inline-flex;
     align-items: center;
@@ -556,25 +856,22 @@
   }
   .scan-control select {
     width: auto;
-    height: auto;
     margin: 0;
-    padding: 0.3rem 2rem 0.3rem 0.6rem;
-    font-size: var(--dp-text-sm);
   }
   .scan-control button {
     margin: 0;
   }
   /*
-     * 受信できるチャンネルの表は、スマートフォンの幅では欄の間を詰める。
-     * 局の欄が幅を取り、右端の「10/13 まで」が枠の外へ押し出されていた
-     */
+   * 受信できるチャンネルの表は、スマートフォンの幅では欄の間を詰める。
+   * 局の欄が幅を取り、右端の「10/13 まで」が枠の外へ押し出されていた
+   */
   .channels-wrap {
     container-type: inline-size;
   }
   @container (max-width: 32rem) {
     .channels-wrap th,
     .channels-wrap td {
-      padding-inline: 0.3rem;
+      padding-inline: var(--dp-space-1);
     }
   }
   /* ロゴの数は、チャンネル → 局 → 番組表の数のあとに少し離して並べる */
@@ -582,15 +879,15 @@
     display: inline-flex;
     flex-wrap: wrap;
     align-items: center;
-    gap: 0.25rem;
+    gap: var(--dp-space-1);
     margin-left: var(--dp-space-3);
   }
   /*
-     * **行は低く保つ。** 1 行に 1 局で、ロゴは局名の字の高さほど (局ロゴ 1.35rem)。
-     * 同じチャンネルの局は、種別と ch を縦につないでまとめて見せる
-     */
+   * **行は低く保つ。** 1 行に 1 局で、ロゴは局名の字の高さほど (局ロゴ 1.35rem)。
+   * 同じチャンネルの局は、種別と ch を縦につないでまとめて見せる
+   */
   .channels-wrap td {
-    padding-block: 0.3rem;
+    padding-block: var(--dp-space-1);
     vertical-align: middle;
   }
   .channels-wrap td[rowspan] {
@@ -599,7 +896,7 @@
   .station {
     display: inline-flex;
     align-items: center;
-    gap: 0.4rem;
+    gap: var(--dp-space-2);
   }
   /* 局名は欄の幅で折り返す (全角の英数が続く局名でも) */
   .station .broadcast {
@@ -609,7 +906,7 @@
   .inline-logos {
     display: none;
     align-items: center;
-    gap: 0.25rem;
+    gap: var(--dp-space-1);
   }
   /* ロゴそのものを押して大きく見る (`LogoZoom`)。ボタンの地や余白は付けない */
   .zoom {

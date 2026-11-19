@@ -1,7 +1,7 @@
 /**
  * **1 局に絞った TS から、映像と音声の PES を取り出す** (denpa のライブを変換せずに送る経路。docs/stream.md#放送そのままmpeg-2を送る)。
  *
- * エンコードする経路ではここを ffmpeg がやっていた。変換せずに送ると TS がそのままブラウザへ来るので、
+ * エンコードする経路では ffmpeg が PES を取り出す。変換せずに送ると TS がそのままブラウザへ来るので、
  * 映像も音声も WASM のデコーダ (denpa の `wasm/decoder.c`) に渡す前に、
  * こちらで PES に戻す。サーバが 1 局に絞ってある (`ServiceFilter`) ので PAT に
  * 載っている局は 1 つだけで、その PMT を読んで映像 1 本と音声 (並んだ順) を取り出す。
@@ -17,16 +17,16 @@ import {
   PID_PAT,
   pmtStreams,
   PmtTracker,
+  STREAM_AAC,
 } from "./psi.js";
 
 /** PTS・PCR の刻み (90kHz)。denpa の取り決めの時刻もこの刻み (docs/stream.md#websocket-プロトコル) */
 export const CLOCK = 90_000;
-/** PTS の一周 (33 ビット)。26.5 時間 */
+/** PTS の一周 (33 ビット)。26.5 時間。PCR の基準部とデータ放送の NPT も同じ (`bml.ts`) */
 export const WRAP = 2 ** 33;
 
-/** PMT の stream_type。**放送の映像は MPEG-2、音声は ADTS の AAC** (ARIB STD-B32) */
+/** PMT の stream_type。**放送の映像は MPEG-2、音声は ADTS の AAC** (ARIB STD-B32。AAC は psi.ts の `STREAM_AAC`) */
 const STREAM_MPEG2 = 0x02;
-const STREAM_AAC = 0x0f;
 
 export interface Pes {
   pid: number;
@@ -56,7 +56,7 @@ export function readStamp(data: Uint8Array, at: number): number {
   );
 }
 
-/** PES の頭を読んで中身を切り出す。**壊れていれば null** (頭の 00 00 01 が無いなど) */
+/** PES のヘッダを読んで中身を切り出す。**壊れていれば null** (先頭の 00 00 01 が無いなど) */
 export function parsePes(
   data: Uint8Array,
 ): { pts: number | null; dts: number | null; data: Uint8Array } | null {
@@ -67,31 +67,31 @@ export function parsePes(
   const start = 9 + headerLength;
   if (start > data.length) return null;
   const length = u16(data, 4);
-  // 長さが書いてあればそこまで (後ろに詰め物が付くことがある)。0 は「次の頭まで」
+  // 長さが書いてあればそこまで (後ろに詰め物が付くことがある)。0 は「次の PES の先頭まで」
   const end = length === 0 ? data.length : Math.min(data.length, 6 + length);
   const pts = flags & 0x02 && data.length >= 14 ? readStamp(data, 9) : null;
   const dts = flags === 0x03 && data.length >= 19 ? readStamp(data, 14) : pts;
   return { pts, dts, data: data.subarray(start, end) };
 }
 
-/** 長さの分からない PES (映像) の入れ物の最初の大きさ。1 コマの多くはこれに収まる */
+/** 長さの分からない PES (映像) のバッファの最初の大きさ。1 コマの多くはこれに収まる */
 const PES_START = 64 * 1024;
 
 /**
- * 組み立てかけの PES。**1 本の入れ物に写し足す** (パケットごとに写して最後に繋ぐと、1 コマで 2 回写すうえ、
+ * 組み立てかけの PES。**1 つのバッファに続けてコピーする** (パケットごとにコピーして最後に繋ぐと、1 コマで 2 回コピーするうえ、
  * 184 バイトの切れ端を何百も作る)。足りなくなったら倍に広げる
  */
 interface Partial {
   buffer: Uint8Array;
   size: number;
-  /** 書いてある長さ (頭の 6 バイトを含む)。0 なら次の頭まで */
+  /** 書いてある長さ (先頭の 6 バイトを含む)。0 なら次の PES の先頭まで */
   expected: number;
 }
 
 /**
  * TS を渡すと PES を返す。**選局し直したら作り直す** (前の局の切れ端を持ち越さない)。
  *
- * 映像は長さ 0 (次の頭で終わりが分かる) なので 1 枚ぶん遅れて出るが、貯めの中に収まる。
+ * 映像は長さ 0 (次の PES の先頭で終わりが分かる) なので 1 フレームぶん遅れて出るが、受け側が貯めるぶんに収まる。
  * 音声は長さが書いてあるので揃った時点で出す
  */
 export class PesDemuxer {
@@ -99,7 +99,7 @@ export class PesDemuxer {
   /** 絞ってあるので局は 1 つだけのはず。万一複数あっても先頭を採る */
   private readonly pmt = new PmtTracker();
   private readonly partial = new Map<number, Partial>();
-  /** いま分かっている ES。**変わったら `feed` の返りで知らせる** */
+  /** いま分かっている ES。**変わったら `feed` の戻り値 (`changed`) で知らせる** */
   streams: Streams = { video: null, audio: [] };
   /** デコードする音声の PID。**選ばれた 1 本だけ**組み立てる (他は捨てる) */
   audioPid: number | null = null;
@@ -165,20 +165,20 @@ export class PesDemuxer {
     const payload = packet.subarray(offset);
 
     if (packet[1]! & 0x40) {
-      // 次の頭が来た。**長さ 0 の PES (映像) はここで終わりが分かる**
+      // 次の PES の先頭が来た。**長さ 0 の PES (映像) はここで終わりが分かる**
       this.finish(pid, kind, out);
       const expected = payload.length >= 6 ? 6 + u16(payload, 4) : 0;
-      // 溜めるものは写す。パケットは届いた塊の上の窓で、塊は使い回される (psi.ts の PacketStream)
       const known = expected === 6 ? 0 : expected;
       // 長さが書いてあればちょうどの大きさ (音声はほぼこれ)、無ければ映像向けに大きめ
       const buffer = new Uint8Array(
         Math.max(known > 0 ? known : PES_START, payload.length),
       );
+      // 溜めるものはコピーする。パケットは届いたチャンクの一部を指し、チャンクのバッファは使い回される (psi.ts の PacketStream)
       buffer.set(payload);
       this.partial.set(pid, { buffer, size: payload.length, expected: known });
     } else {
       const partial = this.partial.get(pid);
-      // 頭を見ていない続きは捨てる (途中から受け取った)
+      // 先頭を見ていない続きは捨てる (途中から受け取った)
       if (partial === undefined) return;
       const end = partial.size + payload.length;
       if (end > partial.buffer.length) {
@@ -204,7 +204,7 @@ export class PesDemuxer {
     if (partial === undefined) return;
     this.partial.delete(pid);
     // 余りが大きければ詰めて返す。返したものはキューに積まれたり worker へ送られたりするので、
-    // 広げた入れ物の余り (最大で倍近く) まで抱えさせない
+    // 広げたバッファの余り (最大で倍近く) まで抱えさせない
     const { buffer, size } = partial;
     const parsed = parsePes(
       size * 1.25 < buffer.length
@@ -223,7 +223,7 @@ export const ADTS_RATES = [
 ];
 
 export interface AdtsFrame {
-  /** 頭 (7 か 9 バイト) ごと。WASM の AAC デコーダは ADTS のまま受け取る */
+  /** ヘッダ (7 か 9 バイト) ごと。WASM の AAC デコーダは ADTS のまま受け取る */
   data: Uint8Array;
   /** 90kHz */
   pts: number;
@@ -236,7 +236,7 @@ export interface AdtsFrame {
 /**
  * PES の中身を ADTS のコマに割る。**コマは PES をまたぐことがある**ので、余りは持ち越す。
  *
- * 時刻は PES の PTS を頭のコマに付け、続くコマには 1 コマぶんずつ足す。持ち越した
+ * 時刻は PES の PTS を先頭のコマに付け、続くコマには 1 コマぶんずつ足す。持ち越した
  * 余りから始まるコマは、前の続きの時刻になる
  */
 export class AdtsSplitter {
@@ -244,7 +244,7 @@ export class AdtsSplitter {
   private next: number | null = null;
 
   feed(data: Uint8Array, pts: number | null): AdtsFrame[] {
-    // 余りが無いときだけ PES の時刻に合わせ直す (余りがあれば頭のコマはその続き)
+    // 余りが無いときだけ PES の時刻に合わせ直す (余りがあれば先頭のコマはその続き)
     if (pts !== null && this.rest.length === 0) this.next = pts;
     const buffer =
       this.rest.length === 0 ? data : concatBytes([this.rest, data]);
@@ -272,7 +272,7 @@ export class AdtsSplitter {
           data: buffer.slice(at, at + length),
           pts: this.next,
           sampleRate: rate,
-          // 0 は「中身に書いてある」(PCE)。放送のデュアルモノはここに来るので、2 本とみなす
+          // 0 は「中身に書いてある」(PCE)。放送のデュアルモノはここに来るので、2 チャンネルとみなす
           channels: channels === 0 ? 2 : channels,
           duration,
         });

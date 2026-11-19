@@ -18,8 +18,8 @@ import { alias } from "drizzle-orm/sqlite-core";
 import { channelNotice } from "#lib/channel-notice.js";
 import { capacityLabel } from "#lib/format.js";
 import { GROUPED_COOKIE, storedGrouped } from "#lib/grouping.js";
-import { channelAlert } from "#lib/server/channel-alert.js";
-import { fileSize } from "#lib/server/chase.js";
+import { parseId } from "#lib/id.js";
+import { agentCount } from "#lib/server/agents.js";
 import { clipCountsByRecording } from "#lib/server/clips.js";
 import { now, orm } from "#lib/server/db.js";
 import { capacity } from "#lib/server/disk.js";
@@ -28,15 +28,17 @@ import {
   CM_CUT_ALREADY,
   enqueue,
   isCanceling,
+  NO_CODEC,
   pump,
 } from "#lib/server/encoder.js";
-import { serviceCounts } from "#lib/server/epg.js";
+import { listedServices, serviceCounts } from "#lib/server/epg.js";
 import { emit } from "#lib/server/events.js";
-import { deleteRecordingFiles, reconcile } from "#lib/server/files.js";
+import { reconcile, removeRecording } from "#lib/server/files.js";
+import { fileSize } from "#lib/server/fsx.js";
 import { seriesFolder } from "#lib/server/library.js";
 import { watchProgress } from "#lib/server/playback.js";
 import { recordingFromForm } from "#lib/server/recording.js";
-import { cancel, restore } from "#lib/server/reservations.js";
+import { cancelReservation, restore } from "#lib/server/reservations.js";
 import {
   activeEncodeJobId,
   cardContracts,
@@ -73,7 +75,7 @@ interface RecordingRow extends Recording {
   job_eta_ms: number | null;
   job_log: string | null;
   /**
-   * 中止をリクエストしてあって、まだ畳み終わっていない。中止のボタンを回したまま
+   * 中止をリクエストしてあって、まだ中止が済んでいない。中止のボタンを回したまま
    * にするための印 (`encoder.isCanceling`)。DB には無く、動いている間だけ
    */
   job_canceling: boolean;
@@ -108,7 +110,7 @@ interface RecordingRow extends Recording {
   has_logo: boolean | null;
   /**
    * 一覧の「残り」の位置と尺 (ms)。観る物差しに直したもの (`playback.watchProgress`)。続きが無ければ null。
-   * `resume_ms` は元の TS の物差しなので、エンコードしたものの尺と比べると CM を切ったものでは食い違う
+   * `resume_ms` は元の TS の物差しなので、エンコードしたものの尺とそのまま比べると、捨てた先頭 (v2.37 までに CM を切ったものは切った CM も) のぶん食い違う
    */
   progress: { at: number; length: number } | null;
   /** 「まとめて表示」でまとめるキーと見出し (`seriesGroup`) */
@@ -186,9 +188,9 @@ export function load({ url, cookies }) {
   const showDeleted = url.searchParams.get("deleted") === "1";
 
   /*
-   * 並びは**放送日時の近い順**で固定し、録画中だけ先頭に置く (「完了した予約も表示」で向きを変えていた頃は、
-   * 押した瞬間に一覧がひっくり返って見ていた行を見失った)。
-   * 録り始めてからの状態は**録画の行から引く** (予約側に書き写していた頃は、録画が失敗しても録画中のまま残った)。
+   * 並びは**放送日時の近い順**で固定し、録画中だけ先頭に置く。「完了した予約も表示」で向きを変えると、
+   * 押した瞬間に一覧がひっくり返って、見ていた行を見失うため。
+   * 録り始めてからの状態は**録画の行から引く**。予約側に書き写すと、録画が失敗しても録画中のまま残るため。
    *
    * 出すのはまだ始まっていないものと録っているもの (「完了した予約も表示」なら全部)。
    * - 録り逃し (`missed`) は録画の結果なので、録画の側に出す (下の `missed`)
@@ -246,7 +248,7 @@ export function load({ url, cookies }) {
     // まとめて表示のキー。予約はシリーズ名を持たないので、番組名から切り出す (録るときと同じ)
     .map((row) => ({ ...row, ...seriesGroup("", row.name) }));
 
-  // エンコードは録画の行の状態として出す (別のカードにしていた頃は、増えるたびに一覧が下へずれた)
+  // エンコードは録画の行の状態として出す。別のカードにすると、増えるたびに一覧が下へずれる
   const res = alias(reservationTable, "res");
   const j = alias(encodeJobs, "j");
   const recordings: RecordingRow[] = orm()
@@ -276,15 +278,15 @@ export function load({ url, cookies }) {
         // 録画中のものは予約の行として出ている。ここにも出すと同じ番組が 2 箇所に並ぶ
         ne(recordingTable.state, "recording"),
         /*
-         * 「削除済みも表示」は消したものを**足す**。消したものだけに切り替えていた頃は、
-         * 消したかどうかを確かめるのに一覧を行き来することになっていた
+         * 「削除済みも表示」は消したものを**足す**。消したものだけに切り替えると、
+         * 消したかどうかを確かめるのに一覧を行き来することになる
          */
         showDeleted ? undefined : isNull(recordingTable.deleted_at),
       ),
     )
     /*
-     * 並びは放送日順に固定する。エンコードが始まったものを上へ動かしていた頃は、
-     * 眺めている間に行が飛んで、どれを見ていたのか分からなくなっていた
+     * 並びは放送日順に固定する。エンコードが始まったものを上へ動かすと、
+     * 見ている間に行が動いて、どれを見ていたのか分からなくなる
      */
     .orderBy(desc(recordingTable.start_at))
     .limit(300)
@@ -306,7 +308,7 @@ export function load({ url, cookies }) {
   /*
    * 録り逃し。**録れたものに混ぜて出す** (画面側で放送日順に差し込む)。
    * チューナーが足りずに落とされたものが黙って消えると、録れたつもりのまま
-   * 気付かれずに終わる。いちばん知りたいのは「録れなかった」ほうなのに。
+   * 気付かれずに終わるため。
    *
    * **録画しない (コピー禁止の `skipped`) は入れない。** 意図して録らなかったもので、失敗ではない
    * (放送が終わっても `skipped` のまま。`scheduler.tick`)
@@ -357,9 +359,11 @@ export function load({ url, cookies }) {
 
   return {
     /** 局が無いときに上に出す案内 (`#lib/channel-notice.ts`。出すのは `+layout.svelte`) */
-    channelNotice: channelNotice(serviceCounts()),
-    /** チャンネルのお知らせの 1 行 (`server/channel-alert.ts`) */
-    channelAlert: channelAlert(),
+    channelNotice: channelNotice(
+      serviceCounts(),
+      listedServices(),
+      agentCount(),
+    ),
     reservations,
     recordings,
     missed,
@@ -367,19 +371,18 @@ export function load({ url, cookies }) {
     showDeleted,
     /** サイドバーの「状態」に出す空きと、あと何時間録れるかの目安 (`disk.capacity`)。読めなければ null */
     capacity: room === null ? null : capacityLabel(room.free, room.hours),
-    /** まとめて表示 (`#lib/grouping.ts`)。サーバで描く形を、端末の覚えに合わせる */
+    /** まとめて表示 (`#lib/grouping.ts`)。サーバで描く画面を、端末が cookie に保存した設定に合わせる */
     grouped: storedGrouped(cookies.get(GROUPED_COOKIE)),
-    /** 新しい順で表示 (`#lib/timeline.ts`)。こちらも端末の覚えに合わせる */
+    /** 新しい順で表示 (`#lib/timeline.ts`)。こちらも cookie に合わせる */
     reversed: storedReversed(cookies.get(REVERSED_COOKIE)),
     /** 録画ごとの切り抜きの数。詳細の「この録画の切り抜き (n)」 */
     clipCounts: clipCountsByRecording(),
   };
 }
 
-/** フォームの `id`。数でなければ null */
+/** フォームの `id`。ID として読めなければ null (`parseId`) */
 async function formId(request: Request): Promise<number | null> {
-  const id = Number((await request.formData()).get("id"));
-  return Number.isFinite(id) ? id : null;
+  return parseId((await request.formData()).get("id"));
 }
 
 export const actions = {
@@ -387,7 +390,8 @@ export const actions = {
     const recording = recordingFromForm(await request.formData());
     if (recording === undefined)
       return fail(400, { message: "録画が見つかりません" });
-    deleteRecordingFiles(recording, "手動削除");
+    if (!removeRecording(recording, "手動削除"))
+      return fail(409, { message: "録画中は消せません" });
     return { success: true };
   },
 
@@ -408,7 +412,7 @@ export const actions = {
      */
     if (settings().codec === "none") {
       return fail(400, {
-        message: "映像コーデックが選ばれていません。設定で選んでください",
+        message: NO_CODEC,
       });
     }
     enqueue(recording.id);
@@ -417,7 +421,7 @@ export const actions = {
   },
 
   /**
-   * 「CM 検出をやり直す」(詳細の「その他…」)。再エンコードせず、CM を探し直してエンコードしたもののチャプターを
+   * 「CM の再検出」(詳細の「その他…」)。再エンコードせず、CM を探し直してエンコードしたもののチャプターを
    * 書き直す (`encoder.runCmJob`)。エンコードするジョブと同じ待ち行列に並び、同じ録画に 2 つは積まない
    */
   redetectCm: async ({ request }) => {
@@ -438,7 +442,7 @@ export const actions = {
   cancelEncode: async ({ request }) => {
     const id = await formId(request);
     if (id === null) return fail(400, { message: "ジョブ ID が不正です" });
-    // 畳み終わってから返る。ここで待たないと、この直後の読み直しが
+    // 中止が済んでから返る。ここで待たないと、この直後の再読み込みが
     // まだ「エンコード中」を読んで、押しても何も変わらないように見える
     await cancelEncode(id);
     return { success: true };
@@ -448,7 +452,7 @@ export const actions = {
    * 「視聴済みにする」「未視聴に戻す」(詳細の「その他…」)。**どちらも続きの位置を消す。**
    * 一覧は続きの位置があれば進捗バーを出し、印 (点) を出さない。残したままだと、
    * 視聴済みにしても進捗バーのまま・未視聴に戻しても点が出ない、と押した結果が見えない。
-   * 末尾まで観たとき (`api/recordings/<id>/resume`) と同じ形 (観終えた = 位置なし) に揃える
+   * 末尾まで観たとき (`api/recordings/<id>/resume`) と同じ状態 (観終えた = 位置なし) に揃える
    */
   watched: async ({ request }) => {
     const form = await request.formData();
@@ -473,7 +477,7 @@ export const actions = {
   reconcile: () => {
     // 「ファイルと照合」ボタン。外から消した分をすぐ一覧に反映したいとき用
     const result = reconcile();
-    // 押した本人以外の画面も更新する。同じものを見ている端末が食い違うのを防ぐ
+    // 何も変わらなくても知らせる。押した本人以外の画面も再読み込みさせ、同じものを見ている端末どうしで食い違わないようにする
     emit("recordings");
     return { success: true, reconcile: result };
   },
@@ -482,7 +486,7 @@ export const actions = {
    * 録り逃しを一覧から消す。**消すのは予約の行そのもの**。録画の行が無い
    * (始まらないまま終わった) ので、失敗した録画の削除とは消す先が違う。
    * 放って置いても履歴の片付け (14 日) で消えるが、見るたびに並んだままなのは
-   * 失敗した録画と同じで、確かめ終わったら畳みたい
+   * 失敗した録画と同じで、確かめ終わったら消したい
    */
   deleteMissed: async ({ request }) => {
     const id = await formId(request);
@@ -522,7 +526,8 @@ export const actions = {
   cancel: async ({ request }) => {
     const id = await formId(request);
     if (id === null) return fail(400, { message: "予約 ID が不正です" });
-    await cancel(id);
+    const result = await cancelReservation(id);
+    if (!result.ok) return fail(result.status, { message: result.message });
     return { success: true };
   },
 };

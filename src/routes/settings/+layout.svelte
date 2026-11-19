@@ -5,6 +5,7 @@
   import { onDestroy } from "svelte";
   import ArrowLeft from "~icons/lucide/arrow-left";
 
+  import ChannelAlertDot from "#lib/components/ChannelAlertDot.svelte";
   import { SECTION_ALIASES, SETTINGS_GROUPS } from "#lib/settings-sections.js";
 
   let { children, data } = $props();
@@ -14,6 +15,11 @@
    * 下のタブ・ヘッダーの「設定」の点 (`routes/+layout.svelte` の `fresh`) からここまでをたどれるように
    */
   const freshGroup = $derived(data.update === null ? null : "general");
+  /**
+   * チャンネルのお知らせがあれば、文を出す「受信」(`reception#channels`) に印を付ける (`app.css` の `.alert-dot`)。
+   * 下のタブの「設定」の印 (`routes/+layout.svelte` の `entryMark`) からここまでをたどれるように
+   */
+  const alert = $derived(data.channelAlert);
 
   /** いま開いているグループ (`/settings/reception` なら `reception`)。`/settings` そのものなら null */
   const current = $derived(page.route.id?.split("/")[2] ?? null);
@@ -21,14 +27,14 @@
     SETTINGS_GROUPS.find((g) => g.slug === current) ?? null,
   );
 
-  /** 見えている節 (左の一覧と、狭い画面の上の行で印を付ける) */
+  /** 見えている節 (左の一覧と、狭い画面の節へ飛ぶ行で印を付ける) */
   let active = $state<string | null>(null);
 
   let main = $state<HTMLElement>();
 
   /**
-   * **グループを移ったら頭に戻す。** 巻き取るのはどの幅でも window (`routes/+layout.svelte` の `FILLED` に入れない)。
-   * 頭へは SvelteKit も戻すが、節へ滑らかに巻く設定 (下の `scroll-behavior`) のせいで、前のグループの下から頭まで巻く途中が見える。
+   * **グループを移ったら先頭に戻す。** 巻き取るのはどの幅でも window (`routes/+layout.svelte` の `FILLED` に入れない)。
+   * 先頭へは SvelteKit も戻すが、節へ滑らかに巻く設定 (下の `scroll-behavior`) のせいで、前のグループの下から先頭まで巻く途中が見える。
    * 戻る・進むはブラウザが前の位置へ帰すので触らない。`#<節>` 付きで来たらその節へ (飛ぶ途中を見せても意味が無いので、ここも滑らかにしない)
    */
   afterNavigate(({ from, to, type }) => {
@@ -54,9 +60,9 @@
   });
 
   /**
-   * **飛んだ先に、上の節が育つ間は付いていく。** 相手待ちの節 (チューナー) は骨組みのあとで本物が流れてきて
-   * 背が変わるので、開いた瞬間に合わせただけでは、流れ終わったころには前の節を見ている。
-   * 自分で巻こうとしたら (ホイール・指・キー・クリック)、そこで手を離す
+   * **上の節の高さが変わる間は、飛んだ先に位置を合わせ直す。** 相手待ちの節 (チューナー) は骨組みのあとで本物が届いて
+   * 背が変わるので、開いた瞬間に合わせただけでは、届き終わったころには前の節が見えている。
+   * 自分で巻こうとしたら (ホイール・指・キー・クリック)、そこで合わせ直すのをやめる
    */
   let unpin = () => {};
   const LET_GO = ["wheel", "touchstart", "keydown", "pointerdown"] as const;
@@ -126,7 +132,7 @@
     };
 
     /*
-     * 飛んだ節の頭が止まる所から下を数える。浮いたヘッダー (`html` の `scroll-padding-top` が px で持つ。スマホは 0) と、
+     * 飛んだ節の先頭が止まる所から下を数える。浮いたヘッダー (`html` の `scroll-padding-top` が px で持つ。スマホは 0) と、
      * 節の巻き取りの余白 (スマホの形は上の安全域のぶんも入っている。下の style)。
      * ここより上に残る前の節の終わりは数えない (スマホで節へ飛んだあと、前の節に印が戻っていた)。rootMargin は px か % だけ (rem を渡すと例外になる)
      */
@@ -154,25 +160,25 @@
 </script>
 
 <!--
-    **一覧と詳細の形**。左にグループとその節の一覧、右にグループの画面。
-    **グループごとに 1 つの画面** (`/settings/<グループ>`) で、節は上から積む。節を押すとそこへ滑らかに巻き、
-    巻いていくと左の一覧で見えている節に印が付く。並びは `#lib/settings-sections.ts`。
+  **一覧と詳細の形**。左にグループとその節の一覧、右にグループの画面。
+  **グループごとに 1 つの画面** (`/settings/<グループ>`) で、節は上から積む。節を押すとそこへ滑らかに巻き、
+  巻いていくと左の一覧で見えている節に印が付く。並びは `#lib/settings-sections.ts`。
 
-    **横に並べはじめる幅は 768px** (映像の画面の二段組 (1000px。[+layout.svelte](../+layout.svelte) の `FILLED` の上の説明) より手前から。768〜999px は下のタブの形のまま左の一覧を残す)。
-    並べたときの形は下の style。左の列と右とは線で分けない (地は同じで、右の列を真ん中に寄せた余白で分かれる)。
+  **横に並べはじめる幅は 768px** で、映像の画面の二段組の 1000px ([+layout.svelte](../+layout.svelte) の `FILLED` の上の説明) より手前。768〜999px は下のタブの形のまま左の一覧を残す。
+  並べたときの形は下の style。左の列と右とは線で分けない (地は同じで、右の列を真ん中に寄せた余白で分かれる)。
 
-    **狭い画面では一覧と中身を切り替える。** `/settings` はグループの一覧だけ、押すとその画面と「← 設定」、
-    節へ飛ぶ行 (巻いても残る。下のタブの上)。
+  **狭い画面では一覧と中身を切り替える。** `/settings` はグループの一覧だけ、押すとその画面と「← 設定」、
+  節へ飛ぶ行 (巻いても残る。下のタブの上)。
 
-    **節の操作 (見出しの行の押すもの・絞り込み) は、節の中の `.section-bar` に入れる。** スマホの形では見えている節の
-    その 1 行だけを下のタブの上 (768px 未満は節へ飛ぶ行のすぐ上) に浮かべ、節を移ると入れ替わる。操作の無い節では出さない。
-    広い形 (ヘッダーのある形) は節の中のまま
+  **節の操作 (見出しの行の押すもの・絞り込み) は、節の中の `.section-bar` に入れる。** スマホの形では見えている節の
+  その 1 行だけを下のタブの上 (768px 未満は節へ飛ぶ行のすぐ上) に浮かべ、節を移ると入れ替わる。操作の無い節では出さない。
+  広い形 (ヘッダーのある形) は節の中のまま
 -->
 <div class="page settings-page" class:list-view={current === null}>
   <!--
-        **行は線で区切らない** (録画の画面のサイドバーと同じ部品)。グループは太字の見出し、
-        節はそれより一段深い行。見えている節は左の縦線と主の色の太字
-    -->
+    **行は線で区切らない** (録画の画面のサイドバーと同じ部品)。グループは太字の見出し、
+    節はそれより一段深い行。見えている節は左の縦線と主の色の太字
+  -->
   <nav
     class="side side-panel"
     aria-label="設定の項目"
@@ -190,6 +196,9 @@
             data-testid="settings-nav-{g.slug}"
           >
             {g.label}
+            {#if alert !== null && g.slug === "reception"}
+              <ChannelAlertDot kind={alert.kind} />
+            {/if}
             {#if freshGroup === g.slug}
               <span
                 class="fresh-dot"
@@ -258,9 +267,9 @@
 
 <style>
   /*
-     * **広い画面では左右と下を main の余白の外まで広げる。** 左の列は画面の左端に付けてヘッダーの下に貼り付け、
-     * 高さは窓の残りまで (あふれたら一覧の中で巻き取る。`app.css` の `.side-panel`)。右の中身は窓ごと巻き、浮いたヘッダーの裏を流れる
-     */
+   * **広い画面では左右と下を main の余白の外まで広げる。** 左の列は画面の左端に付けてヘッダーの下に貼り付け、
+   * 高さは窓の残りまで (あふれたら一覧の中で巻き取る。`app.css` の `.side-panel`)。右の中身は窓ごと巻き、浮いたヘッダーの裏を流れる
+   */
   @media (min-width: 768px) {
     .page {
       display: grid;
@@ -275,10 +284,10 @@
   }
 
   /*
-     * ---- 左の一覧 ----
-     * **録画の画面のサイドバーと同じ部品** (`app.css` の `.side-panel`・`.side-label`・`.side-list`・`.side-item`)。
-     * グループの見出しはその画面へのリンク。ここは幅と、狭い画面の形だけ
-     */
+   * ---- 左の一覧 ----
+   * **録画の画面のサイドバーと同じ部品** (`app.css` の `.side-panel`・`.side-label`・`.side-list`・`.side-item`)。
+   * グループの見出しはその画面へのリンク。ここは幅と、狭い画面の形だけ
+   */
   .groups {
     display: flex;
     flex-direction: column;
@@ -302,15 +311,15 @@
   .group-hint {
     display: none;
   }
-  /* 新しいバージョンの点 (上の `freshGroup`)。名前の後ろに並べる */
+  /* 新しいバージョンの点 (上の `freshGroup`)。名前の後ろに、チャンネルのお知らせの印 (`.alert-dot`) と同じ間を空けて並べる */
   .group-link .fresh-dot {
-    margin-inline-start: 0.375rem;
+    margin-inline-start: var(--dp-space-1);
     vertical-align: 0.1em;
   }
   /*
-     * 狭い画面の一覧はグループだけ (押すとその画面。節へは節の行で飛ぶ)。
-     * 指で押すので行を高くする (40px 以上)。字は本文の大きさ、塗りだけ余白の外へ少し出す
-     */
+   * 狭い画面の一覧はグループだけ (押すとその画面。節へは節の行で飛ぶ)。
+   * 指で押すので行を高くする (40px 以上)。字は本文の大きさ、塗りだけ余白の外へ少し出す
+   */
   @media (max-width: 767.98px) {
     .side {
       padding: 0;
@@ -320,13 +329,13 @@
       display: none;
     }
     .groups {
-      margin-inline: -0.75rem;
+      margin-inline: calc(-1 * var(--dp-space-3));
     }
     /* 行どうしは線で区切らない。見出しの太字も外し、ふつうの行にする (下に中身の 1 行) */
     .group-link {
       display: block;
       margin: 0;
-      padding-block: 0.625rem;
+      padding-block: var(--dp-space-2);
       color: inherit;
       font-size: var(--dp-text-base);
       font-weight: var(--dp-weight);
@@ -352,9 +361,9 @@
     }
   }
   /*
-     * 中の 2 段組 (`app.css` の `.setting-rows`) は、この列の幅で切り替える。
-     * 広い画面では列を真ん中に寄せる (左に寄せたままだと右が大きく空いて見えた)
-     */
+   * 中の 2 段組 (`app.css` の `.setting-rows`) は、この列の幅で切り替える。
+   * 広い画面では列を真ん中に寄せる (左に寄せたままだと右が大きく空いて見えた)
+   */
   .main-inner {
     display: flex;
     width: 100%;
@@ -366,11 +375,11 @@
     container-type: inline-size;
   }
   /*
-     * **節どうしは線を引かず、上下にたっぷりの余白で区切る** (左の一覧のグループの境目と同じ考え。カードにはしない)。
-     * 節の中の行の間より目に見えて空ける。飛んだ先が見出しの上にぴったり付くよう、
-     * 巻き取りの余白を取る (広い画面は浮いたヘッダーの下。ヘッダーのぶんは `html` の `scroll-padding-top` が持つので、ここは間の余白だけ。
-     * スマホの形は上の安全域の下。下で決め直す)
-     */
+   * **節どうしは線を引かず、上下にたっぷりの余白で区切る** (左の一覧のグループの境目と同じ考え。カードにはしない)。
+   * 節の中の行の間より目に見えて空ける。飛んだ先が見出しの上にぴったり付くよう、
+   * 巻き取りの余白を取る (広い画面は浮いたヘッダーの下。ヘッダーのぶんは `html` の `scroll-padding-top` が持つので、ここは間の余白だけ。
+   * スマホの形は上の安全域の下。下で決め直す)
+   */
   .main-inner :global([data-part] + [data-part]) {
     margin-top: var(--dp-space-4);
     padding-top: var(--dp-space-6);
@@ -387,9 +396,9 @@
   }
 
   /*
-     * **狭い画面の節の行。** 「← 設定」と節の名前を横に並べ、巻いても残す (下のタブのすぐ上)。
-     * はみ出す分は横に巻く (行を折り返すと高さが変わり、飛んだ先の余白が合わなくなる)
-     */
+   * **狭い画面の節の行。** 「← 設定」と節の名前を横に並べ、巻いても残す (下のタブのすぐ上)。
+   * はみ出す分は横に巻く (行を折り返すと高さが変わり、飛んだ先の余白が合わなくなる)
+   */
   .jump {
     z-index: var(--dp-z-dock);
     display: flex;
@@ -419,9 +428,9 @@
     height: 1.125rem;
   }
   /*
-     * **スマホの形 (`#lib/phone-form.ts`。`<html data-phone>`) では下のタブのすぐ上に浮かべる** (押すものは下に。
-     * ホームの操作の 1 行と同じ `app.css` の `.dock`)。中身の最後が隠れないよう、そのぶん下を空ける
-     */
+   * **スマホの形 (`#lib/phone-form.ts`。`<html data-phone>`) では下のタブのすぐ上に浮かべる** (押すものは下に。
+   * ホームの操作の 1 行と同じ `app.css` の `.dock`)。中身の最後が隠れないよう、そのぶん下を空ける
+   */
   :global(:where(html[data-phone])) .page {
     /* 節へ飛ぶ行の高さ。節の操作の 1 行はこの上に積む (`--jump-room`。節へ飛ぶ行の無い 768px からは 0) */
     --jump-h: calc(var(--dp-btn-h-sm) + 0.5rem);
@@ -433,7 +442,7 @@
     box-sizing: border-box;
     height: var(--jump-h);
     margin: 0;
-    padding: 0.25rem 0.5rem;
+    padding: var(--dp-space-1) var(--dp-space-2);
   }
   :global(:where(html[data-phone])) .main-inner {
     padding-bottom: 3.5rem;
@@ -460,7 +469,7 @@
     align-items: center;
     gap: var(--dp-space-2);
     margin: 0;
-    padding: 0.25rem 0.5rem;
+    padding: var(--dp-space-1) var(--dp-space-2);
     overflow-x: auto;
     scrollbar-width: none;
     white-space: nowrap;

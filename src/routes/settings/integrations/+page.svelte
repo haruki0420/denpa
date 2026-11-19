@@ -6,12 +6,13 @@
   import Migrate from "./Migrate.svelte";
   import MigrateEdcb from "./MigrateEdcb.svelte";
   import Notifications from "./Notifications.svelte";
+  import Ranking from "./Ranking.svelte";
   import Transfer from "./Transfer.svelte";
   import Tv from "./Tv.svelte";
 
   let { data, form } = $props();
 
-  // 引き継ぎの進み具合はサーバから流れてくる
+  // 引き継ぎの進み具合はサーバから届く
   liveUpdates(["migrate"]);
 
   /** 押した結果は画面で 1 か所に出す。引き継ぎの進み具合そのものは、その節の中に出したまま */
@@ -38,7 +39,13 @@
       list.push({
         key: "niconico-unlinked",
         kind: "success",
-        text: "連携を外しました。ニコニコの側の許可は、ニコニコのアカウント設定から取り消せます",
+        text: "連携を解除しました。ニコニコの側の許可は、ニコニコのアカウント設定から取り消せます",
+      });
+    if (form?.rankingLeft === "unreached")
+      list.push({
+        key: "ranking-unreached",
+        kind: "info",
+        text: "denpa-hub に届かなかったため、送った予約は放送が終わると denpa-hub から消えます",
       });
     if (form?.migrate)
       list.push({ key: "migrate-started", kind: "info", text: form.migrate });
@@ -52,6 +59,7 @@
 <div id="notifications" data-part><Notifications {data} /></div>
 <div id="tv" data-part><Tv {data} /></div>
 <div id="jikkyo" data-part><Jikkyo {data} /></div>
+<div id="ranking" data-part><Ranking {data} /></div>
 <div id="migrate" data-part><Migrate {data} /></div>
 <div id="migrate-edcb" data-part><MigrateEdcb {data} /></div>
 <div id="transfer" data-part><Transfer {data} /></div>

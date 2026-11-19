@@ -5,7 +5,6 @@
   import { untrack } from "svelte";
   import RefreshCw from "~icons/lucide/refresh-cw";
   import ShieldCheck from "~icons/lucide/shield-check";
-  import X from "~icons/lucide/x";
 
   import { fullDate, SERVICE_TYPE_LABEL } from "#lib/format.js";
   import type {
@@ -16,18 +15,24 @@
 
   let {
     open,
+    agent,
     cardId,
     initialContracts = [],
     initialSettings,
     onclose,
   }: {
     open: boolean;
+    /** どのエージェントのカードか (契約の一覧と復号を確かめるカード。`tuners.server.ts`) */
+    agent: number;
     cardId: string | null;
     initialContracts: ContractRow[];
     initialSettings?: ContractSettings | undefined;
     onclose: () => void;
   } = $props();
 
+  // エージェントごとに 1 つずつ置くので、見出しの ID を窓ごとに分ける
+  const uid = $props.id();
+  const titleId = `contract-dialog-title-${uid}`;
   let dialog = $state<HTMLDialogElement | null>(null);
   let box = $state<HTMLElement | null>(null);
 
@@ -101,12 +106,9 @@
           element.showModal();
           box?.focus();
         }
-      } else {
-        if (element.open) element.close();
-      }
+      } else if (element.open) element.close();
     });
   });
-
   function formatDate(ms: number | null): string {
     if (!ms) return "—";
     const d = new Date(ms);
@@ -396,7 +398,7 @@
 <dialog
   bind:this={dialog}
   {onclose}
-  aria-labelledby="contract-dialog-title"
+  aria-labelledby={titleId}
   data-testid="contract-dialog"
 >
   <!-- 幕を押したら閉じる (`app.css` の `.modal-backdrop`) -->
@@ -408,16 +410,7 @@
     onclick={() => dialog?.close()}
   ></button>
   <article class="modal-box modal-box-wide" bind:this={box} tabindex="-1">
-    <button
-      type="button"
-      class="ghost icon small modal-close"
-      onclick={() => dialog?.close()}
-      aria-label="閉じる"
-      data-testid="contract-close"
-    >
-      <X aria-hidden="true" />
-    </button>
-    <h2 id="contract-dialog-title">有料契約の確認</h2>
+    <h2 id={titleId}>有料契約の確認</h2>
     <p class="small muted intro">
       {#if cardId}
         <span class="mono">B-CAS: {cardId}</span><br />
@@ -727,6 +720,14 @@
         </table>
       </div>
     {/if}
+    <footer class="modal-foot">
+      <button
+        type="button"
+        class="secondary modal-close"
+        onclick={() => dialog?.close()}
+        data-testid="contract-close">閉じる</button
+      >
+    </footer>
   </article>
 </dialog>
 
@@ -736,7 +737,6 @@
     max-width: 56rem;
     width: 100%;
   }
-
   .intro {
     margin: var(--dp-space-1) 0 var(--dp-space-4);
   }
@@ -761,7 +761,6 @@
     overflow-x: auto;
     max-height: 60vh;
   }
-
   table {
     width: 100%;
     border-collapse: collapse;

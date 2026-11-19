@@ -9,18 +9,50 @@
 import {
   type AdaptDecision,
   type AdaptSample,
+  autoValue,
   RungAdapter,
   type Step,
-  stepLabel,
 } from "./adapt";
 import { CODEC_LABEL } from "./hw";
 import type { LiveCodec } from "./live";
 import type { Pace, Rung } from "./rungs";
+import { holds, type Ranges } from "./ts/playback";
 
 /** `adapt.ts` を呼ぶ間隔 (ms)。`adapt.ts` の数 (2〜3 秒続いたら) を読み分けられる細かさ */
 export const ADAPT_TICK = 1_000;
 /** 送り出しの具合を読み直す間 (ms)。WebSocket の `pace` と同じ 2 秒ごと */
 const PACE_EVERY = 2_000;
+
+/** `HTMLMediaElement.NETWORK_IDLE` (ここは DOM を触らないので値で持つ) */
+const NETWORK_IDLE = 1;
+
+/** `fileIdle` に渡す `<video>` の様子 */
+interface FileMedia {
+  networkState: number;
+  seeking: boolean;
+  /** 読めている区間 (`remux-player.ts` の `rangesOf`) */
+  buffered: Ranges;
+  currentTime: number;
+}
+
+/**
+ * **ファイルの直再生で、ブラウザがファイルを読むのを止めているか** (`adapt.ts` の `AdaptSample.idle`)。
+ * `networkState` が `NETWORK_IDLE` か、直前の刻みの間に `suspend` が来た (`suspendAt`) ときに止めていると見る。
+ *
+ * いまの位置をまだ読んでいない間と、飛んでいる最中は false にする。`NETWORK_IDLE` は読み終えたときだけでなく、
+ * 読み始める前 (`preload` が `none` なら再生するまで読まない) と、飛んだ先を読み始める前にも付く。
+ * ここで足りている印にすると、回線が細くて 1 バイトも届かなくても下げなくなる
+ */
+export function fileIdle(
+  media: FileMedia,
+  suspendAt: number,
+  now: number,
+): boolean {
+  if (media.seeking) return false;
+  // 先頭は映像と音声の始まりのずれ (数十 ms) だけ後ろから溜まることがあるので、少し手前も含める
+  if (!holds(media.buffered, media.currentTime)) return false;
+  return media.networkState === NETWORK_IDLE || now - suspendAt <= ADAPT_TICK;
+}
 
 /** 段を下げた変換をリクエストするときに足すクエリ (`&rung=2&playable=av1,h264`)。段 0 は空 */
 export function rungQuery(rung: Rung, playable: readonly LiveCodec[]): string {
@@ -28,22 +60,21 @@ export function rungQuery(rung: Rung, playable: readonly LiveCodec[]): string {
   return `&rung=${rung}&playable=${playable.join(",")}`;
 }
 
-/** コーデックのメニューの「自動」の行の値 (「自動 (H.264 540p)」)。段 0 は「自動」だけ */
+/**
+ * 観る画面のコーデックのメニューの「自動」の行の値 (組み立ては `adapt.ts` の `autoValue`)。
+ * 段 0 は「自動」だけ (いまの形式は添えない)
+ */
 export function autoLabel(step: Step, codec: string | null): string {
   if (step === 0) return "自動";
   const name =
     codec === "h264" || codec === "hevc" || codec === "av1"
       ? CODEC_LABEL[codec]
       : "";
-  return `自動 (${stepLabel(step, name)})`;
+  return autoValue(step, name);
 }
 
-/** 段を切り替えようとして、サーバが混んでいて断られたとき。`down` は下げようとしたか */
-export function busyNote(down: boolean): string {
-  return down
-    ? "サーバが混んでいるため、画質を下げられませんでした"
-    : "サーバが混んでいるため、画質を上げられませんでした";
-}
+/** サーバが混んでいて段を替えられなかったときの文言。ライブのサーバの通知と同じ文なので、段の表 (`rungs.ts`) が持つ */
+export { busyNote } from "./rungs";
 
 /** 呼ぶたびに観る画面が渡すもの。`now`・`route`・`pace` はここで足す */
 export type WatchSample = Omit<AdaptSample, "now" | "route" | "pace"> & {
@@ -107,20 +138,16 @@ export function watchAdapt(host: WatchAdaptHost): WatchAdapt {
         return;
       }
       const at = now();
-      // 止めていた間の溜まりの伸びを、回線のぶんとして読まない
+      // 止めていた間のバッファの伸びを、回線のぶんとして読まない
       if (idle) adapter.reset(at);
       idle = false;
-      poll(s.paceId, at);
+      const { paceId, ...sample } = s;
+      poll(paceId, at);
       const decision = adapter.tick({
+        ...sample,
         now: at,
         route: "watch",
-        current: s.current,
-        manual: s.manual,
-        throughput: s.throughput,
-        ahead: s.ahead,
-        waiting: s.waiting,
         pace,
-        baseKbps: s.baseKbps,
       });
       if (decision !== null) host.decide(decision);
     },

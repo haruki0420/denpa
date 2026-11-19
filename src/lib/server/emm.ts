@@ -5,7 +5,9 @@ import {
 } from "@danything/arib/psi";
 import { eq } from "drizzle-orm";
 
-import { agentFetch } from "./agent-client";
+import { serviceChannel, servicePlaces, strictPlaces } from "./agent-channels";
+import { fetchAgent } from "./agent-client";
+import { listAgents } from "./agents";
 import { getActiveCardId } from "./contracts";
 import { orm } from "./db";
 import { services } from "./schema";
@@ -52,8 +54,12 @@ export async function sendCardEmm(
   timeoutMs = 5_000,
 ): Promise<EmmResult> {
   try {
+    const agent = listAgents()[0];
+    if (!agent) {
+      return { ok: false, code: 0, error: "エージェントが設定されていません" };
+    }
     const base64 = Buffer.from(payload).toString("base64");
-    const res = await agentFetch("/denpa/card/emm", {
+    const res = await fetchAgent(agent, "/denpa/card/emm", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ emm: base64 }),
@@ -166,14 +172,23 @@ export async function receiveEmm(
   }
 
   let channel = options.channel;
+  let places = channel
+    ? listAgents().map((agent) => ({ agent: agent.id, channel: channel! }))
+    : [];
   if (!channel) {
     const bsService = orm()
-      .select({ channel: services.channel })
+      .select({
+        channel: serviceChannel(),
+        places: servicePlaces(),
+      })
       .from(services)
       .where(eq(services.type, "BS"))
       .limit(1)
       .get();
     channel = bsService?.channel ?? "BS15:16625";
+    places = bsService?.places
+      ? strictPlaces(bsService.places)
+      : listAgents().map((agent) => ({ agent: agent.id, channel: channel! }));
   }
   const type = options.type ?? "BS";
   const seconds = options.seconds ?? 20;
@@ -194,7 +209,7 @@ export async function receiveEmm(
   try {
     stream = await openChannelStream(
       type,
-      channel,
+      places,
       abortController.signal,
       "live emm-pipeline",
       1, // 優先度

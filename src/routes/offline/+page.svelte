@@ -1,4 +1,5 @@
 <script lang="ts">
+  import "@anyblades/blades/components/progress";
   import { onMount, tick } from "svelte";
 
   import { arming } from "#lib/arming.svelte.js";
@@ -19,7 +20,7 @@
    *
    * プレイヤーはこの画面に内蔵する。オフラインでは /watch/<id> へは行けない
    * (あの画面はサーバが組む) ので、ここで直接観られるようにしておく。
-   * オンラインで観るぶんには従来どおり /watch が端末のコピーを使う。
+   * オンラインでは /watch が端末のコピーを使う。
    *
    * **`<video>` で読めなければ canvas に描く** (観る画面の互換モードと同じエンジン。`canvas-player.ts`・
    * `mkv-source.ts`)。保存したものは Matroska で、iPhone の Safari の `<video>` は Matroska を読めない
@@ -58,6 +59,8 @@
    * サーバからも消えることが分かる言葉で聞き返す
    */
   const deleting = arming('[data-testid="offline-delete"]');
+  /** 端末で消して、オンラインに戻ったらサーバでも消す録画の数 */
+  const pendingDeletes = $derived(Object.keys(offline.pendingDelete).length);
 
   async function load(): Promise<void> {
     list = (await videos.all()).sort((a, b) => b.startAt - a.startAt);
@@ -66,6 +69,7 @@
 
   onMount(() => () => {
     stop();
+    deleting.fire();
     for (const url of posterUrls.values()) URL.revokeObjectURL(url);
     posterUrls.clear();
   });
@@ -84,6 +88,7 @@
     drawnWaiting = false;
     scrub = null;
     problem = null;
+    lastKept = 0;
     if (src !== null) URL.revokeObjectURL(src);
     if (poster !== null) URL.revokeObjectURL(poster);
     src = null;
@@ -94,12 +99,14 @@
   async function play(item: OfflineVideo): Promise<void> {
     if (item.state !== "ready" || item.video === undefined) return;
     stop();
+    const mine = session;
     playing = item;
     src = URL.createObjectURL(item.video);
     poster =
       item.poster === undefined ? null : URL.createObjectURL(item.poster);
     // 前回の続きから。オフライン中の位置は resumeQueue に覚えている
     const kept = await resumeQueue.get(item.id);
+    if (mine !== session) return;
     startAt = kept?.at ?? 0;
     if (video !== null) video.currentTime = startAt;
   }
@@ -152,7 +159,7 @@
         start: at >= length - 1 ? 0 : at,
         audio: "0",
         /*
-         * **「再生する音」として鳴らす。** そうしないと iPhone は消音スイッチで Web Audio を黙らせる
+         * **「再生する音」として鳴らす。** そうしないと iPhone は消音スイッチで Web Audio の音を消す
          * (`<video>` は消音スイッチでも鳴る)。押して観はじめたものなので、`<video>` と同じに扱う
          */
         background: true,
@@ -207,7 +214,7 @@
     if (playing === null) return;
     if (Math.abs(at - lastKept) < 5) return;
     lastKept = at;
-    // 落としたものはエンコードしたもの
+    // 端末に保存したものはエンコードしたもの
     void rememberResume(playing.id, at, length, "encoded");
   }
   function onTime(): void {
@@ -249,8 +256,9 @@
 <div class="page">
   <h1>端末に保存した録画</h1>
   <p class="lead small muted">
-    電波の無いところでも観られます。ここで削除すると、
-    <strong>次にオンラインに戻ったとき、サーバの録画も消えます</strong>。
+    電波の無いところでも観られます。ここで削除すると、<strong
+      >次にオンラインに戻ったとき、サーバの録画も消えます</strong
+    >。
   </p>
 
   {#if playing !== null}
@@ -297,7 +305,7 @@
                 scrub = null;
               }}
             />
-            <span class="clock tiny muted">
+            <span class="clock tiny muted num">
               {clock(scrub ?? drawnAt)} / {clock(drawnLength)}
             </span>
             {#if drawnMuted}
@@ -322,17 +330,19 @@
     <p class="muted">読み込んでいます…</p>
   {:else if list.length === 0}
     <div class="empty-state glow">
-      <p class="bold">まだ何も保存していません</p>
+      <p class="bold">端末に保存した録画はまだありません</p>
       <p class="small muted">
-        録画の詳細の「端末に保存」を押すと、オフラインでも観られるようになります。
+        録画の詳細の「端末に保存」を押すと、オフラインでも観られるようになります
       </p>
     </div>
   {:else}
     <ul class="item-list">
       {#each list as item (item.id)}
+        {@const thumb = posterUrl(item)}
+        {@const progress = offline.entries[item.id]?.progress ?? null}
         <li class="row item">
-          {#if posterUrl(item) !== null}
-            <img src={posterUrl(item)} alt="" class="thumb" />
+          {#if thumb !== null}
+            <img src={thumb} alt="" class="thumb" />
           {:else}
             <div class="thumb blank"></div>
           {/if}
@@ -349,49 +359,59 @@
             </div>
           </div>
           {#if item.state === "downloading"}
-            {@const progress = offline.entries[item.id]?.progress ?? null}
-            <span class="tag keep">
-              保存中{progress === null ? "…" : ` ${percent(progress)}`}
-            </span>
-          {:else if item.state === "failed"}
-            <span class="tag error keep">保存に失敗</span>
-          {:else}
-            <button type="button" class="small keep" onclick={() => play(item)}>
-              再生
-            </button>
+            <!-- 進み具合は件の面の下端いっぱいに敷く (ホームの行と同じ)。取れないときは動いているだけのバー -->
+            <progress
+              class="row-bar"
+              class:running={progress !== null}
+              value={progress ?? undefined}
+              max="1"
+              aria-label="端末への保存の進み具合"
+            ></progress>
           {/if}
-          {#if item.state === "failed"}
-            <!-- 失敗した控えの片付け。**サーバの録画には触らない** (中身が無いだけ) -->
-            <button
-              type="button"
-              class="ghost small keep"
-              onclick={async () => {
-                await removeLocal(item.id);
-                await load();
-              }}
-            >
-              失敗した保存データを削除
-            </button>
-          {:else}
-            <button
-              type="button"
-              class="small keep {deleting.armed === item.id
-                ? 'danger'
-                : 'outline danger'}"
-              onclick={() => remove(item)}
-              data-testid="offline-delete"
-            >
-              {deleting.armed === item.id ? "端末とサーバから削除" : "削除"}
-            </button>
-          {/if}
+          <!-- 行の操作。押せる高さはホームの行と同じ 40px (`app.css` の `.row-actions`。docs/design.md の「何行かある一覧」) -->
+          <div class="row-actions">
+            {#if item.state === "downloading"}
+              <span class="tag">
+                保存中{progress === null ? "…" : ` ${percent(progress)}`}
+              </span>
+            {:else if item.state === "failed"}
+              <span class="tag error">保存に失敗</span>
+              <!-- 失敗した控えの片付け。**サーバの録画には触らない** (中身が無いだけ) -->
+              <button
+                type="button"
+                class="ghost small"
+                onclick={async () => {
+                  await removeLocal(item.id);
+                  await load();
+                }}
+              >
+                失敗した保存データを削除
+              </button>
+            {:else}
+              <button type="button" class="small" onclick={() => play(item)}>
+                再生
+              </button>
+            {/if}
+            {#if item.state !== "failed"}
+              <button
+                type="button"
+                class="small danger"
+                class:outline={deleting.armed !== item.id}
+                onclick={() => remove(item)}
+                data-testid="offline-delete"
+              >
+                {deleting.armed === item.id ? "端末とサーバから削除" : "削除"}
+              </button>
+            {/if}
+          </div>
         </li>
       {/each}
     </ul>
   {/if}
 
-  {#if Object.keys(offline.pendingDelete).length > 0}
+  {#if pendingDeletes > 0}
     <p class="pending tiny muted">
-      {Object.keys(offline.pendingDelete).length} 件は、次にオンラインに戻ったときにサーバからも削除します。
+      {pendingDeletes} 件は、次にオンラインに戻ったときにサーバからも削除します。
     </p>
   {/if}
 </div>
@@ -402,13 +422,13 @@
     margin: 0 auto;
   }
   h1 {
-    margin-bottom: 0.25rem;
+    margin-bottom: var(--dp-space-1);
   }
   .lead {
-    margin-bottom: 1rem;
+    margin-bottom: var(--dp-space-4);
   }
   .player {
-    margin-bottom: 1rem;
+    margin-bottom: var(--dp-space-4);
   }
   .player video {
     display: block;
@@ -436,8 +456,8 @@
   .controls {
     display: flex;
     align-items: center;
-    gap: 0.5rem;
-    margin-top: 0.25rem;
+    gap: var(--dp-space-2);
+    margin-top: var(--dp-space-1);
   }
   .controls input[type="range"] {
     min-width: 0;
@@ -446,27 +466,39 @@
   }
   .clock {
     flex-shrink: 0;
-    font-variant-numeric: tabular-nums;
   }
   .problem {
-    margin: 0.25rem 0 0;
+    margin: var(--dp-space-1) 0 0;
   }
   .player-bar {
     display: flex;
     align-items: center;
     justify-content: space-between;
-    margin-top: 0.25rem;
-  }
-  .name {
-    font-weight: var(--dp-weight);
+    margin-top: var(--dp-space-1);
   }
   /* 1 件ずつ件の面 (`app.css` の `.item`) に乗せ、並べ方は `.item-list` (docs/design.md の「何行かある一覧」。ホームの行と同じ) */
   .row {
+    position: relative;
     display: flex;
     align-items: center;
-    gap: 0.75rem;
+    gap: var(--dp-space-3);
     min-height: var(--dp-item-h);
-    padding: 0.5rem 0.75rem;
+    padding: var(--dp-space-2) var(--dp-space-3);
+    /* 下端のバーを面の角で切り落とす */
+    overflow: clip;
+  }
+  /* 進み具合のバー。高さと色はホームの行と同じ (`home.css` の `.row-bar.success`) */
+  .row-bar {
+    position: absolute;
+    inset-inline: 0;
+    bottom: 0;
+    width: 100%;
+    height: 3px;
+    margin: 0;
+    border-radius: 0;
+    --pico-progress-color: var(--dp-ok);
+    /* 画面の外では描かない (バーの光が回り続けない)。大きさは上で決めてあるので contain-intrinsic-size は要らない */
+    content-visibility: auto;
   }
   .thumb {
     width: 5rem;
@@ -481,10 +513,10 @@
     min-width: 0;
     flex: 1 1 0%;
   }
-  .keep {
+  .row-actions {
     flex-shrink: 0;
   }
   .pending {
-    margin-top: 0.75rem;
+    margin-top: var(--dp-space-3);
   }
 </style>

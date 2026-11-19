@@ -5,9 +5,9 @@ import { expect, goto, test } from "./helpers";
 /**
  * **ソフトウェアで描いている端末では、動き続けるものを止める** (docs/design.md の「動き」。`#lib/lite.ts`)。
  *
- * 開いたときに WebGL の描き手の名前を読み、ソフトウェアなら `<html data-lite>` を付ける。
+ * 開いたときに WebGL のレンダラの名前を読み、ソフトウェアなら `<html data-lite>` を付ける。
  * 付いている間は、録画中の点・骨組みの光などを動きを減らす設定と同じ止まった姿にする (`app.css` の最後)。
- * 描き手の名前は端末で変わるので、WebGL の箱を差し替えて名前を決める。動きを見るので、動きを許して流す
+ * レンダラの名前は端末で変わるので、WebGL の箱を差し替えて名前を決める。動きを見るので、動きを許して流す
  */
 test.use({ reducedMotion: "no-preference" });
 
@@ -41,20 +41,23 @@ async function fakeRenderer(page: Page, name: string): Promise<void> {
   }, name);
 }
 
-/** 録画中の点と骨組みを置き、それぞれの動きの名前を読む */
+/** 録画中の点・骨組み・値の無い進み具合のバーを置き、それぞれの動きの名前を読む */
 function animations(page: Page) {
   return page.evaluate(() => {
     const dot = document.createElement("span");
     dot.className = "rec-dot";
     const skeleton = document.createElement("div");
     skeleton.className = "skeleton";
-    document.body.append(dot, skeleton);
+    const bar = document.createElement("progress");
+    document.body.append(dot, skeleton, bar);
     const result = {
       dot: getComputedStyle(dot).animationName,
       skeleton: getComputedStyle(skeleton, "::after").animationName,
+      bar: getComputedStyle(bar).animationName,
     };
     dot.remove();
     skeleton.remove();
+    bar.remove();
     return result;
   });
 }
@@ -63,7 +66,7 @@ function lite(page: Page) {
   return page.evaluate(() => document.documentElement.dataset["lite"] ?? null);
 }
 
-test("ソフトウェアの描き手なら data-lite を付け、録画中の点と骨組みの光を止める", async ({
+test("ソフトウェアのレンダラなら data-lite を付け、録画中の点・骨組みの光・値の無いバーを止める", async ({
   page,
 }) => {
   await fakeRenderer(
@@ -72,10 +75,14 @@ test("ソフトウェアの描き手なら data-lite を付け、録画中の点
   );
   await goto(page, "/settings");
   await expect.poll(() => lite(page)).toBe("");
-  expect(await animations(page)).toEqual({ dot: "none", skeleton: "none" });
+  expect(await animations(page)).toEqual({
+    dot: "none",
+    skeleton: "none",
+    bar: "none",
+  });
 });
 
-test("GPU の描き手なら data-lite を付けず、回し続ける", async ({ page }) => {
+test("GPU のレンダラなら data-lite を付けず、回し続ける", async ({ page }) => {
   await fakeRenderer(
     page,
     "ANGLE (NVIDIA, NVIDIA GeForce RTX 4070 Direct3D11 vs_5_0 ps_5_0, D3D11)",
@@ -86,5 +93,6 @@ test("GPU の描き手なら data-lite を付けず、回し続ける", async ({
   expect(await animations(page)).toEqual({
     dot: "rec-pulse",
     skeleton: "skeleton-sweep",
+    bar: "progress-wait",
   });
 });

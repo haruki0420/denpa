@@ -14,9 +14,9 @@
 <svelte:window onclick={revoking.stand} />
 
 <!--
-    テレビのアプリ (danything/denpa-tv) に渡したアクセストークン。家の外から OIDC 越しに使うテレビは
-    QR でペアリングしてアクセストークンを持つ (信頼するネットワークの中なら要らない)。
-    なくしたテレビ・手放したテレビはここで止める
+  テレビのアプリ (danything/denpa-tv) に渡したアクセストークン。家の外から OIDC 越しに使うテレビは
+  QR でペアリングしてアクセストークンを持つ (信頼するネットワークの中なら要らない)。
+  なくしたテレビ・手放したテレビはここで止める
 -->
 <div class="sections readable">
   <section class="section">
@@ -38,12 +38,13 @@
         {#each data.devices as device (device.id)}
           <div class="device item" data-testid="device-row">
             <div class="grow">
-              <div><strong>{device.name}</strong></div>
+              <div>{device.name}</div>
               <div class="small muted">
-                ペアリング {dateTime(device.created_at)}・最後に使った
-                {device.last_used_at === null
-                  ? "まだ"
-                  : dateTime(device.last_used_at)}
+                ペアリング {dateTime(
+                  device.created_at,
+                )}・{device.last_used_at === null
+                  ? "まだ使っていません"
+                  : `最後に使った ${dateTime(device.last_used_at)}`}
               </div>
             </div>
             <div class="row-actions">
@@ -72,6 +73,6 @@
     align-items: center;
     gap: var(--dp-space-3);
     min-height: var(--dp-item-h);
-    padding: 0.5rem 0.75rem;
+    padding: var(--dp-space-2) var(--dp-space-3);
   }
 </style>

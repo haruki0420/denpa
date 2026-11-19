@@ -195,7 +195,7 @@ test.describe("ルールの編集", () => {
     await cancelAllReservations(page);
   });
 
-  test("ルールが立てた予約を1件ずつ取り消せる", async ({ page }) => {
+  test("ルールが立てた予約を 1 件ずつ取り消せる", async ({ page }) => {
     /*
      * ここで立てた予約は取り消しで残る (ルールは作り直さないため)。
      * 他のテストが使う「テストアニメ」を消費すると、そちらで予約が
@@ -218,7 +218,7 @@ test.describe("ルールの編集", () => {
       await expect(cancels).toHaveCount(left - 1);
     }
 
-    // 残りはルールごと畳む。まだ始まっていない予約は行ごと消える
+    // 残りはルールごと削除する。まだ始まっていない予約は行ごと消える
     await goto(page, "/rules");
     await deleteRule(page.getByTestId("rule-row").first());
     await expect(page.getByTestId("rule-row")).toHaveCount(0);

@@ -4,7 +4,8 @@
  * デコードは canvas に描く worker と同じ関数 (`wasm-audio.ts`)。デコーダを読み終えるまでに届いたものは溜めておき、
  * 読み終えたら順に流す
  */
-import { type Fmp4Track, readFragment, readInit } from "../ts/fmp4";
+import { type Fmp4Track, readFragment, readInit } from "#lib/ts/fmp4.js";
+
 import { audioCodec, audioFrame } from "./fmp4";
 import {
   type AudioInput,
@@ -40,7 +41,7 @@ function fail(message: string): void {
   post({ type: "error", message });
 }
 
-/** 画面の断り書きに出す理由 (`Error: ` を付けない) */
+/** 画面に出す理由 (`Error: ` を付けない) */
 function reason(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
@@ -79,7 +80,7 @@ function segment(d: WasmAudio, message: Segment): void {
   }
 }
 
-/** 流して、受け取ったと返す (画面はこれで送り込みすぎを測る) */
+/** 読んでデコードし、受け取ったと返す (画面はこれで送り込みすぎを測る) */
 function handle(d: WasmAudio, message: Segment): void {
   segment(d, message);
   post({ type: "ack", bytes: message.bytes.byteLength });

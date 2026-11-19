@@ -11,7 +11,7 @@
  * (`serverOptions` は JSON にして埋め込まれるので関数を持てない)。`platform.server` で
  * Bun の Server には触れても、`websocket` 無しに立てた Server は upgrade できない。
  * SvelteKit の手続き (handler) も静的ファイルの表 (routes) も `build/server/adapter-index.js`
- * に畳み込まれていて、外から import できる形では出てこない。
+ * に取り込まれていて、外から import できる形では出てこない。
  *
  * そこで **`Bun.serve` を 1 回だけ包んでから `build/index.js` を読む。** adapter が渡す
  * 設定 (PORT・HOST・BODY_SIZE_LIMIT などの環境変数を読んだもの) はそのまま使い、
@@ -23,7 +23,7 @@
  * 閉じるので、録画が終わるまで居座る間に画面が開けなくなる。アプリ (`runtime.ts` の
  * `takeOverSignals`) が引き取る。adapter が合図を登録するのは `build/index.js` のいちばん最後なので、
  * 読み終えたあとでもう一度アプリに引き取らせる (下の `takeOver`)。アプリが引き取るまでに来た合図は
- * `hold-signals.ts` が取っておき、アプリが受け直す (PID 1 では、受け手のいない合図は捨てられる)。
+ * `hold-signals.ts` が取っておき、アプリが受け直す (PID 1 では、誰も受け取らない合図は捨てられる)。
  *
  * **`Host` はそのまま扱う。** SvelteKit の CSRF 判定は自分の origin と `Origin` を比べる。
  * denpa は名前をいくつも持てるので自分の origin を 1 つに固定できない (SvelteKit の `paths.origin`。
@@ -108,7 +108,7 @@ const websocket = {
   //
   // 映像はサーバ→客の一方向なので、この値は「客からの pong が途切れて
   // よい上限」。ブラウザは ping に自動で pong を返すため、**生きている客は
-  // 映像が流れているだけで切れない**。返さなくなった客だけを畳む。
+  // 映像が流れているだけで切れない**。返さなくなった客だけを切断する。
   // serve 直下は 0 のままで、録画のファイルや SSE はこの値に掛からない。
   idleTimeout: 120,
   sendPings: true,

@@ -1,6 +1,6 @@
 /**
- * **Web Audio で鳴らす音の出口** (3 画面共通)。canvas に描く経路 (`raw/engine.ts`) と、`<video>` の音を通す
- * 経路 (`components/player/volume.svelte.ts`) が同じものを使う。
+ * **Web Audio で鳴らす音の出口** (3 画面共通)。canvas に描く経路 (`raw/engine.ts`)、`<video>` の音を通す
+ * 経路 (`components/player/volume.svelte.ts`)、WebKit のライブで音を別に鳴らす経路 (`raw/native-audio.ts`) が同じものを使う。
  *
  * 出口までは「音量 → リミッタ → 出口」の 1 本の経路 (`Outlet`)。決め方は `volume.ts`
  */
@@ -18,7 +18,7 @@ import {
  *
  * Web Audio で鳴らす音を、言わずにおくと iOS は効果音と同じに扱い、**Safari を裏へ回すと止める**。
  * 小窓で観ていても音だけ消えた (iPhone 15 Pro Max、iOS 27.2)。消音スイッチで黙らないのも `<video>` と
- * 同じになる。畳むときは既定 (`auto`) に戻す。
+ * 同じになる。破棄するときは既定 (`auto`) に戻す。
  *
  * これが言える端末 (Safari) では `<audio>` を通さない (`Outlet.route`)
  */
@@ -58,7 +58,7 @@ export class Outlet {
   private wanted = false;
   /** 止めているか (`hold`)。`<audio>` も止めておく。外から見て「止まっている」と分かるように */
   private held = false;
-  /** `<audio>` の出口。一度作ったら畳むまで使い回す */
+  /** `<audio>` の出口。一度作ったら破棄するまで使い回す */
   private out: Through | null = null;
   private passing = false;
   private gone = false;
@@ -167,6 +167,9 @@ export class Outlet {
   destroy(): void {
     if (this.gone) return;
     this.gone = true;
+    // AudioContext は使い回すことがある (`NativeAudio`)。閉じなくても音が残らないように、自分の経路を外しておく
+    this.input.disconnect();
+    this.tail.disconnect();
     if (this.out !== null) {
       this.out.audio.pause();
       this.out.audio.srcObject = null;

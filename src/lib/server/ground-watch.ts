@@ -6,19 +6,20 @@
  *
  * - **続けて選局できないチャンネル** (`reception.failingGround`)。周波数が変わったなら、スキャンし直せば選局できる
  * - **局の顔ぶれがスキャンの結果と違うチャンネル。** 番組表の取得がチャンネルを開いたときに SDT を読み、そのチャンネルに入っている
- *   局 (テレビ) をスキャンの結果と比べる。局が増えた・減ったなら、スキャンし直せば入る
+ *   局 (取り込む種別の局。テレビ・ラジオ・データ放送) をスキャンの結果と比べる。局が増えた・減ったなら、スキャンし直せば入る
  *
- * どちらもお知らせの 1 行 (録画・番組表・ライブの上) に出し、起きたときに通知の「チャンネルの変更」も送る。
+ * どちらもヘッダーの印 (`ChannelAlert.svelte`) に出し、起きたときに通知の「チャンネルの変更」も送る。
  * スキャンし直すか、受信できるようになれば消える
  */
 import { SdtReader, type TransportInfo } from "@danything/arib/psi";
 
 import { failingGround } from "./reception";
+import { IMPORTED_SERVICE_TYPES } from "./schema";
 import type { AgentChannel } from "./tuner";
 import { notify } from "./webhook";
 
-/** 局の顔ぶれがスキャンの結果と違ったチャンネル (名前 → 放送の局のサービス ID の並び) */
-const mismatched = new Map<string, string>();
+/** 局の顔ぶれがスキャンの結果と違ったチャンネルの名前 */
+const mismatched = new Set<string>();
 
 /** 通知を送った文。同じ文は 2 度送らない */
 const notified = new Set<string>();
@@ -26,7 +27,7 @@ const notified = new Set<string>();
 /** 番組表の取得がチャンネルを読むついでに、SDT を読む長さ (SDT は 2 秒に 1 回は流れる) */
 const WATCH_FOR = 15_000;
 
-/** テレビの局のサービス ID を並べた文字列 (比べるため) */
+/** 取り込む種別の局のサービス ID を並べた文字列 (比べるため) */
 const shapeOf = (ids: Iterable<number>) =>
   [...ids].sort((a, b) => a - b).join(",");
 
@@ -47,16 +48,16 @@ export function compareGround(
   if (ts.services.length === 0) return;
   const broadcast = shapeOf(
     ts.services
-      .filter((service) => service.serviceType === 0x01)
+      .filter((service) => IMPORTED_SERVICE_TYPES.has(service.serviceType))
       .map((service) => service.serviceId),
   );
   const kept = shapeOf(
     channel.services
-      .filter((service) => service.serviceType === 0x01)
+      .filter((service) => IMPORTED_SERVICE_TYPES.has(service.serviceType))
       .map((service) => service.serviceId),
   );
   if (broadcast === kept) mismatched.delete(channel.channel);
-  else mismatched.set(channel.channel, broadcast);
+  else mismatched.add(channel.channel);
 }
 
 /** スキャンの結果から無くなったチャンネルの違いを忘れる (スキャンし直した) */
@@ -64,7 +65,7 @@ export function forgetGround(channels: readonly AgentChannel[]): void {
   const listed = new Set(
     channels.filter((c) => c.type === "GR").map((c) => c.channel),
   );
-  for (const channel of mismatched.keys()) {
+  for (const channel of mismatched) {
     if (!listed.has(channel)) mismatched.delete(channel);
   }
 }
@@ -78,7 +79,7 @@ function groundTexts(): string[] {
       `${failing.join("・")} を続けて選局できません。周波数が変わった場合は、地上波をスキャンし直すと選局できます`,
     );
   if (mismatched.size > 0) {
-    const channels = [...mismatched.keys()].sort((a, b) =>
+    const channels = [...mismatched].sort((a, b) =>
       a.localeCompare(b, "en", { numeric: true }),
     );
     texts.push(
@@ -88,7 +89,7 @@ function groundTexts(): string[] {
   return texts;
 }
 
-/** お知らせの 1 行。両方あれば、選局できないほうを出す。知らせることが無ければ null */
+/** ヘッダーの印に出す文。両方あれば、選局できないほうを出す。知らせることが無ければ null */
 export function groundNotice(): string | null {
   return groundTexts()[0] ?? null;
 }

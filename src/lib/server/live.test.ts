@@ -1,42 +1,66 @@
 import { describe, expect, test } from "bun:test";
 
+import { PacketStream } from "@danything/arib/psi";
+import {
+  packetize,
+  patSection,
+  programMap,
+  stream,
+} from "@danything/arib/synth";
+
 import {
   askedTrack,
   type AudioSide,
   audioTracks,
+  broadcastTrack,
   pickTrack,
 } from "#lib/arib.js";
-import { CHANNEL, codecsFor } from "#lib/live.js";
+import { BROADCAST_HEVC, CHANNEL, codecsFor } from "#lib/live.js";
 
 import type { LiveHw } from "./hwenc";
 import {
+  AUDIO_FORM,
   audioArgs,
   blameLiveHw,
+  CardNumber,
   CHASE_STREAM_HOLD,
+  chaseForm,
+  chaseRawServed,
+  copiesVideo,
   encodeArgs,
   EncodeLag,
   encodeSpeed,
+  hevcTsCodec,
   keepLight,
   key,
   type Light,
   LIGHT_LAG,
   lightNotices,
   LIVE_STREAM_BACKLOG,
+  liveForm,
   liveHwFailed,
+  liveRungCodec,
+  missingMedia,
+  missingMediaMessage,
   nextLight,
   openingLine,
   parseCommand,
   parsePlayable,
+  pinnedNotTuned,
+  PmtAudioWatch,
   rawEnding,
+  rawOpeningLine,
   rungCodec,
   rungPlan,
   rungSlot,
+  servedFormat,
   sessionStream,
   softwareEncodes,
   takeLight,
   videoArgs,
   whyNotTuned,
 } from "./live";
+import { HLG_TO_SDR } from "./uhd";
 
 /** 1 本目の音声をそのまま。番組表が何も言っていないときの既定 */
 const stereo = audioTracks([])[0]!;
@@ -60,7 +84,7 @@ describe("ライブのエンコード方法", () => {
    * **`-flags low_delay` を入れない。**
    *
    * `-i` より前に書くとエンコーダではなくデコーダに効く。放送の MPEG-2 には
-   * B フレームがあるので、この指定を受けたデコーダは表示順ではなく復号順で
+   * B フレームがあるので、この指定を受けたデコーダは表示順ではなくデコード順で
    * フレームを出し、1 枚進んでは戻るように見える。実測で隣り合うコマの差の比が
    * 2.17 → 1.11 に落ちた (素材のフィールドを直に測ると 1.02)。
    * エンコーダ側の遅れは `-tune zerolatency` が見ている。
@@ -70,26 +94,26 @@ describe("ライブのエンコード方法", () => {
   });
 
   /*
-   * **入口の解析で読んだぶんを捨てさせない。**
+   * **入力の解析で読んだぶんを捨てさせない。**
    *
    * `-fflags nobuffer` を付けると、解析 (`-probesize`) の間に読んだ I フレームを捨てて
-   * 次の GOP を待つ。合成の TS を実時間で流し込むと、I フレームが頭から 40ms の位置で
+   * 次の GOP を待つ。合成の TS を実時間で流し込むと、I フレームが先頭から 40ms の位置で
    * 最初の moof が 781〜803ms → 外して 270〜291ms。1 秒ぶん出そろう時刻は変わらなかった
    * (遅れは増えない)。どの音声・コーデックでも同じ
    */
-  test("入口の解析で読んだぶんを捨てさせない", () => {
+  test("入力の解析で読んだぶんを捨てさせない", () => {
     for (const codec of ["h264", "av1", "audio"] as const) {
       expect(encodeArgs(1024, stereo, codec)).not.toContain("nobuffer");
     }
   });
 
   /*
-   * **入口の解析は小さくてよい。渡す前に 1 局へ絞るから。**
+   * **入力の解析は小さくてよい。渡す前に 1 局へ絞るから。**
    *
    * ffmpeg は名指しした局を `-probesize` のぶん読む間に見つけられなければ、
    * **そのまま終了する**。実機の tvk (T15。tvk1/2/3 + ワンセグ + データで、
    * 局ごとに 14 本以上のストリーム) では 400KB でも足りず、
-   * `Failed to set value '0:p:24632:v:0' for option 'map'` で降りていた。
+   * `Failed to set value '0:p:24632:v:0' for option 'map'` で失敗して終了していた。
    *
    * わざと probesize を下げて T15 で測ったもの (3 回ずつ):
    *
@@ -102,7 +126,7 @@ describe("ライブのエンコード方法", () => {
    * **いまは 100KB に戻してある。** 同じ ffmpeg に**字幕まで見つけさせる**ので、
    * 映像だけのときの値では足りない
    */
-  test("入口の解析は 100KB まで", () => {
+  test("入力の解析は 100KB まで", () => {
     const args = plain();
     expect(args[args.indexOf("-probesize") + 1]).toBe("100000");
   });
@@ -130,8 +154,8 @@ describe("ライブのエンコード方法", () => {
    * 動きのある場面が櫛状になる。録画と違い、ライブは映像が来る前に決める
    * しかないので、動きが絶対に落ちない側 (60) に倒す
    */
-  // 字幕の出口が名前付きパイプ (Windows) のとき、あるかを確かめるだけでパイプの 1 本を使ってしまう (`stream.sideOutput`)
-  test("出口があるかを確かめさせない (-y)", () => {
+  // 字幕の出力が名前付きパイプ (Windows) のとき、あるかを確かめるだけでパイプの 1 本を使ってしまう (`stream.sideOutput`)
+  test("出力があるかを確かめさせない (-y)", () => {
     expect(plain()).toContain("-y");
   });
 
@@ -200,22 +224,22 @@ describe("ライブのエンコード方法", () => {
    *
    * 付けると放送の絶対時刻が mp4 の muxer まで届き、あれが 0 に詰め直すので
    * 受け側から見た 0 の意味が分からなくなる (実機では `next_dts` の assertion で
-   * 落ちもした)。付けなければ ffmpeg が入口で 1 回だけ 0 に寄せ、**その寄せが
-   * 字幕の出口にも同じだけ効く**。映像と字幕が同じ物差しに乗る
+   * 落ちもした)。付けなければ ffmpeg が入力で 1 回だけ 0 に寄せ、**その寄せが
+   * 字幕の出力にも同じだけ効く**。映像と字幕が同じ物差しに乗る
    */
   test("放送の絶対時刻は持ち込まない", () => {
     expect(plain()).not.toContain("-copyts");
   });
 
   /*
-   * **字幕も同じ ffmpeg でエンコードする。** 出口を 2 つ持ち、字幕は `pipe:3` に出す。
-   * 別々に起こすと入口の寄せ幅が違って、時刻を突き合わせられない
+   * **字幕も同じ ffmpeg でエンコードする。** 出力を 2 つ持ち、字幕は `pipe:3` に出す。
+   * 別々に起こすと入力の寄せ幅が違って、時刻を突き合わせられない
    */
-  test("字幕は 2 つ目の出口へ出す", () => {
+  test("字幕は 2 つ目の出力へ出す", () => {
     const args = plain();
     expect(args).toContain("pipe:1");
     expect(args).toContain("pipe:3");
-    // 映像の出口が先。字幕はそのあと
+    // 映像の出力が先。字幕はそのあと
     expect(args.indexOf("pipe:1")).toBeLessThan(args.indexOf("pipe:3"));
     // 字幕はデコードせずに写す。描く指定 (-sub_type) も要らない
     expect(args.join(" ")).toContain("-map 0:p:1024:s:0 -c:s copy");
@@ -224,7 +248,7 @@ describe("ライブのエンコード方法", () => {
 
   /*
    * **字幕を持たない放送はある** (ショッピングやサブチャンネル)。
-   * そこで字幕を求めると ffmpeg は組み立ての時点で降りて**映像も出ない**ので、
+   * そこで字幕を求めると ffmpeg は組み立ての時点で失敗して終了し、**映像も出ない**ので、
    * 字幕を外して再エンコードできるようにしてある (`Session.run`)
    */
   test("字幕なしでも組める", () => {
@@ -256,7 +280,7 @@ describe("ライブのエンコード方法", () => {
   });
 
   /*
-   * **`-loglevel` は下げられない。** 選べる字幕は入口の見出しから読み取っていて
+   * **`-loglevel` は下げられない。** 選べる字幕は入力の見出しから読み取っていて
    * (`TrackList`)、あれは info で出る。字幕を映像と同じ ffmpeg でエンコードするように
    * したので、こちらも下げられなくなった。要らない行は読む側で落とす。
    * **数字の進み具合だけは止める。** 毎秒何行も流れるだけで読むものが無い
@@ -296,7 +320,7 @@ describe("エンコード方式を選ぶ", () => {
 
   /*
    * **先読みを切る。** SVT-AV1 は既定で先を読むぶん貯めるので、付けないと
-   * その貯めがそのまま遅れになる。ライブは待たせないほうが優先
+   * そのぶんの待ちがそのまま遅れになる。ライブは待たせないほうが優先
    */
   test("AV1 に先を読ませない", () => {
     expect(av1().join(" ")).toContain("lookahead=0");
@@ -339,6 +363,7 @@ describe("音声も組で決まる", () => {
   test("AV1 は Opus 256k", () => {
     expect(args("av1")).toContain("libopus");
     expect(rate(args("av1"))).toBe("256k");
+    // MP4 の Opus の名前は大文字。小文字を受け取れる端末では画面が小文字に替える (`mseType`)
     expect(codecsFor("av1")).toBe('video/mp4; codecs="av01.0.08M.08,Opus"');
   });
 
@@ -403,7 +428,7 @@ describe("H.264 は速さを優先する", () => {
    * 余っていて、削るのは動きの多い場面の映像のほう。細い経路には AV1 がある。
    *
    * 途切れも「映像だけ遅れる」も、**症状から流量を疑って 2 回とも外した**
-   * (本当は受け側の貯め方と復号。`server/live.ts`)
+   * (本当は受け側の貯め方とデコード。`server/live.ts`)
    */
   test("山は抑えない (宅内で見るものなので)", () => {
     expect(plain()).not.toContain("-maxrate");
@@ -422,7 +447,7 @@ describe("H.264 は速さを優先する", () => {
 /**
  * **コマ数の上限を言っておく。**
  *
- * `-probesize` を削ってあるので、ffmpeg は入口でコマ数を読み切れず、
+ * `-probesize` を削ってあるので、ffmpeg は入力でコマ数を読み切れず、
  * 時間の刻み (90kHz) からでたらめな値を起こすことがある。x264 は黙って受けるが、
  * **SVT-AV1 はエラーにする** (`The maximum allowed frame rate is 240 fps`)。
  * 実機で 20KB のまま AV1 を選ぶと 0/3、上限を付けると 3/3 通った。
@@ -443,7 +468,7 @@ describe("コマ数の上限", () => {
     expect(encodeArgs(1024, stereo)).not.toContain("-r");
   });
 
-  /** どちらのエンコード方式でも要る。読み切れないのは入口の話 */
+  /** どちらのエンコード方式でも要る。読み切れないのは入力の話 */
   test("どちらのエンコード方式でも付ける", () => {
     for (const codec of ["h264", "av1"] as const) {
       expect(encodeArgs(1024, stereo, codec)).toContain("-fpsmax");
@@ -467,7 +492,7 @@ describe("使えなかった理由", () => {
   // ここも土地の時刻で組む
   const until = new Date(2026, 7, 9, 5, 0).getTime();
 
-  test("番組表が休止だと言っていれば、そう言う", () => {
+  test("番組表が休止なら、休止だと伝える", () => {
     expect(whyNotTuned(NOT_LOCKED, until)).toBe(
       "いまは放送休止です (05:00 まで)",
     );
@@ -479,7 +504,7 @@ describe("使えなかった理由", () => {
 
   /*
    * **言い換えるのは「同期しなかった」ときだけ。** 塞がっていたときや
-   * ffmpeg が降りたときに「放送休止です」と出すと、今度はこちらが嘘をつく
+   * ffmpeg が失敗して終了したときに「放送休止です」と出すと、今度はこちらが嘘をつく
    */
   test("別の理由で使えなかったときは言い換えない", () => {
     expect(whyNotTuned("チューナーに空きがありません", until)).toBe(
@@ -491,6 +516,59 @@ describe("使えなかった理由", () => {
   });
 });
 
+/** **名指しの選局を断られたら、エージェントの理由と自動に戻す場所を出す** (docs/agent.md「デバッグ用の名指し」) */
+describe("名指しの選局を断られたときの文面 (pinnedNotTuned)", () => {
+  test("理由を出し、自動に戻す場所を添える", () => {
+    expect(
+      pinnedNotTuned(
+        "it930x:3-1:0",
+        "PLEX PX-MLT8PE 3-1 #0: 30 秒待っても TS が届きませんでした",
+        false,
+      ),
+    ).toBe(
+      "ライブのチューナーに選んだ it930x:3-1:0 で選局できませんでした。PLEX PX-MLT8PE 3-1 #0: 30 秒待っても TS が届きませんでした。設定の「その他」で「自動」に戻せます",
+    );
+  });
+
+  test("チューナーがもう無ければ、自動に戻したと伝える", () => {
+    expect(pinnedNotTuned("/dev/px4video0", "選局できませんでした", true)).toBe(
+      "ライブのチューナーに選んだ /dev/px4video0 が見つからないため、自動に戻しました",
+    );
+  });
+});
+describe("ffmpeg が局の映像・音声を指定できずに失敗した (missingMedia)", () => {
+  test("映像か音声の指定で失敗した行なら、どちらかを返す", () => {
+    expect(
+      missingMedia(
+        "Failed to set value '0:p:24632:v:0' for option 'map': Invalid argument",
+      ),
+    ).toBe("映像");
+    expect(
+      missingMedia(
+        "Failed to set value '0:p:1032:a:1' for option 'map': Invalid argument",
+      ),
+    ).toBe("音声");
+    expect(missingMediaMessage("映像")).toBe(
+      "この局の放送から映像を見つけられなかったため、映像を出せませんでした",
+    );
+  });
+
+  /*
+   * 字幕の指定で失敗したのは、字幕なしで起こし直す (`NO_SUBTITLE`)。実機の BS10プレミアム (未契約) で出た行。
+   * スクランブルされたままだったことは、届いた TS の印で別に決める (`LastingScramble`)
+   */
+  test("字幕の指定とほかの行は見ない", () => {
+    expect(
+      missingMedia(
+        "Failed to set value '0:p:201:s:0' for option 'map': Invalid argument",
+      ),
+    ).toBeNull();
+    expect(
+      missingMedia("Error opening output files: Invalid argument"),
+    ).toBeNull();
+  });
+});
+
 describe("音声だけのエンコード方式 (外から使う API の ?audio=only)", () => {
   test("映像も字幕もエンコードせず、AAC だけを fMP4 で出す", () => {
     const args = encodeArgs(1024, stereo, "audio", 0);
@@ -499,6 +577,35 @@ describe("音声だけのエンコード方式 (外から使う API の ?audio=o
     expect(args).not.toContain("-filter_complex");
     expect(args.join(" ")).toContain("-c:a aac");
     expect(args.join(" ")).toContain("-f mp4");
+  });
+
+  test("映像も音声も無い局 (データ放送だけの局) は、TS を読まずに無音を実時間で出す", () => {
+    const args = encodeArgs(
+      1024,
+      stereo,
+      "audio",
+      null,
+      null,
+      0,
+      false,
+      "pipe:3",
+      "ts",
+      "mpeg2",
+      true,
+    );
+    expect(args).not.toContain("pipe:0");
+    expect(args).toContain("-re");
+    expect(args.join(" ")).toContain("-f lavfi -i sine=frequency=0");
+    expect(args.join(" ")).toContain("-c:a aac");
+    expect(args.at(-1)).toBe("pipe:1");
+  });
+
+  test("映像の無い局の形式は、どれをリクエストされても音声だけ (AUDIO_FORM)", () => {
+    expect(AUDIO_FORM).toEqual({
+      codec: "audio",
+      raw: false,
+      downgraded: false,
+    });
   });
 });
 
@@ -516,7 +623,7 @@ describe("外から選ぶ音声 (?audio=<id>)", () => {
     expect(args[args.indexOf("-af") + 1]).toBe("pan=stereo|c0=c1|c1=c1");
   });
 
-  test("知らないものは主音声でエンコードする (断らない)", () => {
+  test("一覧に無いものは主音声でエンコードする (断らない)", () => {
     const args = encodeArgs(1024, chosen("3:sub"));
     expect(args[args.indexOf("-af") + 1]).toBe("pan=stereo|c0=c0|c1=c0");
     expect(chosen("only").id).toBe("0:main");
@@ -569,7 +676,7 @@ describe("GPU でエンコードする", () => {
     expect(args).not.toContain("-hwaccel");
   });
 
-  test("復号から GPU。`-hwaccel` は入力より前、CPU のフィルタは挟まない", () => {
+  test("デコードから GPU。`-hwaccel` は入力より前、CPU のフィルタは挟まない", () => {
     const args = full();
     expect(before(args, "-hwaccel")).toBe(true);
     expect(before(args, "-hwaccel_output_format")).toBe(true);
@@ -578,7 +685,7 @@ describe("GPU でエンコードする", () => {
     expect(args.join(" ")).not.toContain("hwupload");
   });
 
-  test("字幕の出口・コマ数の上限・音声はソフトウェアのときと同じ", () => {
+  test("字幕の出力・コマ数の上限・音声はソフトウェアのときと同じ", () => {
     for (const args of [encodeOnly(), full()]) {
       expect(args[args.indexOf("-fpsmax") + 1]).toBe("60000/1001");
       expect(args.join(" ")).toContain("-map 0:p:1024:s:0 -c:s copy");
@@ -596,7 +703,7 @@ describe("GPU でエンコードする", () => {
 
   /*
    * **H.265 は GPU でだけ。** 音声は H.264 と同じ AAC で、入れ物の中の名前は `hvc1` (Safari は `hev1` を受け取らない)。
-   * GPU が無いのにリクエストされたら投げる (選局の指示を受けるところで H.264 にしてあるので、ふつうは来ない)
+   * GPU が無いのにリクエストされたら例外にする (選局の指示を受けるところで H.264 にしてあるので、ふつうは来ない)
    */
   test("H.265 は GPU でだけエンコードし、hvc1 の名前で出し、音声は AAC", () => {
     const args = encodeArgs(1024, stereo, "hevc", 0, {
@@ -638,9 +745,9 @@ describe("GPU でエンコードする", () => {
 
   /*
    * 消費者向けの GPU は同時に開けるエンコードの数に上限がある (`hwenc.nvencBusy`)。
-   * 超えて降りたのは GPU が壊れているのではないので、15 分外すことはしない
+   * 超えて失敗したのは GPU が壊れているのではないので、15 分外すことはしない
    */
-  test("同時に開ける数を超えて降りただけなら、方式を覚えない", () => {
+  test("同時に開ける数を超えて失敗しただけなら、方式を覚えない", () => {
     // ほかのテストと混ざらないよう、ここだけのデバイス
     const hw = {
       way: { device: "/dev/nvidia-test-busy", kind: "nvenc" as const, gpu: 0 },
@@ -734,6 +841,14 @@ describe("開くまでの内訳", () => {
       "[live] GR:T27: 開くまで 選局 - / 最初のバイト - / ffmpeg 3ms / init 250ms / 最初の fMP4 260ms (av1)",
     );
   });
+
+  test("放送のままの経路は、ffmpeg の代わりに最初の送信を出す", () => {
+    expect(
+      rawOpeningLine("GR:T27", { tuned: 312.4, firstByte: 520.6, sent: 530 }),
+    ).toBe(
+      "[live] GR:T27: 開くまで 選局 312ms / 最初のバイト 521ms / 最初の送信 530ms (放送のまま)",
+    );
+  });
 });
 
 /** 画面から来た指示の読み方 (`parseCommand`)。追っかけを元の TS で受ける `raw` と、送るのを止める `hold` */
@@ -776,7 +891,7 @@ describe("元の TS が尽きたあと (rawEnding)", () => {
     );
   });
 
-  test("畳んだあとは何も伝えない", () => {
+  test("終えたあとは何も伝えない", () => {
     expect(rawEnding({ chase: true, fed: true, stopped: true })).toBe("quiet");
     expect(rawEnding({ chase: false, fed: true, stopped: true })).toBe("quiet");
   });
@@ -842,7 +957,7 @@ describe("エンコードが遅れたときの軽い組み合わせ", () => {
       step: "half",
       light: { half: true, gpu: false },
     });
-    // 答えは 1 回だけ (セッションはここで畳む)
+    // 答えは 1 回だけ (セッションはここで終える)
     expect(lag.tick(20_000, 0.5, base)).toBeNull();
   });
 
@@ -947,6 +1062,14 @@ describe("エンコードが遅れたときの軽い組み合わせ", () => {
     expect(takeLight("GR:T27:1", 60_000)).toBeNull();
     expect(takeLight("GR:T16:1", 2_000)).toBeNull();
   });
+
+  test("受け取られないまま期限を過ぎたものは、次に預けるときに捨てる", () => {
+    keepLight("GR:T20:1", { half: true, gpu: false }, 1_000);
+    // 期限 (30 秒) を過ぎてから別のセッションが預ける。前のものは捨てたので、期限を戻しても受け取れない
+    keepLight("GR:T21:1", { half: true, gpu: false }, 40_000);
+    expect(takeLight("GR:T20:1", 1_000)).toBeNull();
+    expect(takeLight("GR:T21:1", 40_000)).toEqual({ half: true, gpu: false });
+  });
 });
 
 /**
@@ -1014,13 +1137,13 @@ describe("段を下げた映像の引数", () => {
       "bwdif=mode=send_frame:deint=interlaced,fps=30000/1001,scale=-2:720,format=nv12",
     );
     expect(args.encoder.join(" ")).toBe(
-      "-c:v hevc_rkmpp -rc avbr -b:v 3000000 -maxrate 3187500 -minrate 187500 -g 30 -tag:v hvc1",
+      "-c:v hevc_rkmpp -rc avbr -b:v 2823529 -maxrate 3000000 -minrate 176471 -g 30 -tag:v hvc1",
     );
   });
 
-  test("NVENC は段の上限を VBR の平均に渡す", () => {
+  test("NVENC は段の値を VBR の平均と上限に渡す (上限を超えない)", () => {
     expect(videoArgs("h264", nvenc, true, 3).encoder.join(" ")).toContain(
-      "-rc vbr -b:v 600000 -maxrate 1200000 -bufsize 1200000",
+      "-rc vbr -b:v 600000 -maxrate 600000 -bufsize 600000",
     );
   });
 
@@ -1087,11 +1210,11 @@ describe("段を下げるときのコーデック", () => {
     expect(rungCodec(["av1", "h264"], true, gpu("av1", "h264"))).toBe("av1");
   });
 
-  test("GPU が無ければソフトウェアの H.264 (再生できると言われていなくても)", () => {
+  test("GPU が無ければソフトウェアの H.264 (再生できると送られていなくても)", () => {
     expect(rungCodec(["av1", "hevc"], true, gpu())).toBe("h264");
   });
 
-  test("再生できるコーデックの読み方。省けばリクエストされたものと H.264、知らない値は捨てる", () => {
+  test("再生できるコーデックの読み方。省けばリクエストされたものと H.264、ほかの値は捨てる", () => {
     expect(parsePlayable(undefined, "av1")).toEqual(["av1", "h264"]);
     expect(parsePlayable("", "h264")).toEqual(["h264"]);
     expect(parsePlayable("hevc,x,h264,hevc", "av1")).toEqual(["hevc", "h264"]);
@@ -1185,7 +1308,7 @@ describe("段の指示 (parseCommand)", () => {
     expect(parseCommand({ ...tune, rung: "1" })).toMatchObject({ rung: 1 });
   });
 
-  test("追っかけも同じ。段 0 の H.265 は H.264 にする", () => {
+  test("追っかけも同じ。H.265 はそのまま受ける (TS の録画の段 0 は `openChase` が H.264 にし、4K の局の録画は放送の HEVC の詰め替え)", () => {
     expect(
       parseCommand({ type: "chase", recordingId: 3, rung: 3 }),
     ).toMatchObject({ rung: 3, playable: ["h264"] });
@@ -1197,7 +1320,7 @@ describe("段の指示 (parseCommand)", () => {
         rung: 1,
         playable: ["hevc"],
       }),
-    ).toMatchObject({ codec: "h264", rung: 1, playable: ["hevc"] });
+    ).toMatchObject({ codec: "hevc", rung: 1, playable: ["hevc"] });
   });
 
   test("音声だけ (codec: audio) は選局でだけ受け、追っかけでは H.264 にする", () => {
@@ -1220,5 +1343,433 @@ describe("エンコードの速さ", () => {
   test("放送そのままと音声だけは null (音声だけで 0 と返すと、画面がエンコードの遅れと読む)", () => {
     expect(encodeSpeed(true, "h264", () => 0)).toBeNull();
     expect(encodeSpeed(false, "audio", () => 0)).toBeNull();
+  });
+});
+
+/**
+ * **4K の局 (MMT/TLV) のライブ** (`encodeArgs` の `transport`・`liveForm`・`liveRungCodec`)。入力は denpa が詰め替えた fMP4
+ * (HEVC 2160p・10 ビット・HLG) で、放送のままは詰め替えだけ、エンコードするときは縮めて SDR にする
+ */
+describe("4K の局のライブ", () => {
+  const uhd = (codec: "h264" | "av1" | "audio", rung: 0 | 1 | 2 | 3 = 0) =>
+    encodeArgs(161, stereo, codec, null, null, rung, false, "pipe:3", "tlv");
+  const filter = (args: string[]) => args[args.indexOf("-vf") + 1] ?? "";
+
+  test("局は 1 つなので番号で名指しせず、字幕の出力も付けない (字幕は denpa が TTML から作る)", () => {
+    const args = uhd("h264");
+    expect(args.join(" ")).toContain("-map 0:v:0");
+    expect(args.join(" ")).toContain("-map 0:a:0");
+    expect(args.join(" ")).not.toContain("0:p:");
+    expect(args).not.toContain("pipe:3");
+    expect(args).not.toContain("-c:s");
+  });
+
+  test("1080p に縮めてから HLG を SDR の 8 ビットに直す。インタレ解除はしない", () => {
+    const vf = filter(uhd("h264"));
+    expect(vf).toBe(["scale=-2:1080", ...HLG_TO_SDR].join(","));
+    expect(vf).not.toContain("bwdif");
+    expect(vf.endsWith("format=yuv420p")).toBe(true);
+    // 段 0 は 60 コマのまま、キーフレームは 1 秒ごと
+    expect(uhd("h264").join(" ")).toContain("-g 60");
+    expect(uhd("av1").join(" ")).toContain("libsvtav1");
+  });
+
+  test("段を下げると段の高さと 29.97 コマにし、上限つきの x264 にする", () => {
+    const args = uhd("h264", 2);
+    expect(filter(args)).toBe(
+      ["fps=30000/1001", "scale=-2:540", ...HLG_TO_SDR].join(","),
+    );
+    expect(args.join(" ")).toContain("-maxrate:v 1500000");
+    expect(args.join(" ")).toContain("-g 30");
+  });
+
+  test("GPU でエンコードするときも、縮めて直したものを上げて渡す (デコードは CPU)", () => {
+    const args = encodeArgs(
+      161,
+      stereo,
+      "h264",
+      null,
+      { way: { device: "/dev/dri/renderD128", kind: "vaapi" }, full: true },
+      0,
+      false,
+      "pipe:3",
+      "tlv",
+    );
+    expect(filter(args)).toBe(
+      ["scale=-2:1080", ...HLG_TO_SDR, "format=nv12", "hwupload"].join(","),
+    );
+    expect(args).not.toContain("-hwaccel");
+    expect(args.join(" ")).toContain("-c:v h264_vaapi");
+  });
+
+  test("H.265 にはエンコードしない (4K の局の hevc は詰め替えだけ)", () => {
+    expect(() =>
+      encodeArgs(161, stereo, "hevc", null, null, 0, false, "pipe:3", "tlv"),
+    ).toThrow();
+  });
+
+  test("音声だけは映像をエンコードしない", () => {
+    const args = uhd("audio");
+    expect(args).not.toContain("-vf");
+    expect(args.join(" ")).toContain("-map 0:a:0");
+  });
+
+  test("放送のままは HEVC の詰め替え。GPU が無くても出せる。TS の局の H.265 は GPU が無ければ H.264", () => {
+    const noGpu = () => false;
+    expect(liveForm("hevc", "h264", true, noGpu)).toEqual({
+      codec: "hevc",
+      raw: false,
+      downgraded: false,
+    });
+    expect(liveForm("hevc", "hevc", false, noGpu)).toEqual({
+      codec: "hevc",
+      raw: false,
+      downgraded: false,
+    });
+    expect(liveForm("mpeg2", "hevc", false, noGpu)).toEqual({
+      codec: "h264",
+      raw: false,
+      downgraded: true,
+    });
+    expect(liveForm("mpeg2", "h264", true, noGpu)).toEqual({
+      codec: "h264",
+      raw: true,
+      downgraded: false,
+    });
+  });
+
+  test("段を下げるときは H.265 を外して選ぶ (端末が H.265 を再生できても)", () => {
+    const hw: LiveHw = { way: { device: "d", kind: "rkmpp" }, full: false };
+    const rk = (codec: string) =>
+      codec === "hevc" || codec === "h264" ? hw : null;
+    expect(liveRungCodec(["hevc", "h264"], "hevc", rk)).toBe("h264");
+    expect(liveRungCodec(["hevc", "h264"], "mpeg2", rk)).toBe("hevc");
+  });
+
+  test("TS で送る 4K の局と PMT で分かったら、ライブの段を下げた H.265 だけを選び直す (hevcTsCodec)", () => {
+    const hw: LiveHw = { way: { device: "d", kind: "vaapi" }, full: false };
+    const gpu = () => hw;
+    // 段を下げた H.265 は H.265 を外して、言った形式から選ぶ (AV1 が先)
+    expect(hevcTsCodec("hevc", 1, true, ["hevc", "av1", "h264"], gpu)).toBe(
+      "av1",
+    );
+    expect(hevcTsCodec("hevc", 2, true, ["hevc", "h264", "raw"], gpu)).toBe(
+      "h264",
+    );
+    // 言っていなければ H.264
+    expect(hevcTsCodec("hevc", 1, true, null, gpu)).toBe("h264");
+    // 段 0 の H.265 は放送の HEVC を写すのでそのまま。ほかの形式もそのまま
+    expect(hevcTsCodec("hevc", 0, true, ["av1"], gpu)).toBe("hevc");
+    expect(hevcTsCodec("av1", 1, true, ["av1"], gpu)).toBe("av1");
+    // 追っかけは選局の答えを出さないので替えない
+    expect(hevcTsCodec("hevc", 1, false, ["av1"], gpu)).toBe("hevc");
+  });
+
+  test("追っかけは開く前に録画の放送のコーデックで形式を決める (chaseForm)", () => {
+    // GPU は無いものとする (設定と DB を読まない)
+    const noGpu = () => null;
+    const ask = (
+      codec: "h264" | "hevc" | "av1",
+      rung: 0 | 1 | 2,
+      raw = false,
+    ) => ({
+      codec,
+      raw,
+      rung,
+      playable: ["hevc" as const, "h264" as const],
+    });
+    // MPEG-2 の局の録画: 段 0 の H.265 は作らないので H.264、段を下げた H.265 はそのまま。元の TS もそのまま
+    expect(chaseForm(ask("hevc", 0), "ts", "mpeg2", noGpu)).toEqual({
+      codec: "h264",
+      raw: false,
+      rung: 0,
+      copy: false,
+    });
+    expect(chaseForm(ask("hevc", 1), "ts", "mpeg2", noGpu)).toEqual({
+      codec: "hevc",
+      raw: false,
+      rung: 1,
+      copy: false,
+    });
+    expect(chaseForm(ask("h264", 2, true), "ts", "mpeg2", noGpu)).toEqual({
+      codec: "h264",
+      raw: true,
+      rung: 0,
+      copy: false,
+    });
+    // TS で送る 4K の局の録画: 段 0 の H.265 と放送のままは放送の HEVC を写す (枠を使わない)
+    for (const asked of [ask("hevc", 0), ask("h264", 0, true)])
+      expect(chaseForm(asked, "ts", "hevc", noGpu)).toEqual({
+        codec: "hevc",
+        raw: false,
+        rung: 0,
+        copy: true,
+      });
+    // 段を下げた H.265 は写さず、H.265 を外して選び直す。ほかのコーデックはそのまま (縮めて SDR にする)
+    expect(chaseForm(ask("hevc", 1), "ts", "hevc", noGpu)).toEqual({
+      codec: "h264",
+      raw: false,
+      rung: 1,
+      copy: false,
+    });
+    expect(chaseForm(ask("av1", 2), "ts", "hevc", noGpu)).toEqual({
+      codec: "av1",
+      raw: false,
+      rung: 2,
+      copy: false,
+    });
+    // 4K の局の録画 (.mmts) も同じ決め方
+    expect(chaseForm(ask("hevc", 0), "tlv", "hevc", noGpu).copy).toBe(true);
+    expect(chaseForm(ask("hevc", 2), "tlv", "hevc", noGpu).codec).toBe("h264");
+  });
+
+  test("元の TS で開いた追っかけは、録画の PMT の映像が HEVC なら放送の HEVC を写したものに替える (chaseRawServed)", () => {
+    const raw = { codec: "h264" as const, raw: true };
+    expect(chaseRawServed(raw, "hevc")).toEqual({ codec: "hevc", raw: false });
+    // MPEG-2 の局の録画と、PMT を読めなかったものは元の TS のまま
+    expect(chaseRawServed(raw, "mpeg2")).toEqual(raw);
+    expect(chaseRawServed(raw, null)).toEqual(raw);
+    // 元の TS でないものは替えない (開く前に形式を決めてある)
+    const encoded = { codec: "h264" as const, raw: false };
+    expect(chaseRawServed(encoded, "hevc")).toEqual(encoded);
+  });
+
+  test("詰め替えた fMP4 の codecs は Main 10・Level 5.1 の hvc1", () => {
+    expect(codecsFor("hevc", "hevc")).toBe(BROADCAST_HEVC);
+    expect(BROADCAST_HEVC).toContain("hvc1.2.4.L153");
+    // TS の局の H.265 (GPU でエンコードしたもの) は今までどおり
+    expect(codecsFor("hevc")).toContain("hvc1.1.6.L123");
+  });
+});
+
+/**
+ * **TS で送る 4K の局のライブ** (`encodeArgs` の `video` が `hevc`・`servedFormat`。issue #2729)。ケーブルの 4K の局には、
+ * HEVC (stream_type 0x24) と AAC の LATM を TS に入れて送る局がある
+ */
+describe("TS で送る 4K の局のライブ", () => {
+  const vaapi: LiveHw = {
+    way: { device: "/dev/dri/renderD128", kind: "vaapi" },
+    full: true,
+  };
+  const ts = (codec: "hevc" | "h264" | "av1", hw: LiveHw | null = null) =>
+    encodeArgs(1024, stereo, codec, 0, hw, 0, false, "pipe:3", "ts", "hevc");
+  const filter = (args: string[]) => args[args.indexOf("-vf") + 1] ?? "";
+
+  test("H.265 は映像をエンコードせずに写し、音声だけ AAC にエンコードする", () => {
+    const args = ts("hevc").join(" ");
+    expect(args).toContain("-map 0:p:1024:v:0 -c:v copy -tag:v hvc1");
+    expect(args).not.toContain("-vf");
+    expect(args).not.toContain("-fpsmax");
+    expect(args).toContain("-c:a aac");
+    expect(args).toContain("-probesize 5000000");
+    expect(args).toContain("+delay_moov");
+    // 字幕は MPEG-2 の局と同じく、同じ ffmpeg から受ける
+    expect(args).toContain("pipe:3");
+  });
+
+  test("写すときは GPU を使わない", () => {
+    const args = ts("hevc", vaapi).join(" ");
+    expect(args).not.toContain("vaapi");
+    expect(args).toContain("-c:v copy");
+  });
+
+  test("H.264・AV1 は 4K の局と同じく、インタレ解除をせずに縮めて SDR の 8 ビットにする", () => {
+    expect(filter(ts("h264"))).toBe(["scale=-2:1080", ...HLG_TO_SDR].join(","));
+    expect(ts("h264").join(" ")).toContain("-map 0:p:1024:v:0");
+    expect(ts("av1").join(" ")).toContain("libsvtav1");
+  });
+
+  test("VA-API でも GPU でデコードせず、deinterlace_vaapi を挟まない", () => {
+    const args = ts("h264", vaapi);
+    expect(filter(args)).toBe(
+      ["scale=-2:1080", ...HLG_TO_SDR, "format=nv12", "hwupload"].join(","),
+    );
+    expect(args).not.toContain("-hwaccel");
+    expect(args.join(" ")).not.toContain("deinterlace_vaapi");
+    expect(args.join(" ")).toContain("-c:v h264_vaapi");
+  });
+
+  test("MPEG-2 の局は今までどおり", () => {
+    const mpeg2 = encodeArgs(
+      1024,
+      stereo,
+      "h264",
+      0,
+      null,
+      0,
+      false,
+      "pipe:3",
+      "ts",
+      "mpeg2",
+    );
+    expect(mpeg2).toEqual(plain());
+    expect(plain().join(" ")).toContain("-probesize 100000");
+    expect(plain().join(" ")).not.toContain("delay_moov");
+  });
+
+  test("ffmpeg で写すのは、TS の HEVC を hevc でリクエストしたときだけ", () => {
+    expect(copiesVideo("ts", "hevc", "hevc")).toBe(true);
+    expect(copiesVideo("ts", "mpeg2", "hevc")).toBe(false);
+    expect(copiesVideo("ts", "hevc", "h264")).toBe(false);
+    // 4K の局 (TLV) は ffmpeg を通さずに詰め替える
+    expect(copiesVideo("tlv", "hevc", "hevc")).toBe(false);
+  });
+
+  test("放送のままは HEVC の詰め替え。再生できる形式に HEVC が無い端末にはエンコードする", () => {
+    const raw = { codec: "h264", raw: true } as const;
+    const copy = { codec: "hevc", raw: false } as const;
+    expect(servedFormat(raw, "hevc", null)).toEqual(copy);
+    expect(servedFormat(raw, "hevc", ["raw", "hevc", "h264"])).toEqual(copy);
+    expect(servedFormat(raw, "hevc", ["raw", "h264", "av1"])).toEqual({
+      codec: "h264",
+      raw: false,
+    });
+    expect(servedFormat(raw, "hevc", ["raw", "av1"])).toEqual({
+      codec: "av1",
+      raw: false,
+    });
+    // 再生できる形式が無い (呼ぶ側が「再生できる形式がありません」で終える)
+    expect(servedFormat(raw, "hevc", ["raw"])).toBeNull();
+    // MPEG-2 の局・読めなかったとき・放送のままでないものは、リクエストされたまま
+    expect(servedFormat(raw, "mpeg2", null)).toEqual(raw);
+    expect(servedFormat(raw, null, null)).toEqual(raw);
+    const h264 = { codec: "h264", raw: false } as const;
+    expect(servedFormat(h264, "hevc", null)).toEqual(h264);
+  });
+
+  test("元の TS のまま送る HTTP の raw (?playable= が無い) は、HEVC の詰め替えに替えうるものと共有しない", () => {
+    const at = (keepsTs: boolean) =>
+      key("CATV", "QC14", 1, stereo, "raw", 0, null, 0, keepsTs);
+    expect(at(true)).not.toBe(at(false));
+    // 分けないものは今までの目印のまま
+    expect(at(false)).toBe(key("CATV", "QC14", 1, stereo, "raw", 0));
+  });
+
+  test("画面が前の答えで受け取った放送のコーデックを、選局の指示から読む", () => {
+    const tune = {
+      type: "tune",
+      channelType: "CATV",
+      channel: "QC14",
+      serviceId: 1,
+    };
+    expect(parseCommand({ ...tune, broadcast: "hevc" })).toMatchObject({
+      broadcast: "hevc",
+    });
+    expect(parseCommand(tune)).toMatchObject({ broadcast: "mpeg2" });
+    expect(parseCommand({ ...tune, broadcast: "av1" })).toMatchObject({
+      broadcast: "mpeg2",
+    });
+  });
+});
+
+/**
+ * **データ放送が選んだ音声 (`N:es`) は、PMT の音声の N 本目をエンコードする** (`arib.broadcastTrack`。J:COM テレビのラジオ選局)。
+ * PMT を見ずに受けるので、無い ES なら音声無しで続ける (`-map` の `?`)。番組表の音声 (`N:both`) はそのまま (`?` を付けない)
+ */
+describe("データ放送が選んだ音声のエンコード", () => {
+  test("N:es は a:N? で、番組表の音声は ? を付けない", () => {
+    const es = encodeArgs(1, broadcastTrack("2:es")!, "h264");
+    expect(es.join(" ")).toContain("-map 0:p:1:a:2?");
+    const main = encodeArgs(1, stereo, "h264");
+    expect(main.join(" ")).toContain("-map 0:p:1:a:0 ");
+    expect(main.join(" ")).not.toContain("a:0?");
+  });
+});
+
+/**
+ * **選局したエージェントのカードの番号を知らせる** (`CardNumber`。データ放送の `getIRDID`)。選局し直したら前の番号を渡さず、
+ * 応答を待つ間に別のエージェントへ移ったら古い応答を捨てる。双方向がオフなら知らせない
+ */
+describe("カードの番号", () => {
+  /** 訊いた順に、手で応答を返せる `cardIdOf` の代わり */
+  const setup = (network = true) => {
+    const answers = new Map<number, (id: string | null) => void>();
+    const told: string[] = [];
+    let agent: number | null = null;
+    const card = new CardNumber(
+      (asked) =>
+        new Promise((resolve) => {
+          answers.set(asked, resolve);
+        }),
+      () => network,
+      () => agent,
+      (id) => told.push(id),
+    );
+    const tune = (to: number) => {
+      agent = to;
+      return card.learn(to);
+    };
+    return { answers, told, card, tune };
+  };
+
+  test("応答を受けたら覚えて知らせ、選局し直したら前の番号を null に戻す", async () => {
+    const { answers, told, card, tune } = setup();
+    const first = tune(1);
+    answers.get(1)!("0000111122223333");
+    await first;
+    expect(card.id).toBe("0000111122223333");
+    expect(told).toEqual(["0000111122223333"]);
+
+    void tune(2);
+    expect(card.id).toBeNull();
+  });
+
+  test("応答を待つ間に別のエージェントへ移ったら、古い応答を捨てる", async () => {
+    const { answers, told, card, tune } = setup();
+    const first = tune(1);
+    const second = tune(2);
+    answers.get(1)!("0000111122223333");
+    await first;
+    expect(card.id).toBeNull();
+    expect(told).toEqual([]);
+
+    answers.get(2)!("4444555566667777");
+    await second;
+    expect(card.id).toBe("4444555566667777");
+    expect(told).toEqual(["4444555566667777"]);
+  });
+
+  test("双方向がオフなら問い合わせず、知らせない", async () => {
+    const { answers, told, card, tune } = setup(false);
+    await tune(1);
+    expect(answers.size).toBe(0);
+    expect(card.id).toBeNull();
+    expect(told).toEqual([]);
+  });
+});
+
+describe("PmtAudioWatch", () => {
+  /** 局 1024 の PMT。音声の ES の部品タグを並べる */
+  const pmt = (tags: number[]) =>
+    packetize(
+      0x1f0,
+      programMap(1024, 0x100, [
+        [0x02, 0x100, [0x52, 0x01, 0x00]],
+        ...tags.map((tag, i): [number, number, number[]] => [
+          0x0f,
+          0x110 + i,
+          [0x52, 0x01, tag],
+        ]),
+      ]),
+    );
+  const feed = (watch: PmtAudioWatch, ...parts: Uint8Array[]): boolean[] => {
+    const out: boolean[] = [];
+    for (const packet of new PacketStream().feed(stream(...parts)))
+      out.push(watch.feedPacket(packet));
+    return out;
+  };
+
+  test("PMT の音声の部品タグを読み、初めて決まったときと変わったときだけ true を返す", () => {
+    const watch = new PmtAudioWatch(1024);
+    const pat = packetize(0x0000, patSection([[1024, 0x1f0]]));
+    expect(feed(watch, pat, pmt([0x10]), pmt([0x10]))).toEqual([
+      false,
+      true,
+      false,
+    ]);
+    expect(watch.value).toEqual([0x10]);
+    // 副音声の ES が足された
+    expect(feed(watch, pmt([0x10, 0x11]))).toEqual([true]);
+    expect(watch.value).toEqual([0x10, 0x11]);
   });
 });

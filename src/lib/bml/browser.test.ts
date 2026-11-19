@@ -40,7 +40,7 @@ function setup(
   active = "/40/0000/startup.bml",
   app?: Pick<
     BrowserHost,
-    "canStartApp" | "startApp" | "canFetchAit" | "startAppFrom"
+    "canStartApp" | "startApp" | "canFetchAit" | "startAppFrom" | "irdId"
   >,
 ): Setup {
   const xml = parseXml(BML);
@@ -70,6 +70,9 @@ function setup(
     },
     subscribed: (element) => subscribed.push(element),
     stream: () => {},
+    setMainAudio: () => false,
+    mainAudioRef: () => "/10",
+    objectChanged: () => {},
   };
   const dom = new Dom(host);
   const kept = new Map<string, string>();
@@ -122,6 +125,7 @@ function setup(
     screen: () => {},
     lock: () => 1,
     unlock: () => true,
+    unlockAll: () => {},
     locked: () => [],
     detect: () => 1,
     loadDrcs: () => 1,
@@ -201,6 +205,7 @@ describe("browser.*", () => {
       "Ctrl.startExtraBrowser",
       "AITControlledApp.Start",
       "EPG.Basic2",
+      "Ctrl.NPT",
     ];
     const result = await s.run(`
             var groups = ${JSON.stringify(groups).replace(/"/g, "'")};
@@ -210,8 +215,35 @@ describe("browser.*", () => {
             out[groups.length + 1] = browser.getResidentAppVersion("x");
             var result = out;
         `);
-    // Ctrl.Media は isSupportedMedia が答えるのと揃える。PPP・常駐アプリ・外のブラウザ・AIT は無い
-    expect(items(result)).toEqual([1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 1, null]);
+    // Ctrl.Media は isSupportedMedia が答えるのと揃える。PPP・常駐アプリ・外のブラウザ・AIT・NPT は無い
+    expect(items(result)).toEqual([1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 1, null]);
+  });
+
+  test("getBrowserSupport の IRDID は、getIRDID が番号を返せるときだけ 1 と答える", async () => {
+    let card: string | null = "0123456789AB";
+    const s = setup(undefined, {
+      irdId: (type) => (type === 5 ? card : null),
+    });
+    const query = `
+            var result = [
+                browser.getBrowserSupport("ARIB", "IRDID"),
+                browser.getBrowserSupport("ARIB", "IRDID", "5"),
+                browser.getBrowserSupport("ARIB", "IRDID", "0"),
+                browser.getIRDID(5)
+            ];
+        `;
+    expect(items(await s.run(query))).toEqual([1, 1, 0, "0123456789AB"]);
+    // 双方向がオフ・録画の再生など、番号を渡さないときは 0
+    card = null;
+    expect(items(await s.run(query))).toEqual([0, 0, 0, null]);
+    // 番号を渡す手段が無い画面でも 0
+    expect(
+      items(
+        await setup().run(
+          `var result = [browser.getBrowserSupport("ARIB", "IRDID")];`,
+        ),
+      ),
+    ).toEqual([0]);
   });
 
   test("Hybridcast を開けるときだけ AIT の問い合わせに 1 と答え、開くのは画面に任せる", async () => {
@@ -380,7 +412,7 @@ describe("browser.*", () => {
     expect(s.vm.realm.global.get("a")).toBe(1);
   });
 
-  test("transmitTextDataOverIP は待って [結果, 状態, 返り] を返す (Denbun= に EUC-JP の %XX)", async () => {
+  test("transmitTextDataOverIP は待って [結果, 状態, レスポンス] を返す (Denbun= に EUC-JP の %XX)", async () => {
     const s = setup();
     const result = await s.run(
       'var r = browser.transmitTextDataOverIP("http://x/", "あa", "EUC-JP"); var result = r[2];',

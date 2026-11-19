@@ -88,7 +88,7 @@ describe("RankingRelay", () => {
     expect(reads).toBe(2);
   });
 
-  test("読めなければ投げ、記録には同じ理由を 1 行だけ。戻ったら 1 行", async () => {
+  test("読めなければ例外を送出し、記録には同じ理由を 1 行だけ。戻ったら 1 行", async () => {
     const warn = spyOn(console, "warn").mockImplementation(() => {});
     const log = spyOn(console, "log").mockImplementation(() => {});
     let now = 0;
@@ -146,12 +146,12 @@ describe("rankingEntries", () => {
     expect(
       rankingEntries(
         [
-          { id: 1, type: "GR", service_id: 1048 },
-          { id: 2, type: "GR", service_id: 2064 },
-          { id: 3, type: "GR", service_id: 1024 },
-          { id: 4, type: "BS", service_id: 101 },
-          { id: 6, type: "BS", service_id: 102 },
-          { id: 5, type: "GR", service_id: 9999 },
+          { id: 1, type: "GR", service_id: 1048, network_id: 0x7fe0 },
+          { id: 2, type: "GR", service_id: 2064, network_id: 0x7fe0 },
+          { id: 3, type: "GR", service_id: 1024, network_id: 0x7fe0 },
+          { id: 4, type: "BS", service_id: 101, network_id: 4 },
+          { id: 6, type: "BS", service_id: 102, network_id: 4 },
+          { id: 5, type: "GR", service_id: 9999, network_id: 0x7fe0 },
         ],
         forces,
       ),
@@ -174,7 +174,6 @@ describe("recordingJikkyo", () => {
         network_id: 32739,
         name: "ＴＢＳ１",
         type: "GR",
-        channel: "T22",
         updated_at: 0,
       },
       {
@@ -183,7 +182,6 @@ describe("recordingJikkyo", () => {
         network_id: 4,
         name: "放送大学テレビ",
         type: "BS",
-        channel: "BS11_2",
         updated_at: 0,
       },
     ])

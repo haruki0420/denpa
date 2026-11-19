@@ -137,9 +137,9 @@ export function readEntity(data: Uint8Array, part = false): Entity | null {
   const headers: EntityHeader[] = [];
   let at = 0;
   for (;;) {
-    // 中身が空の部品は、ヘッダの空行の CRLF が次の区切りの頭に食われて、ヘッダの行で
+    // 中身が空の部品は、ヘッダの空行の CRLF が次の区切りの先頭として読まれ、ヘッダの行で
     // ちょうど終わる (`--X\r\nContent-Type: a\r\n\r\n--X--`)。空の本体として受ける
-    // (web-bml の entity-parser はここで null を返し、モジュールごと捨てていた)
+    // (web-bml の `entity_parser.ts` はここで null を返し、モジュールごと捨てていた)
     if (part && at === data.length && headers.length > 0) break;
     const end = find(data, CRLF, at);
     if (end === -1) return null;

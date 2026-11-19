@@ -56,7 +56,7 @@
   const over = $derived(scroll - client);
 
   /**
-   * その要素の見分け。**class は先頭だけ**。全部出すと表示が画面を覆う。
+   * その要素を見分ける名前。**class は先頭だけ**。全部出すと表示が画面を覆う。
    *
    * `id` は属性から採る。`<form>` の `.id` は**中の入力欄**を指すことが
    * あり (名前の付いた部品が同名の属性より前に出る古い決まり)、そのまま
@@ -100,7 +100,7 @@
         /*
          * **数えるほうが先。** `CSSStyleRule` にも `cssRules` がある
          * (入れ子が書けるようになったため、たいてい空)。潜るほうを
-         * 先に見ると**規則が全部そちらへ流れて 0 件になる** (実際なった)
+         * 先に見ると**規則が全部そちらへ流れて 0 件になる** (実際に 0 件になった)
          */
         if (rule instanceof CSSStyleRule) {
           seen++;
@@ -270,8 +270,8 @@
 </script>
 
 <!--
-    **押せないようにしておく。** 出しているのは読むための数で、下にあるものを
-    触れなくしたら本末転倒
+  **押せないようにしておく。** 出しているのは読むための数で、下にあるものを
+  触れなくしたら本末転倒
 -->
 <div class="measure" data-testid="measure">
   <div>
@@ -287,7 +287,7 @@
     </div>
   {/if}
   <div class="wrap">{rules}</div>
-  {#each culprits as culprit (culprit.what + culprit.bottom)}
+  {#each culprits as culprit, index (index)}
     <div>↳ {culprit.what} → {culprit.bottom}</div>
   {/each}
 </div>
@@ -296,11 +296,11 @@
   .measure {
     pointer-events: none;
     position: fixed;
-    right: 0.25rem;
-    bottom: 0.25rem;
+    right: var(--dp-space-1);
+    bottom: var(--dp-space-1);
     z-index: var(--dp-z-measure);
     max-width: 95vw;
-    padding: 0.25rem 0.5rem;
+    padding: var(--dp-space-1) var(--dp-space-2);
     border-radius: var(--dp-radius-sm);
     background: var(--dp-video-veil-strong);
     color: var(--dp-on-video);
@@ -313,9 +313,9 @@
     word-break: break-all;
   }
   /*
-     * 黒の上に出すので、テーマに関わらず明るい側に寄せる
-     * (明るいテーマ用の濃い文字色だと、この黒地では読めない)
-     */
+   * 黒の上に出すので、テーマに関わらず明るい側に寄せる
+   * (明るいテーマ用の濃い文字色だと、この黒地では読めない)
+   */
   .bad {
     color: color-mix(in srgb, var(--dp-rec) 55%, #fff);
   }

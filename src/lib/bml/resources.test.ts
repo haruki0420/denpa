@@ -284,7 +284,7 @@ describe("DRCS・PNG", () => {
     const mask = alphaPng(2, 1, Uint8Array.of(0, 255));
     const fixed = applyClut(mask, [[1, 2, 3, 4]]);
     expect(fixed?.width).toBe(2);
-    // 灰 + 透明度の PNG (色の型 4) には手を入れない
+    // グレー + 透明度の PNG (色の型 4) には手を入れない
     expect(fixed?.data.length).toBe(mask.length);
   });
 });
@@ -311,8 +311,8 @@ describe("押さえ直し", () => {
   });
 });
 
-describe("PNG・DRCS・深い入れ子 (レビューで足したもの)", () => {
-  /** PNG の塊の名前の並び */
+describe("PNG・DRCS・深い入れ子", () => {
+  /** PNG のチャンクの名前の並び */
   const chunks = (png: Uint8Array): string[] => {
     const names: string[] = [];
     const view = new DataView(png.buffer, png.byteOffset, png.byteLength);
@@ -330,7 +330,7 @@ describe("PNG・DRCS・深い入れ子 (レビューで足したもの)", () => 
     const idat = png.subarray(idatAt + 8, idatAt + 8 + view.getUint32(idatAt));
     const raw = inflateSync(idat);
     expect(raw.length).toBe(40 * (1 + 40 * 2));
-    // 2 行目 (y=1) の x=1 の透明度: 行の先頭 81 + フィルタ 1 + 灰と透明度 2 × 1 + 灰 1
+    // 2 行目 (y=1) の x=1 の透明度: 行の先頭 81 + フィルタ 1 + グレーと透明度 2 × 1 + グレー 1
     expect(raw[81 + 1 + 2 + 1]).toBe(alpha[41]);
   });
 
@@ -365,6 +365,13 @@ describe("PNG・DRCS・深い入れ子 (レビューで足したもの)", () => 
       "IDAT",
       "IEND",
     ]);
+  });
+
+  test("DRCS は 87・88 区の字だけ持つ", () => {
+    const pixels = new Array<number>(64).fill(0);
+    const glyph = (ku: number) => [ku, 0x21, 1, 0x11, 2, 16, 16, ...pixels];
+    const out = parseDrcs(Uint8Array.from([2, ...glyph(0x76), ...glyph(0x77)]));
+    expect(out.map(([unit]) => isDrcs(unit))).toEqual([true]);
   });
 
   test("DRCS が途中で切れていても投げない", () => {
@@ -409,7 +416,7 @@ describe("名前の書き方", () => {
     });
   });
 
-  test("規格に無いスキーム (bml:// など) だけを「扱えない」と言う", () => {
+  test("規格に無いスキーム (bml:// など) だけを「扱えない」と知らせる", () => {
     expect(unknownScheme("bml://startup.bml")).toBe("bml");
     expect(unknownScheme("BML://x")).toBe("bml");
     for (const known of [

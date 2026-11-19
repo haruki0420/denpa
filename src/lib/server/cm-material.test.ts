@@ -28,7 +28,14 @@ function material(frames: number, logo = true): CmMaterial {
     ],
     times,
     cuts,
-    logo: logo ? { spans: [{ start: 10, end: 2500 }], scores } : null,
+    logo: logo
+      ? {
+          spans: [{ start: 10, end: 2500 }],
+          scores,
+          blind: [{ start: 2600, end: 2700 }],
+        }
+      : null,
+    logoModel: logo ? "枠 1290,30,92,67、型 312 画素" : undefined,
     why: logo ? "" : "ロゴの位置を特定できませんでした",
   };
 }
@@ -49,8 +56,20 @@ describe("材料の控え", () => {
     expect(after.cuts[97]).toBeCloseTo(4.2, 1);
     expect(after.cuts[1]).toBe(0);
     expect(after.logo!.spans).toEqual([{ start: 10, end: 2500 }]);
+    expect(after.logo!.blind).toEqual([{ start: 2600, end: 2700 }]);
     expect(after.logo!.scores[0]).toBeCloseTo(0.7, 2);
     expect(after.logo!.scores[2600]).toBeCloseTo(0.05, 2);
+    // 当てた型の在り処も戻る (型は録画のたびに育つので、あとからは分からない)
+    expect(after.logoModel).toBe("枠 1290,30,92,67、型 312 画素");
+  });
+
+  test("境目のすぐ下の値は、控えから読んでも境目に乗らない (切り下げる)", () => {
+    const before = material(300);
+    before.cuts[1] = 7.96;
+    before.logo!.scores[1] = 0.245;
+    const after = decodeMaterial(encodeMaterial(before))!;
+    expect(after.cuts[1]).toBeLessThan(8);
+    expect(after.logo!.scores[1]).toBeLessThan(0.25);
   });
 
   test("ロゴが使えなかったものは理由ごと戻る", () => {

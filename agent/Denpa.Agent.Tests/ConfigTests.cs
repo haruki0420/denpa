@@ -4,7 +4,7 @@ using System.Text.Json.Nodes;
 namespace Denpa.Agent.Tests;
 
 /*
- * 取り合いと HTTP の API は `agent/conformance.test.ts` が本物を起こして当てている。
+ * 取り合いと HTTP の API は `agent/conformance.test.ts` が本物を起動して確かめている。
  * こちらで見るのは、そこからは届きにくいところで、
  * **設定の読み書き**と、チューナー自動検出の値の読み取り。
  */
@@ -79,7 +79,7 @@ public class TunerSpecTests
     }
 
     [Test]
-    public async Task ファイルの中の書き損じは1台だけ飛ばす()
+    public async Task ファイルの中の書き損じは_1_台だけ飛ばす()
     {
         var config = Fresh();
         File.WriteAllText(config.TunersFile, """
@@ -133,6 +133,18 @@ public class ChannelStoreTests
     }
 
     [Test]
+    public async Task 空の結果で_その種別のチャンネルだけを消せる()
+    {
+        // DELETE /denpa/channels?type=CATV が使う (設定の画面の「局を削除」。スキャンし直しても消えない種別)
+        var config = Fresh();
+        config.SaveChannels(Entries(("GR", "T16"), ("CATV", "QC30")), ["GR", "CATV"]);
+
+        var merged = config.SaveChannels([], ["CATV"]);
+
+        await Assert.That(merged.Select(entry => entry!["channel"]!.GetValue<string>())).IsEquivalentTo(["T16"], CollectionOrdering.Matching);
+    }
+
+    [Test]
     public async Task 種別ごとにまとめて並べる()
     {
         var config = Fresh();
@@ -144,7 +156,18 @@ public class ChannelStoreTests
     }
 
     [Test]
-    public async Task 局名は逃がさずそのまま書く()
+    public async Task ケーブルは_CS_のあと_スカパー_プレミアムの前に並べる()
+    {
+        var config = Fresh();
+        var merged = config.SaveChannels(
+            Entries(("SKY", "H01"), ("CATV", "QC51"), ("CS", "CS02:24608"), ("CATV", "QC30:1"), ("GR", "T21"), ("BS", "BS03:16432")),
+            ["GR", "BS", "CS", "CATV", "SKY"]);
+
+        await Assert.That(merged.Select(entry => entry!["channel"]!.GetValue<string>())).IsEquivalentTo(["T21", "BS03:16432", "CS02:24608", "QC30:1", "QC51", "H01"], CollectionOrdering.Matching);
+    }
+
+    [Test]
+    public async Task 局名はエスケープせずそのまま書く()
     {
         /*
          * `channels.json` は人が開いて確かめるもの。既定のエンコーダは非 ASCII を
@@ -164,7 +187,7 @@ public class ChannelStoreTests
     }
 
     [Test]
-    public async Task まだ1度も預かっていなければ空()
+    public async Task まだ_1_度も預かっていなければ空()
     {
         await Assert.That(Fresh().LoadChannels()).IsEmpty();
     }
@@ -174,7 +197,7 @@ public class ChannelStoreTests
  * チューナーの自動検出。
  *
  * ioctl そのものは実機でしか試せないので、ここで見るのは**返ってきた値の
- * 読み取り**。数と並びは実機の PT3 で測ってあり (DeviceProbe の頭のコメント)、
+ * 読み取り**。数と並びは実機の PT3 で測ってあり (DeviceProbe の冒頭のコメント)、
  * ここに置いてあるのはそのとき出た値そのもの。
  */
 public class DeviceProbeTests
@@ -190,7 +213,7 @@ public class DeviceProbeTests
     }
 
     [Test]
-    public async Task 知らない方式は種別にしない()
+    public async Task 対応していない方式は種別にしない()
     {
         // DVB-T や ATSC が出てきても、日本の放送には使わない
         await Assert.That(DeviceProbe.TypesFor([3, 11])).IsEmpty();
@@ -206,11 +229,11 @@ public class DeviceProbeTests
     }
 
     [Test]
-    public async Task 方式を答えないドライバは名前で当てる()
+    public async Task 方式を返さないドライバは名前から推定する()
     {
         await Assert.That(DeviceProbe.TypesFromName("Toshiba TC90522 ISDB-S module")).IsEquivalentTo(["BS", "CS"], CollectionOrdering.Matching);
         await Assert.That(DeviceProbe.TypesFromName("Toshiba TC90522 ISDB-T module")).IsEquivalentTo(["GR"], CollectionOrdering.Matching);
-        // 名前に方式が入っていないものは当てにいかない (黙って間違えるより出さない)
+        // 名前に方式が入っていないものは当てにいかない (間違った種別を出すより、出さない)
         await Assert.That(DeviceProbe.TypesFromName("Some Generic Frontend")).IsEmpty();
     }
 
@@ -255,5 +278,42 @@ public class ConfigEnvironmentTests
             Environment.SetEnvironmentVariable("TUNERS_FILE", tuners);
             Environment.SetEnvironmentVariable("CHANNELS_FILE", channels);
         }
+    }
+}
+
+public class EnvironmentValueTests
+{
+    /// <summary>**空か空白だけの値は書いていないのと同じにし、前後の空白は落とす** (エージェントのどの変数も、CARD_* も同じ)</summary>
+    [Test]
+    [Arguments(null, null)]
+    [Arguments("", null)]
+    [Arguments("  ", null)]
+    [Arguments(" 25252 ", "25252")]
+    [Arguments("/config/tuners.json", "/config/tuners.json")]
+    public async Task 空白だけの値は書いていないのと同じ(string? value, string? expected)
+    {
+        await Assert.That(Config.Present(value)).IsEqualTo(expected);
+    }
+
+    [Test]
+    public async Task 空白だけの_CARD_の値も既定のまま()
+    {
+        var policy = CardLanPolicy.Parse(name => name == "CARD_TTL" ? "  " : null);
+        await Assert.That(policy.Hops).IsEqualTo(1);
+    }
+
+    /// <summary>**SHUTDOWN_WAIT は書いていなければ 6 時間、0 以上の整数でなければ読めない** (呼ぶ側は AGENT_PORT と同じく止まる)</summary>
+    [Test]
+    [Arguments(null, true, Config.DefaultShutdownWaitMs)]
+    [Arguments("0", true, 0L)]
+    [Arguments("60000", true, 60000L)]
+    [Arguments("-1", false, 0L)]
+    [Arguments("6h", false, 0L)]
+    [Arguments("1.5", false, 0L)]
+    public async Task SHUTDOWN_WAIT_は読めない値を既定に戻さない(string? text, bool ok, long expected)
+    {
+        var read = Config.TryShutdownWait(text, out var ms);
+        await Assert.That(read).IsEqualTo(ok);
+        if (ok) await Assert.That(ms).IsEqualTo(expected);
     }
 }

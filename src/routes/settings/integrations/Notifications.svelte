@@ -69,16 +69,15 @@
 
     {#if data.webhooks.length > 0}
       <!--
-                1 件を URL・送る通知・直近の結果・ボタン の順に縦に積む。幅がいくらでも横には出ない
-                (URL だけは `text-overflow: ellipsis` で止める)
-            -->
+        1 件を URL・送る通知・直近の結果・ボタンの順に縦に積む。幅がいくらでも横には出ない
+        (URL だけは `text-overflow: ellipsis` で止める)
+      -->
       <div class="item-list">
         {#each data.webhooks as webhook (webhook.id)}
           <div class="webhook item" data-testid="webhook-row">
             <div class="url-line">
-              <span class="tag {webhook.enabled ? 'success' : ''}">
-                {webhook.enabled ? "有効" : "無効"}
-              </span>
+              <!-- 状態のバッジは止めているときだけ (オンは塗らない。docs/design.md の「印の意味」。ルールの一覧と同じ) -->
+              {#if !webhook.enabled}<span class="tag">無効</span>{/if}
               <span class="truncate mono">{webhook.url}</span>
             </div>
             <div class="small">
@@ -138,19 +137,19 @@
   .events {
     display: flex;
     flex-wrap: wrap;
-    gap: 0.5rem 1rem;
-    margin-top: 0.25rem;
+    gap: var(--dp-space-2) var(--dp-space-4);
+    margin-top: var(--dp-space-1);
   }
   .webhook {
     display: flex;
     flex-direction: column;
-    gap: 0.5rem;
-    padding: 0.75rem;
+    gap: var(--dp-space-2);
+    padding: var(--dp-space-3);
   }
   .url-line {
     display: flex;
     align-items: center;
-    gap: 0.5rem;
+    gap: var(--dp-space-2);
   }
   .url-line .tag {
     flex-shrink: 0;

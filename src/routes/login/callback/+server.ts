@@ -14,12 +14,16 @@ function failed(message: string): Response {
   // ここは人が見る画面。何が起きたか読めないと、設定のどこが悪いのか追えない
   return new Response(`ログインできませんでした: ${message}`, {
     status: 403,
-    headers: { "content-type": "text/plain; charset=utf-8" },
+    // 本文に URL で受け取った文 (`error_description`) が入るので、HTML として読ませない (`auth.denied` と同じ)
+    headers: {
+      "content-type": "text/plain; charset=utf-8",
+      "x-content-type-options": "nosniff",
+    },
   });
 }
 
 /**
- * Entra から戻ってくるところ。
+ * IdP から戻ってくるところ。
  *
  * **`state` が合うことが「自分が始めたログイン」の証拠**になる。比べる元の state は
  * Cookie にしか無いので、他所のサイトから貼られたリンクでは通らない。

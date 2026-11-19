@@ -19,7 +19,7 @@ export const SKIP = 10;
 /**
  * 2 回目とみなす間合い (ms)。
  *
- * **短いと繋がらず、長いと普通の連打まで数える。** 300ms は OS の既定
+ * **短いと繋がらず、長いと普通の連打まで数える。** 300 ms は OS の既定
  * (ダブルクリック) とほぼ同じで、指でも届く
  */
 export const DOUBLE_TAP = 300;
@@ -187,11 +187,11 @@ export function skipTarget(
   lead = 0,
 ): number | null {
   /*
-   * **`lead` のぶん先を見ます。** 入ってから飛ぶと、気付くまでのコマが必ず
-   * 見えます (画面は飛ぶまで今の映像を出し続けるため)。**跨ぐ直前に飛べば、
-   * 最後に映っているのは本編の 1 コマ**で、CM のコマは 1 枚も出ません。
-   * 早く飛んだぶん本編の末尾が欠けますが、境目は場面の切れ目なので
-   * 1 コマぶんなら分かりません
+   * **`lead` のぶん先を見る。** CM に入ってから飛ぶと、飛ぶまでのコマが必ず
+   * 見える (画面は飛ぶまで今の映像を出し続けるため)。**跨ぐ直前に飛べば、
+   * 最後に映っているのは本編の 1 コマ**で、CM のコマは 1 枚も出ない。
+   * 早く飛んだぶん本編の末尾が欠けるが、境目は場面の切れ目なので
+   * 1 コマぶんなら分からない
    */
   const now = chapterAt(chapters, at + lead);
   if (now === null || !isCm(now.title)) return null;
@@ -211,8 +211,8 @@ export function skipTarget(
  * **時刻は秒の文字列で来る** (`start_time`)。刻み (`time_base`) から起こす手も
  * あるが、ffprobe が既に直したものを添えてくるのでそちらを採る。
  *
- * 読めない・1 つも無いときは空。**チャプターの無い録画はある。** CM を切って
- * エンコードしたもの (切ったので位置が無い) と、CM 検出が当たらなかったもの
+ * 読めない・1 つも無いときは空。**チャプターの無い録画はある。** CM 検出が当たらなかったものと、
+ * 前のバージョンで CM を切ってエンコードしたもの (切ったので位置が無い)
  */
 export function parseChapters(json: string): Chapter[] {
   let raw: unknown;
@@ -253,7 +253,7 @@ export function parseChapters(json: string): Chapter[] {
  * - 先頭のすぐそば … まだ観はじめていない。覚えても先頭から出すのと同じで、
  *   「続きがある」と見えるぶんだけ紛らわしい
  *
- * サーバも画面も同じ判断をする必要がある (片方だけが「観終えた」と思うと、
+ * サーバも画面も同じ判断をする必要がある (片方だけが「観終えた」と判断すると、
  * 目印が残ったり消えたりが噛み合わない) ので、ここ 1 箇所に置く。
  *
  * @param at いまの位置 (秒)
@@ -285,8 +285,8 @@ export function watchedToEnd(at: number, length: number): boolean {
  * 録っている最中 (追っかけ) は元の TS で、エンコードしたあとはエンコードしたもので観るので、どちらかの
  * 物差しのまま覚えると、もう一方で開いたときに先頭で捨てたぶん (`encode_skip`) や切った CM のぶんずれる。
  *
- * - `kept` … CM を切ってエンコードしたときに残した区間 (`cm_kept`。元の TS の物差し)。エンコードしたものは
- *   これをつないだもの。null は切っていない
+ * - `kept` … 前のバージョンで CM を切ってエンコードしたときに残した区間 (`cm_kept`。元の TS の物差し)。
+ *   エンコードしたものはこれをつないだもの。null は切っていない (今のバージョンは切らない)
  * - `skip` … 切っていないとき、エンコードしたときに先頭から捨てた長さ (`encode_skip`)
  *
  * 物差しが元の TS そのもの (エンコードしたものが無い・TS で観ている) なら `Ruler` は null
@@ -300,7 +300,7 @@ function keptOf(ruler: Ruler): { start: number; end: number }[] {
   return (ruler.kept ?? []).filter((range) => range.end > range.start);
 }
 
-/** 元の TS の物差しの位置 (秒) を、`ruler` の物差しへ。**切った CM の中は、その後の本編の先頭へ寄せる** */
+/** 元の TS の物差しで測った位置 (秒) を、`ruler` の物差しへ。**切った CM の中は、その後の本編の先頭へ寄せる** */
 export function fromTsTime(at: number, ruler: Ruler | null): number {
   if (ruler === null) return at;
   const kept = keptOf(ruler);
@@ -314,7 +314,7 @@ export function fromTsTime(at: number, ruler: Ruler | null): number {
   return sum;
 }
 
-/** `ruler` の物差しの位置 (秒) を、元の TS の物差しへ (`fromTsTime` の逆) */
+/** `ruler` の物差しで測った位置 (秒) を、元の TS の物差しへ (`fromTsTime` の逆) */
 export function toTsTime(at: number, ruler: Ruler | null): number {
   if (ruler === null) return at;
   const kept = keptOf(ruler);
@@ -329,8 +329,8 @@ export function toTsTime(at: number, ruler: Ruler | null): number {
 }
 
 /**
- * 元の TS の物差しの位置 (秒) が、`ruler` の物差しのどこで観られるか (コメントの一覧の時刻)。
- * `fromTsTime` と違って寄せない: 観られる所より前は `"before"`、切った CM の中 (と残した区間の後) は `"cut"`
+ * 元の TS の物差しで測った位置 (秒) が、`ruler` の物差しのどこで観られるか (コメントの一覧の時刻)。
+ * `fromTsTime` と違って寄せず、観られる所より前は `"before"`、切った CM の中と残した区間の後は `"cut"` を返す
  */
 export function playbackAt(
   at: number,
@@ -356,16 +356,16 @@ export const RESUME_EDGE = 30;
 const RESUME_HEAD = 15;
 
 /**
- * 観はじめるときに CM 飛ばしを入れておくか。
+ * 観はじめるときに CM 飛ばしをオンにしておくか。
  *
- * **既定は入れる。** 切らずにエンコードした録画 (既定はチャプターを入れるだけ) では、
- * 観るたびに送りのボタンを押すことになる。押さずに済むほうを既定にする。
- * 覚えているのは端末ごとで、人が切ったときだけ `'0'` が入っている。
+ * **既定はオン。** CM はチャプターとして入っているだけなので、オフだと観るたびに送りのボタンを
+ * 押すことになる。押さずに済むほうを既定にする。
+ * 覚えているのは端末ごとで、人がオフにしたときだけ `'0'` が入っている。
  *
- * **ロゴでの判定に失敗した 1 本だけは、覚えていても切って始める。**
- * あれはロゴを使えず**無音だけで当てている**ので外れやすく、外れると
+ * **ロゴでの判定に失敗した 1 本だけは、覚えていてもオフで始める。**
+ * あれはロゴを使えず**無音と CM の尺だけで当てている**ので外れやすく、外れると
  * CM ではなく本編のほうを飛ばす。飛んでから気付くのでは遅いので、精度を
- * 当てにできない 1 本では黙って飛ばさない。**押せばその場で入る**
+ * 当てにできない 1 本では自動で飛ばさない。**押せばその場でオンになる**
  */
 export function skipCmAtStart(
   cmNote: string | null,

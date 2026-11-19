@@ -6,7 +6,7 @@
  * 開いても CDT は 1 つも来なかった (地上波は 12 中継で 29/29 揃う)。
  *
  * 衛星は**データカルーセル (DSM-CC)** で送る (ARIB STD-B21 / TR-B15)。
- * Mirakurun も同じ切り分けで、ネットワーク 4 は DSM-CC を読みに行く
+ * Mirakurun も同じ切り分けで、ネットワーク 4 では DSM-CC を読む
  * (`TSFilter.ts` の `_enableParseDSMCC`)。
  *
  * 手順が長い。
@@ -20,7 +20,7 @@
  *    ロゴデータモジュールになる
  * 5. モジュールの中に「どの局のロゴか」と PNG が入っている
  *
- * 3〜4 は [dsmcc.ts](../../../packages/arib/src/dsmcc.ts) が持っている。**データ放送も同じ運び方**なので、
+ * 3〜4 は [dsmcc.ts](../../../packages/arib/src/dsmcc.ts) で扱う。**データ放送も同じ運び方**なので、
  * ここに残っているのはロゴの読み方 (どの ES を見るか、モジュールの中身) だけ。
  *
  * PNG は地上波と同じく色の表が抜けているので、入れ直してから返す。
@@ -52,14 +52,14 @@ const ESS_SERVICE_ID = 929;
 const DESC_STREAM_IDENTIFIER = 0x52;
 /** DDB (ブロック) の table_id。数えるためだけに持つ (読むのは `parseDdb`) */
 const TABLE_DDB = 0x3c;
-/** ロゴのカルーセルが乗る ES の目印。0x79 が BS、0x7A が CS */
+/** ロゴのカルーセルが流れる ES の目印。0x79 が BS、0x7A が CS */
 const LOGO_COMPONENT_TAGS = new Set([0x79, 0x7a]);
 
 /** モジュール記述子の名前。ロゴかどうかはこれで見分ける */
 const LOGO_MODULE_NAMES = new Set(["LOGO-05", "CS_LOGO-05"]);
 
 /**
- * ロゴのモジュールの大きさの上限 (2MiB)。これより大きいと言うものは組み立てない。
+ * ロゴのモジュールの大きさの上限 (2 MiB)。これより大きいと言うものは組み立てない。
  * 全局ぶんのロゴを詰めても数百 KB なので、十分に余裕がある
  */
 const MAX_LOGO_MODULE_SIZE = 2 * 1024 * 1024;
@@ -179,7 +179,7 @@ function downloadKey(downloadId: number, moduleId: number): string {
  * 揃ったロゴの見分け。
  *
  * `logo_id` は 9 ビットで、**BS と CS で番号が別々に振られている**。
- * logo_id だけを鍵にしていると、同じ番号の BS と CS のロゴが上書きし合う。
+ * logo_id だけをキーにしていると、同じ番号の BS と CS のロゴが上書きし合う。
  */
 function logoKey(logo: ModuleLogo): string {
   return `${logo.logoType}:${logo.logoId}:${logo.services[0]?.networkId ?? 0}`;
@@ -214,7 +214,7 @@ export class CarouselProgress {
    * **読み進んだ数。** 初めて知らされたロゴのモジュール (DII) と、初めて受け取ったブロック (DDB) だけを数える。
    * 開いている間に増えなければ、その間カルーセルは一度も流れてこなかった (`server/logo.ts` の `carouselWatch`)。
    * 同じ DII や受け取り済みのブロックは数えない。カルーセルを流していない間も DII だけ流し続ける中継があると、
-   * 毎回「届いた」ことになってずっとダウンロードの期間中に見え、番組表の取得より上の優先度で 20 分ずつチューナーを塞ぎ続ける
+   * 毎回「届いた」ことになってずっとダウンロードの期間中に見え、番組表の取得より先に 20 分ずつチューナーを塞ぎ続ける
    */
   get received(): number {
     return this.sections;

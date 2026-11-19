@@ -75,7 +75,7 @@ describe("伏せる (Issue に貼る前)", () => {
       );
     });
 
-    test("サーバが知っている値は形にかかわらず消す", () => {
+    test("`known` に渡した値は形にかかわらず消す", () => {
       expect(
         redact("value plainsecret123 leaked", { secrets: ["plainsecret123"] }),
       ).toBe(`value ${MASK.secret} leaked`);
@@ -123,7 +123,7 @@ describe("伏せる (Issue に貼る前)", () => {
       expect(redact("connect nas-box:445 failed")).toBe(
         `connect ${MASK.host}:445 failed`,
       );
-      expect(redact("dp.l.doany.io に繋がりません")).toBe(
+      expect(redact("lan.example.com に繋がりません")).toBe(
         `${MASK.host} に繋がりません`,
       );
       expect(redact("mDNS denpa.local")).toBe(`mDNS ${MASK.host}`);

@@ -2,15 +2,20 @@
  * **録画の観方の取り決め** (`GET /api/recordings/<id>/playback` と `/stream`)。画面にもサーバにも依らない。
  *
  * 分担: **サーバは「何を出せるか・どの形式で出すか・時刻の物差し」を決める。画面は「どれを使うか」を
- * 決める** (端末で再生できるか、人が選んだコーデック、MPEG-2 をそのまま再生する設定)。決め方は `server/playback.ts`。
+ * 決める** (端末で再生できるか、人が選んだコーデック)。決め方は `server/playback.ts`。
  * テレビのアプリは再生できる形式 (`?playable=`) を送り、サーバが同じ `pickOffer` で選んで `auto` で返す (`autoPick`)
  */
 
+import { CODEC_LABEL } from "../hw";
 import { codecsFor, type LiveCodec } from "../live";
-import { autoOrder, type LiveFormat } from "../live-choice";
+import {
+  autoOrder,
+  type BroadcastCodec,
+  type LiveFormat,
+} from "../live-choice";
 import type { Ruler } from "./watch";
 
-/** 出せる映像の形式。H.265 はエンコード済みがあるときだけ (ファイルそのままと詰め替え。その場の変換では作らない) */
+/** 出せる映像の形式。H.265 はエンコード済みがあるとき (ファイルそのままと詰め替え) と、4K の局の元の録画 (放送の HEVC の詰め替え) だけ。その場の変換では作らない */
 export type PlayCodec = "h264" | "hevc" | "av1" | "mpeg2";
 
 /**
@@ -69,6 +74,16 @@ export interface PlaybackInfo {
   ruler?: Ruler;
   /** サーバが選んだ観方 (`autoPick`)。**`?playable=` を付けて聞いたときだけ**ある。選べなければ null */
   auto?: AutoPick | null;
+  /**
+   * 放送のままのコーデック。**4K の局の元の録画 (`.mmts`) だけ** `hevc` (放送の HEVC の詰め替え)。省けば MPEG-2。
+   * 録画しか無いときの「自動」の順で、MPEG-2 の場所に HEVC を入れる (`autoOrder`。ライブの 4K の局と同じ)
+   */
+  broadcast?: BroadcastCodec;
+  /**
+   * **映像の無い録画 (ラジオ・データ放送の局) だけ** false。`offers` は音声だけの fMP4 (`codecs` が `mp4a.40.2`) 1 つで、
+   * `/stream` はどの `codec` をリクエストしても音声だけを返す (音声も無い録画は無音)。画面は段を動かさない
+   */
+  video?: false;
 }
 
 /**
@@ -82,10 +97,16 @@ type AutoPick =
 
 /**
  * MPEG-2 をそのまま流すときの応答ヘッダ。**物差しの 0 にあたる PTS** (90kHz、0〜2^33-1)。
- * 元の TS の先頭の PTS に、エンコードしたときに先頭で捨てた長さ (`encode_skip`) を足したもの。
+ * 元の TS が始まる PTS (`ts/seek.ts` の `tsHead`) に、エンコードしたときに先頭で捨てた長さ (`encode_skip`) を足したもの。
  * 画面の時刻 = (PTS − これ) を一周の中で取って 90000 で割ったもの (`ts/seek.ts` の `sinceHead`)
  */
 export const ORIGIN_HEADER = "X-Denpa-Origin";
+
+/**
+ * MPEG-2 をそのまま流すときの応答ヘッダ。**流し始めたバイト位置** (元の TS の先頭から数える)。
+ * 画面はこれに受け取ったバイト数を足しておき、途中で切れたら続きを `?offset=` でリクエストする (`ts/raw-resume.ts`)
+ */
+export const OFFSET_HEADER = "X-Denpa-Offset";
 
 /**
  * 流すときの応答ヘッダ (`stream`・`chase`・`live`)。**中身の形式** (`h264` / `hevc` / `av1`、音声だけなら `audio`、
@@ -147,6 +168,72 @@ export const STREAM_RETRIES = 8;
 /** `retries` 回リクエストし直したあと、次にリクエストするまで待つ時間 (ms)。倍々に伸ばして 10 秒で頭打ち (デプロイの入れ替えは数十秒かかる) */
 export function retryWait(retries: number): number {
   return Math.min(10_000, 1000 * 2 ** retries);
+}
+
+/**
+ * 切れたときに、倍々に待ってリクエストし直す (`retryWait`)。続けて `STREAM_RETRIES` 回を超えたら打ち切る。
+ * MSE で流すとき (`remux-player.ts`) と canvas に描くとき (`canvas-player.ts`) で同じものを使う
+ */
+export class StreamRetry {
+  private retries = 0;
+  private timer: ReturnType<typeof setTimeout> | null = null;
+  /** `retrying` を言わずに繋ぎ直しているか (`schedule` の `quiet`) */
+  private quiet = false;
+
+  constructor(private readonly state: (state: StreamState) => void) {}
+
+  /** リクエストし直すのを待っている間 */
+  get waiting(): boolean {
+    return this.timer !== null;
+  }
+
+  /**
+   * 切れた。待ってから `again` を呼ぶ。上限を超えていれば `failed` にして呼ばない。
+   * `quiet` なら `retrying` を言わない (手元に溜まっているぶんを再生しながら続きをリクエストするとき)。
+   * 手元を使い切ったら、呼ぶ側が `starved` を呼ぶ
+   */
+  schedule(again: () => void, quiet = false): void {
+    if (this.retries >= STREAM_RETRIES) {
+      this.quiet = false;
+      this.state("failed");
+      return;
+    }
+    const wait = retryWait(this.retries);
+    this.retries++;
+    this.quiet = quiet;
+    if (!quiet) this.state("retrying");
+    this.timer = setTimeout(() => {
+      this.timer = null;
+      again();
+    }, wait);
+  }
+
+  /** 届き始めた。リクエストし直していたなら数を戻して `flowing` にする */
+  flowing(): void {
+    if (this.retries === 0) return;
+    this.retries = 0;
+    this.quiet = false;
+    this.state("flowing");
+  }
+
+  /** `retrying` を言わずに繋ぎ直している間に、手元を使い切って止まった。ここから `retrying` を言う */
+  starved(): void {
+    if (!this.quiet) return;
+    this.quiet = false;
+    this.state("retrying");
+  }
+
+  /**
+   * 待っているリクエストし直しをやめる (別の位置からリクエストした・閉じた)。数はそのまま。
+   * 待っていたものをやめたら `quiet` も戻す (飛んだ先で手元が尽きても、繋ぎ直しの最中ではない)。
+   * 待ち終えて呼んだ `again` の中から呼ばれたとき (`remux-player.ts` の `load`) は、繋ぎ直しの最中なので戻さない
+   */
+  cancel(): void {
+    if (this.timer === null) return;
+    clearTimeout(this.timer);
+    this.timer = null;
+    this.quiet = false;
+  }
 }
 
 /** リクエストし直せば直りうる失敗か (繋がらない・途中で落ちた・サーバの 5xx)。4xx・読めない中身は何度やっても同じ */
@@ -230,23 +317,19 @@ function asPicked(offer: PlayOffer): Picked | null {
  */
 export const ENCODED_ORDER = autoOrder("encoded");
 
-/** その場でエンコードする順 (`autoOrder`。家の中か外か) に並べ替える。並びに無いもの (H.265 の詰め替え) は後ろ */
-function byOnTheFlyOrder(offers: PlayOffer[], indoor: boolean): PlayOffer[] {
-  const order: readonly PlayCodec[] = autoOrder({ indoor, compat: false }).map(
-    (format) => (format === "raw" ? "mpeg2" : format),
-  );
+/** `autoOrder` の形式をコーデックの名前に (放送のままは MPEG-2) */
+function asCodecs(order: readonly LiveFormat[]): PlayCodec[] {
+  return order.map((format) => (format === "raw" ? "mpeg2" : format));
+}
+
+/** `order` の順に並べ替える。並びに無いものは後ろ、同じコーデックの中では元の並びのまま */
+function byOrder(
+  offers: PlayOffer[],
+  order: readonly PlayCodec[],
+): PlayOffer[] {
   const rank = (codec: PlayCodec) => {
     const at = order.indexOf(codec);
     return at === -1 ? order.length : at;
-  };
-  return [...offers].sort((a, b) => rank(a.codec) - rank(b.codec));
-}
-
-/** `ENCODED_ORDER` の順に並べ替える (同じコーデックの中では元の並びのまま) */
-function byEncodedOrder(offers: PlayOffer[]): PlayOffer[] {
-  const rank = (codec: PlayCodec) => {
-    const at = (ENCODED_ORDER as readonly PlayCodec[]).indexOf(codec);
-    return at === -1 ? ENCODED_ORDER.length : at;
   };
   return [...offers].sort((a, b) => rank(a.codec) - rank(b.codec));
 }
@@ -256,12 +339,13 @@ function byEncodedOrder(offers: PlayOffer[]): PlayOffer[] {
  * 観られなければ、または `auto` なら端末に合わせる。
  *
  * **録画しか無い (エンコード済みが無い) ときは、ライブ・追っかけと同じ「その場でエンコード」の順** (`autoOrder`。家の中なら
- * MPEG-2 → H.264 → AV1、外なら AV1 → H.264。H.265 には変換しないので並びから外れる)。エンコード済みがあるときは次の順。
+ * MPEG-2 → H.264 → AV1、外なら AV1 → H.264。`autoOrder` の H.265 は、サーバが H.265 に変換しないので選ばれない)。4K の局の録画
+ * (`broadcast` が `hevc`) は MPEG-2 の場所に放送の HEVC の詰め替えが入る (家の中なら HEVC → H.264 → AV1)。エンコード済みがあるときは次の順。
  *
  * 1. **そのまま読めるファイル** (AV1 → H.265 → H.264。小さいほうが先。同じ画質なら回線もディスクも使わない)
  * 2. MSE が受け取れる**詰め替え** (エンコード済みと同じコーデック。サーバは軽い。並びは 1 と同じ)
  * 3. MSE が受け取れる**変換** (ライブ・追っかけと同じ「その場でエンコード」の順。家の中なら H.264 → AV1、外なら AV1 → H.264。
- *    サーバはその場でエンコードする。H.265 には変換しない)
+ *    サーバはその場でエンコードする。H.265 のストリームは詰め替えだけなので 2 に入る)
  * 4. 中身が分からないファイル (ffprobe が読めなかった) をそのまま渡す。読めなければ観る画面が観られる先を案内する
  *
  * エンコード済みがあるときの自動は MPEG-2 を選ばない (元の TS が残っていれば、選べば観られる)。何も無ければ null
@@ -274,8 +358,19 @@ export function pickOffer(
   choice: CodecChoice | "mpeg2" = "auto",
   indoor = false,
 ): Picked | null {
-  const files = byEncodedOrder(
+  /*
+   * 映像の無い録画は音声だけの fMP4 1 つ。AAC を受け取れない端末は無い (ライブの音声だけと同じ) ので、端末には聞かない。
+   * テレビのアプリの `?playable=` も映像のコーデックしか言わないので、聞くと選べない
+   */
+  if (info.video === false) {
+    const offer = info.offers.find((o) => o.way === "stream");
+    return offer === undefined || offer.codec === "mpeg2"
+      ? null
+      : { way: "stream", codec: offer.codec, type: AUDIO_TYPE };
+  }
+  const files = byOrder(
     info.offers.filter((offer) => offer.way === "file"),
+    ENCODED_ORDER,
   );
   const streams = info.offers.filter((offer) => offer.way === "stream");
   const raw = playsRaw(info, can);
@@ -292,7 +387,11 @@ export function pickOffer(
     if (chosen !== undefined) return asPicked(chosen);
   }
   if (files.length === 0) {
-    for (const format of autoOrder({ indoor, compat: false })) {
+    for (const format of autoOrder({
+      indoor,
+      compat: false,
+      ...(info.broadcast === undefined ? {} : { broadcast: info.broadcast }),
+    })) {
       if (format === "raw") {
         if (raw) return RAW;
         continue;
@@ -306,19 +405,162 @@ export function pickOffer(
   }
   const order = [
     ...files.filter((offer) => playsFile(offer, can)),
-    ...byEncodedOrder(
-      streams.filter(
-        (offer) => playsStream(offer, can) && hasFile(info, offer.codec),
-      ),
-    ),
-    ...byOnTheFlyOrder(
-      streams.filter((offer) => playsStream(offer, can)),
-      indoor,
-    ),
+    ...streamOrder(info, can, indoor),
     ...files,
   ];
   const first = order[0];
   return first === undefined ? null : asPicked(first);
+}
+
+/**
+ * MSE が受け取れるストリームを選ぶ順。**詰め替え** (エンコード済みと同じコーデック。AV1 → H.265 → H.264) を先に、
+ * そのあと**変換** (ライブ・追っかけと同じ「その場でエンコード」の順)
+ */
+function streamOrder(
+  info: PlaybackInfo,
+  can: MediaAbility,
+  indoor: boolean,
+): PlayOffer[] {
+  const streams = info.offers.filter((offer) => playsStream(offer, can));
+  return [
+    ...byOrder(
+      streams.filter((offer) => hasFile(info, offer.codec)),
+      ENCODED_ORDER,
+    ),
+    ...byOrder(streams, asCodecs(autoOrder({ indoor, compat: false }))),
+  ];
+}
+
+/**
+ * **ファイルをそのまま読めなかったときの行き先** (観る画面の `recover`)。`canPlayType` が読めると答えても、
+ * `<video>` が入れ物を読めないことがある (iPhone の Safari は Matroska を WebM としてしか読まない)。
+ * 中身が分からないファイル (`pickOffer` の最後の手) も同じ。MSE が受け取れるストリームを `pickOffer` と同じ順で選び、
+ * 無ければ元の TS (この端末でデコードできるとき)。どれも無ければ null
+ */
+export function pickStream(
+  info: PlaybackInfo,
+  can: MediaAbility,
+  indoor = false,
+): Picked | null {
+  const first = streamOrder(info, can, indoor)[0];
+  if (first !== undefined) return asPicked(first);
+  return playsRaw(info, can) ? RAW : null;
+}
+
+/** `MediaError` の `code` の名前 (HTML の仕様の定数名) */
+const MEDIA_ERRORS: Record<number, string> = {
+  1: "MEDIA_ERR_ABORTED",
+  2: "MEDIA_ERR_NETWORK",
+  3: "MEDIA_ERR_DECODE",
+  4: "MEDIA_ERR_SRC_NOT_SUPPORTED",
+};
+
+/**
+ * **再生できなかった理由を 1 行にする** (観る画面の幕に添える・コンソールに出力する)。`<video>` の `MediaError` があれば
+ * その定数名とブラウザの文言、無ければ受け取った例外 (`SourceBuffer` が追加を拒否した、など)
+ */
+export function failureText(
+  media: { code: number; message?: string } | null,
+  error?: unknown,
+): string {
+  if (media !== null) {
+    const name = MEDIA_ERRORS[media.code] ?? `MediaError ${media.code}`;
+    return media.message ? `${name} (${media.message})` : name;
+  }
+  if (error instanceof Error)
+    return error.name === "Error"
+      ? error.message
+      : `${error.name}: ${error.message}`;
+  return error === undefined ? "" : String(error);
+}
+
+/** その場で流すストリームを、何をきっかけにリクエストしたか (`remux-player.ts`。`streamOrigin` が幕に添える) */
+export type StreamCause =
+  "open" | "seek" | "stall" | "retry" | "audio" | "switch";
+
+const STREAM_CAUSE: Record<StreamCause, string> = {
+  open: "開いたとき",
+  seek: "飛んだとき",
+  stall: "詰まって読み直したとき",
+  retry: "繋ぎ直したとき",
+  audio: "音声を切り替えたとき",
+  switch: "画質を切り替えたとき",
+};
+
+/**
+ * **その場で流すストリームが止まったときに、幕の 1 行へ添える文** (`failureText` の後ろ)。最後にリクエストしたきっかけと
+ * その位置 (`from`)、止まった再生位置 (`at`)。開いた直後か、飛んだ・切り替えたあとかを、報告の画面写真から読み分けるため
+ */
+export function streamOrigin(
+  cause: StreamCause,
+  from: number,
+  at: number,
+): string {
+  return `${STREAM_CAUSE[cause]}に ${from.toFixed(1)} 秒から読み、${at.toFixed(1)} 秒で止まりました`;
+}
+
+/** 幕に添えるコーデックの名前。エンコードするものは設定と同じ (`#lib/hw.ts` の `CODEC_LABEL`) */
+const PLAY_CODEC_LABEL: Record<PlayCodec, string> = {
+  ...CODEC_LABEL,
+  mpeg2: "MPEG-2",
+};
+
+/**
+ * **形式の名前** (幕に添える 1 行の中の 1 つ)。`pickedText` と `offersText` は、コーデックと出し方をこの言葉で書く。
+ *
+ * - `file` … `H.264 のファイル`。端末に保存したものは `端末に保存した H.264 のファイル`
+ * - `stream` … `H.264 の詰め替え`。サーバがその場でエンコードするものは「変換」
+ * - `raw` … `MPEG-2 (元の TS)`
+ */
+function formatText(
+  info: PlaybackInfo | null,
+  format: Picked | PlayOffer,
+  local = false,
+): string {
+  const codec = PLAY_CODEC_LABEL[format.codec];
+  if (format.way === "raw") return `${codec} (元の TS)`;
+  if (format.way === "stream") {
+    const how = info !== null && transcodes(info, format) ? "変換" : "詰め替え";
+    return `${codec} の${how}`;
+  }
+  return local ? `端末に保存した ${codec} のファイル` : `${codec} のファイル`;
+}
+
+/**
+ * **何を再生しようとしたか** (幕に添える 1 行の前半)。形式の名前 (`formatText`) と中身の codecs。報告の画面写真だけで、
+ * どの形式で止まったかを読み分けられるようにする。
+ *
+ * - `file` … `H.264 のファイル (avc1.640028,opus)`
+ * - `stream` … `H.264 の詰め替え (video/mp4; codecs="…")`
+ * - `raw` … `MPEG-2 (元の TS)`
+ */
+export function pickedText(
+  info: PlaybackInfo | null,
+  picked: Picked,
+  local = false,
+): string {
+  const head = formatText(info, picked, local);
+  if (picked.way === "raw") return head;
+  if (picked.way === "stream") return `${head} (${picked.type})`;
+  const codecs = info?.offers.find(
+    (offer) => offer.way === "file" && offer.source === picked.source,
+  )?.codecs;
+  return codecs === undefined ? head : `${head} (${codecs})`;
+}
+
+/**
+ * サーバが出せるもの (`offers`) を 1 行に。観られるものが無かったときに幕に添える。
+ * 形式の名前は `pickedText` と同じ (`formatText`)
+ */
+export function offersText(info: PlaybackInfo | null): string {
+  if (info === null) return "再生の情報を取得できませんでした";
+  if (info.offers.length === 0) return "サーバが出せる形式がありません";
+  return `サーバが出せる形式: ${info.offers
+    .map((offer) => {
+      const head = formatText(info, offer);
+      return offer.codecs === undefined ? head : `${head} (${offer.codecs})`;
+    })
+    .join("、")}`;
 }
 
 /** codecs の文字列 (`av01.0.08M.08,opus`) の映像のコーデック。読めなければ null */
@@ -346,7 +588,7 @@ export function playableAbility(formats: readonly LiveFormat[]): MediaAbility {
 /**
  * **サーバが選ぶ観方** (`playback?playable=` の `auto`)。ブラウザの「自動」と同じ `pickOffer` で選ぶ。
  * `pickOffer` の最後の手 (中身が分からないファイルをそのまま渡す) は、コーデックが並びにあるときだけ使う。
- * 端末が再生できないと言ったものは返さない。選べなければ null
+ * 端末が再生できる形式に無いものは返さない。選べなければ null
  */
 export function autoPick(
   info: PlaybackInfo,
@@ -356,6 +598,9 @@ export function autoPick(
   const picked = pickOffer(info, playableAbility(formats), "auto", indoor);
   if (picked === null) return null;
   if (picked.way === "raw") return picked;
+  // 映像の無い録画は音声だけ。映像のコーデックを再生できるかは問わない (`pickOffer`)
+  if (info.video === false && picked.way === "stream")
+    return { way: "stream", codec: picked.codec };
   if (picked.codec === "mpeg2" || !formats.includes(picked.codec)) return null;
   return picked.way === "file"
     ? { way: "file", codec: picked.codec, source: picked.source }
@@ -389,25 +634,27 @@ export const MENU_ORDER: readonly PlayCodec[] = [...ENCODED_ORDER, "mpeg2"];
 
 /**
  * **コーデックのメニューに並べるもの。** この端末で観られる方法があるコーデックを `MENU_ORDER` の順に。
- * H.265 はエンコード済みがある録画にだけある (その場の変換では作らない)。MPEG-2 は元の TS が残っていて、この端末で
- * デコードできるときだけ。`hidden` (世帯の設定。`#lib/live-choice.ts` の `HIDDEN_CODECS`) は並べない。外すのはメニューだけで、
- * 自動 (`pickOffer`) は今までどおり選ぶ
+ * H.265 はエンコード済みがある録画と 4K の局の元の録画にだけある (その場の変換では作らない)。MPEG-2 は元の TS が残っていて、この端末で
+ * デコードできるときだけ。`hidden` は並べない (メニューは `#lib/live-choice.ts` の `WATCH_HIDDEN_CODECS` を渡す。
+ * 混んでいるときに勧めるものは全部から選ぶので渡さない)。外すのはメニューだけで、自動 (`pickOffer`) は今までどおり選ぶ
  */
 export function codecChoices(
   info: PlaybackInfo,
   can: MediaAbility,
   hidden: readonly PlayCodec[] = [],
 ): PlayCodec[] {
-  const encoded = ENCODED_ORDER.filter(
-    (codec) =>
-      !hidden.includes(codec) &&
-      info.offers.some(
-        (offer) =>
-          offer.codec === codec &&
-          (playsFile(offer, can) || playsStream(offer, can)),
-      ),
+  // 映像の無い録画は音声だけなので、映像のコーデックは並べない
+  if (info.video === false) return [];
+  return MENU_ORDER.filter((codec) =>
+    codec === "mpeg2"
+      ? playsRaw(info, can)
+      : !hidden.includes(codec) &&
+        info.offers.some(
+          (offer) =>
+            offer.codec === codec &&
+            (playsFile(offer, can) || playsStream(offer, can)),
+        ),
   );
-  return playsRaw(info, can) ? [...encoded, "mpeg2"] : encoded;
 }
 
 /*
@@ -465,9 +712,7 @@ export function pickCanvas(
     return choice;
   const light = usable.filter((c) => c !== "mpeg2" && hasFile(info, c));
   // 互換モードの順は家の中か外かで変わらない
-  const order = autoOrder({ indoor: false, compat: true }).map((format) =>
-    format === "raw" ? "mpeg2" : format,
-  );
+  const order = asCodecs(autoOrder({ indoor: false, compat: true }));
   const rest = order.filter((c): c is CanvasCodec =>
     usable.includes(c as CanvasCodec),
   );
@@ -489,9 +734,16 @@ export function canvasTranscodes(
   return codec !== "mpeg2" && !hasFile(info, codec);
 }
 
-/** 選んだもので観るとき、サーバがその場でエンコードするか (枠を使う。混んでいると断られる) */
-export function transcodes(info: PlaybackInfo, picked: Picked): boolean {
-  return picked.way === "stream" && !hasFile(info, picked.codec);
+/**
+ * 選んだもので観るとき、サーバがその場でエンコードするか (枠を使う。混んでいると断られる)。
+ * 4K の局の元の録画にある H.265 (`broadcast` が `hevc`) は放送の HEVC の詰め替えで、エンコードしない
+ */
+export function transcodes(
+  info: PlaybackInfo,
+  picked: Picked | PlayOffer,
+): boolean {
+  if (picked.way !== "stream" || hasFile(info, picked.codec)) return false;
+  return !(picked.codec === "hevc" && info.broadcast === "hevc");
 }
 
 /** `TimeRanges` を配列にしたもの (`[始まり, 終わり]` 秒) */
@@ -517,6 +769,11 @@ export function aheadOf(ranges: Ranges, t: number): number {
  */
 const GAP = 0.5;
 
+/** `t` が溜まっている区間に入っているか。始まりは `GAP` だけ手前も、終わりはちょうど (読み終えた所) も入れる */
+export function holds(ranges: Ranges, t: number): boolean {
+  return ranges.some(([start, end]) => start <= t + GAP && t <= end);
+}
+
 /**
  * 飛んだ先 `t` を、**リクエストし直さずに待てば届くか。**
  *
@@ -535,7 +792,7 @@ export function covers(
 ): boolean {
   if (aheadOf(ranges, t) > 0) return true;
   if (from === null || t < from - GAP) return false;
-  // リクエストした位置から伸びている区間の尻。まだ何も届いていなければリクエストした位置
+  // リクエストした位置から伸びている区間の末尾。まだ何も届いていなければリクエストした位置
   let end = from;
   for (const [start, stop] of ranges) {
     if (start <= from + GAP && stop >= from) end = Math.max(end, stop);

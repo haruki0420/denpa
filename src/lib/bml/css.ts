@@ -15,7 +15,7 @@ interface Selector {
   specificity: number;
 }
 
-/** [特性, 値, !important] */
+/** [プロパティ, 値, !important] */
 export type Declaration = [property: string, value: string, important: boolean];
 
 export interface Rule {
@@ -108,7 +108,7 @@ export function replaceBlocks(
   return out + text.slice(at);
 }
 
-/** スタイルシートを読む。`order` は `start` から振る (文書の中の複数の style の通し番号) */
+/** スタイルシートを読む。`order` は `start` から振る (文書にある複数の style を通した番号) */
 export function parseStylesheet(text: string, start = 0): Rule[] {
   const rules: Rule[] = [];
   const source = stripComments(text);
@@ -133,8 +133,8 @@ export function parseStylesheet(text: string, start = 0): Rule[] {
       at = i;
       continue;
     }
-    // 本体は次の `}` まで。その前に `{` が来たら閉じ忘れ: そこまでの区切り (`;` か改行) で本体を
-    // 終え、残りは次の規則として読み直す (壊れた所だけ捨てる。後ろの規則まで道連れにしない)
+    // 本体は次の `}` まで。その前に `{` が来たら閉じ忘れとみなし、そこまでの区切り (`;` か改行) で本体を
+    // 終え、残りは次の規則として読み直す (壊れた所だけ捨てる。後ろの規則は捨てない)
     const close = source.indexOf("}", open + 1);
     const inner = source.indexOf("{", open + 1);
     let body: string;

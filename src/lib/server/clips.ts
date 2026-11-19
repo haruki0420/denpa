@@ -36,6 +36,7 @@ import {
   clipVersion,
 } from "../clips";
 import { pad } from "../format";
+import { parseId } from "../id";
 import type { FileSource } from "../source";
 import { fromTsTime, toTsTime } from "../ts/watch";
 import type { Recording } from "../types";
@@ -68,7 +69,7 @@ import { searchable } from "./title";
  * - EXIF などは書かない (`-map_metadata -1`)。ログに番組名を出さない
  */
 
-/** 一覧用の幅 (px)。グリッドの 1 枚は広い画面でも 240px ほどなので、2 倍の密度まで */
+/** 一覧用の幅 (px)。グリッドの 1 枚は広い画面でも 240 px ほどなので、2 倍の密度まで */
 const SMALL_WIDTH = 480;
 /**
  * AVIF の画質 (SVT-AV1 の CRF。小さいほどきれいで大きい)。1080 の 1 コマで数百 KB に収まり、
@@ -318,7 +319,7 @@ export function avifArgs(
 }
 
 /**
- * 切り抜きの画像の置き場。**エンコード済みの置き場の下。** 既定の構成で残る置き場は DB (`/data`。5GB ほどの小さいもの) と
+ * 切り抜きの画像の置き場。**エンコード済みの置き場の下。** 既定の構成で残る置き場は DB (`/data`。5 GB ほどの小さいもの) と
  * 元の TS・エンコード済みだけで、`MEDIA_DIR` そのものはボリュームではない。録画と同じディスクに置けば、
  * 置き場を移すときも一緒に写る
  */
@@ -736,9 +737,8 @@ export async function setClipLayers(
  * `/api/clips/<id>` 系の前置き。id を確かめて 1 枚引く。数字でなければ 400、無ければ 404
  */
 export function clipOr404(idLike: string): Clip & { file: string } {
-  const id = Number(idLike);
-  if (!Number.isSafeInteger(id) || id <= 0)
-    error(400, "切り抜き ID が不正です");
+  const id = parseId(idLike);
+  if (id === null || id <= 0) error(400, "切り抜き ID が不正です");
   const clip = clipById(id);
   if (clip === undefined) error(404, "切り抜きが見つかりません");
   return clip;

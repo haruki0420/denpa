@@ -1,7 +1,7 @@
 /**
  * 覚えておく場所 (NVRAM。`browser.readPersistentArray("nvram://local_web/0", "S:16B")`)。
  *
- * 放送が使う領域 (地上波は TR-B14 第二分冊 5.2、BS は TR-B15):
+ * 放送が使う領域は次のとおり (地上波は TR-B14 第二分冊 5.2、BS は TR-B15)。
  *
  * | URI | 誰のものか | ブロック |
  * | --- | --- | --- |
@@ -12,9 +12,10 @@
  * | `nvram://receiverinfo/zipcode` など | 受信機の設定 (読むだけ。郵便番号と都道府県は denpa が渡す) | |
  *
  * 1 ブロック 64 バイト (TR-B15 第一分冊 8.2 表 8-1: BS の事業者の領域は 64 バイト × 16 ブロック、
- * 8.2.2: 違う名前で読み書きしたら読むのは null・書くのは NaN)。番号の外・64 バイトを超える書き込みは
- * 失敗にして知らせる。中身は置き場 (`store`) に base64 で置く。BS の事業者の区別
- * (broadcaster_id) は BIT が要るが denpa はデコードしないので、サービスごとに分ける (混ざらない側に倒す)。
+ * 8.2.2: 違う名前で読み書きしたら読むのは null・書くのは NaN)。番号の外の読み書きと
+ * 64 バイトを超える書き込みは失敗を返す。記録に出すのは、表にある領域で番号が外のときと 64 バイトを超えたときだけ。
+ * 中身は置き場 (`store`) に base64 で置く。BS の事業者の区別
+ * (broadcaster_id) は BIT が要るが denpa はデコードしないので、サービスごとに分ける (混ざらないほうを選ぶ)。
  */
 
 import { type Cell, parseStructure, readFields, writeFields } from "./binary";
@@ -86,6 +87,10 @@ export function visibleFrom(key: string, who: Who): boolean {
     scope === scopeOf(area.scope, who)
   );
 }
+
+/** 受信機の設定で読めるもの (`Nvram` の `bytes`) */
+const RECEIVER_INFO =
+  /^nvram:\/\/receiverinfo\/(zipcode|prefecture|regioncode)$/;
 
 export class Nvram {
   constructor(
@@ -186,8 +191,8 @@ export class Nvram {
 
   /** `checkAccessInfoOfPersistentArray`。2 読み書き・1 読むだけ・NaN 使えない */
   check(uri: string): number {
-    // 受信機の設定は読むだけ (郵便番号は denpa の設定から渡す)
-    if (uri.startsWith("nvram://receiverinfo/")) return 1;
+    // 受信機の設定は読むだけ (郵便番号は denpa の設定から渡す)。読めるのは `bytes` が持つ 3 つ
+    if (RECEIVER_INFO.test(uri.trim())) return 1;
     return this.key(uri) === null ? Number.NaN : 2;
   }
 }

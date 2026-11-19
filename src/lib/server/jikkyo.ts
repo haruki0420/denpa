@@ -1,6 +1,7 @@
 /**
- * **実況のコメント (サーバの受け持ち)。** コメントそのものはサーバを通らず、端末が NX-Jikkyo と
- * 過去ログ API に直接つなぐ (`#lib/jikkyo/endpoints.ts`)。サーバが渡すのは次の 2 つだけです。
+ * **実況のコメント (サーバの受け持ち)。** 流れるコメントはサーバを通らず、端末が NX-Jikkyo と
+ * 過去ログ API に直接つなぐ (`#lib/jikkyo/endpoints.ts`)。公式の実況への書き込みだけはサーバが中継する (`niconico-live.ts`)。
+ * ここでサーバが渡すのは次の 2 つです。
  *
  * - 録画の実況のチャンネルと、先頭と終わりの放送時刻 (`recordingJikkyo`)。観る画面がコメントを取得して再生位置に合わせるのに使う
  * - 局の勢い (`RankingRelay`)。NX-Jikkyo の REST は CORS を許していないのでブラウザから読めず、
@@ -39,6 +40,7 @@ export function recordingJikkyo(recording: Recording): RecordingJikkyo | null {
     .select({
       type: services.type,
       service_id: services.service_id,
+      network_id: services.network_id,
     })
     .from(services)
     .where(eq(services.id, recording.service_id))
@@ -139,7 +141,7 @@ export class RankingRelay {
     private readonly clock: () => number = Date.now,
   ) {}
 
-  /** 今の勢い。読めなければ投げる */
+  /** 今の勢い。読めなければ例外を送出する */
   async get(): Promise<{ at: number; forces: Forces }> {
     const cached = this.cached;
     if (cached !== null && this.clock() - cached.at < RANKING_TTL)

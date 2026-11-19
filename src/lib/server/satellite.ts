@@ -26,6 +26,8 @@ import {
   type ServiceTable,
 } from "@danything/arib/psi";
 
+import { IMPORTED_SERVICE_TYPES } from "./schema";
+import { readUntil } from "./stream";
 import type { AgentChannel } from "./tuner";
 
 export type SatelliteType = "BS" | "CS";
@@ -58,7 +60,7 @@ const TOLERANCE = 1_000;
 
 /**
  * 周波数から中継器の番号を出す。**その種別の中継器でなければ null。**
- * BS-7 と BS-17 (4K/8K。ISDB-S3) も null。この構成のチューナーでは受からない
+ * BS-7 と BS-17 (4K/8K。ISDB-S3) も null。この構成のチューナーでは受信できない
  */
 export function transponderOf(
   type: SatelliteType,
@@ -155,6 +157,8 @@ export function lineupFrom(
               ) ??
               known.get(serviceKeyOf(network.networkId, service.serviceId)) ??
               `${type} ${service.serviceId}`,
+            // 衛星に部分受信 (ワンセグ) は無い
+            partialReception: false,
           }))
           .sort((a, b) => a.serviceId - b.serviceId),
       });
@@ -171,7 +175,7 @@ export function lineupFrom(
 const nameKey = (onid: number, tsid: number, sid: number) =>
   `${onid}:${tsid}:${sid}`;
 
-/** 前の控えの局名を引く鍵 (`lineupFrom` の `known`) */
+/** 前の控えの局名を引くキー (`lineupFrom` の `known`) */
 const serviceKeyOf = (networkId: number, serviceId: number) =>
   `${networkId}:${serviceId}`;
 
@@ -203,11 +207,11 @@ interface TableRead {
 }
 
 /**
- * 流れてくる TS から NIT と SDT を読む。**自分のネットワークの NIT がそろい、そこに載っているテレビの局の
+ * 流れてくる TS から NIT と SDT を読む。**自分のネットワークの NIT がそろい、そこに載っている取り込む種別の局 (テレビ・ラジオ・データ放送) の
  * 名前が SDT でそろったら打ち切る。** そろわなくても `timeout` で打ち切る (名前は欠けたまま返す)
  *
  * `other` を渡すと、それに当てはまる NIT[other] がそろうまでも待つ。CS はこれでもう片方のネットワークの
- * 中継器を知る。NIT[actual] と NIT[other] は別々に流れてくるので、actual と局名だけで打ち切ると other を読み落とす
+ * 中継器が分かる。NIT[actual] と NIT[other] は別々に流れてくるので、actual と局名だけで打ち切ると other を読み落とす
  */
 export async function readTables(
   stream: ReadableStream<Uint8Array>,
@@ -219,41 +223,24 @@ export async function readTables(
 ): Promise<TableRead> {
   const nit = new NitReader();
   const sdt = new SdtReader();
-  const source = stream.getReader();
   let signal = false;
-  let error = "";
-
-  let stop = (): void => {};
-  const deadline = new Promise<void>((resolve) => {
-    stop = resolve;
-  });
-  const timer = setTimeout(stop, timeout);
-  timer.unref?.();
-  abort?.addEventListener("abort", stop, { once: true });
-
-  const read = (async () => {
-    for (;;) {
-      const { done, value } = await source.read();
-      if (done || value === undefined) return;
-      signal ||= value.byteLength > 0;
-      epg?.feed(value);
+  const error = await readUntil(
+    stream,
+    (chunk) => {
+      signal ||= chunk.byteLength > 0;
+      epg?.feed(chunk);
       // 両方に渡す (`||` でつなぐと、NIT が変わった回に SDT を読み落とす)
-      const network = nit.feed(value);
-      const names = sdt.feed(value);
-      if ((network || names) && settled(nit, sdt, other)) return;
-    }
-  })().catch((reason: unknown) => {
-    error = String(reason).trim().split("\n").at(-1)?.trim() ?? "";
-  });
-
-  await Promise.race([read, deadline]);
-  clearTimeout(timer);
-  abort?.removeEventListener("abort", stop);
-  await source.cancel().catch(() => undefined);
+      const network = nit.feed(chunk);
+      const names = sdt.feed(chunk);
+      return (network || names) && settled(nit, sdt, other);
+    },
+    timeout,
+    abort,
+  );
   return { nit, sdt, signal, error };
 }
 
-/** 自分のネットワークの NIT がそろい、テレビの局の名前が全部そろったか (`other` があれば、その NIT[other] も) */
+/** 自分のネットワークの NIT がそろい、取り込む種別の局 (テレビ・ラジオ・データ放送) の名前が全部そろったか (`other` があれば、その NIT[other] も) */
 function settled(
   nit: NitReader,
   sdt: SdtReader,
@@ -281,7 +268,7 @@ function settled(
   }
   return network.transportStreams.every((ts) =>
     ts.services
-      .filter((service) => service.serviceType === 0x01)
+      .filter((service) => IMPORTED_SERVICE_TYPES.has(service.serviceType))
       .every((service) =>
         named.has(
           nameKey(

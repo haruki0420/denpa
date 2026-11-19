@@ -40,7 +40,7 @@
    * - 写す繰り返しと前の色からの入れ替えは、テーブルトップの反射 (`FoldReflection`) と同じ部品 (`glow-loop.svelte.ts`)。
    *   入れ替えは CSS の `opacity` の transition (下の style)
    * - 色は枠に重ならない 4 本の帯 (`.band`) にだけ描く (`strips`)。枠の後ろに敷くと映像のコマごとに合成し直す
-   * - ブラウザの枠の色 (`theme-color`) もページの上の端の色にする (`washTop`)
+   * - ブラウザの枠の色 (`theme-color`) もページの上端の色にする (`washTop`)
    * - 写さないときは `ambient.ts` の `plan`。映像の上には何も重ねない
    */
   let {
@@ -107,7 +107,7 @@
     toneFrame(frame, dark ? "dark" : "light", WASH_LUMINANCE);
     const pixels = glowPixels(frame, GLANCE.width, GLANCE.height, at);
     context.putImageData(new ImageData(pixels, at.width, at.height), 0, 0);
-    // ページの上の端の色をブラウザの枠の色にする (`washTop`)。描いたときだけ測るので、毎フレームの手間は無い
+    // ページ上端の色を、ブラウザの枠に塗る (`washTop`)。描いたときだけ測るので、毎フレームの手間は無い
     const background = fromHex(themeBackground());
     if (background === null) return;
     const next = washTop(pixels, at.width, background, dark ? "dark" : "light");
@@ -341,9 +341,9 @@
 
 <style>
   /*
-     * 色を敷く範囲。位置と大きさは上の `measure` が書く。**自分では何も描かない** (帯が描く)。
-     * 文書の順で枠より前にあるので、重なっても枠の下になる
-     */
+   * 色を敷く範囲。位置と大きさは上の `measure` が書く。**自分では何も描かない** (帯が描く)。
+   * 文書の順で枠より前にあるので、重なっても枠の下になる
+   */
   .ambient {
     position: absolute;
     pointer-events: none;
@@ -386,9 +386,9 @@
     transition: none;
   }
   /*
-     * **右の列 (と、縦に積んだときの番組の中身) は色の上に描く。** 位置を持たせて、文書の順で色より後ろに
-     * 描かせる (位置を持たない箱は、位置を持つ色より先に描かれて隠れる)
-     */
+   * **右の列 (と、縦に積んだときの番組の中身) は色の上に描く。** 位置を持たせて、文書の順で色より後ろに
+   * 描かせる (位置を持たない箱は、位置を持つ色より先に描かれて隠れる)
+   */
   :global(html[data-ambient] [data-player-side] > aside) {
     position: relative;
   }

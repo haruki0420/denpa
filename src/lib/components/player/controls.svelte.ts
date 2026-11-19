@@ -5,11 +5,11 @@
  * 映像の上に実況に書き込む 1 行を開いている間だけ (`writing`。一覧の下の 1 行は映像の外なので残さない)
  */
 
-import { getContext } from "svelte";
+import { getContext, untrack } from "svelte";
 
 /**
- * 触らなくなってから消えるまで (ms)。指もマウスも同じ長さ (指だけ押すまで留めていた頃は、消すのに毎回
- * 映像を押すことになった)
+ * 触らなくなってから消えるまで (ms)。指もマウスも同じ長さ (指だけ押すまで留めると、消すのに毎回
+ * 映像を押すことになる)
  */
 const LINGER = 2500;
 
@@ -37,8 +37,11 @@ export interface PlayerControls {
   away: (event: PointerEvent) => void;
   /** キーボードで触っている間は残す */
   keyboard: boolean;
-  /** メニューが開いている間は残す。**選んでいる最中に消えては選べない** */
-  hold: boolean;
+  /**
+   * メニューが開いている間は残す。**選んでいる最中に消えては選べない**。返す関数で閉じたことを伝える。
+   * 開いているメニューを数で持つ。真偽 1 つだと、音量のつまみが遅れて閉じたとき、あとから開いた ⚙ のぶんまで下ろしてしまう
+   */
+  holdOpen: () => () => void;
   /** 実況に書き込む 1 行を開いている間は残す (打っている最中に消えない) */
   writing: boolean;
   /** その場で出し直す (ボタンを押した直後など) */
@@ -60,14 +63,16 @@ export function playerControls(): PlayerControls {
   /** 押される直前に出ていたか。`toggle` が読む */
   let wasShown = false;
   let keyboard = $state(false);
-  let hold = $state(false);
+  let holds = $state(0);
   let writing = $state(false);
   /** 前にいた場所。**動いていない `pointermove` を捨てる**のに使う (`wake`) */
   let lastX = Number.NaN;
   let lastY = Number.NaN;
 
   // 見るのは「触ったか」だけ (キーボード・開いているメニュー・書き込む 1 行を除く。再生の状態は混ぜない)
-  const shown = $derived(keyboard || hold || writing || now - touched < LINGER);
+  const shown = $derived(
+    keyboard || holds > 0 || writing || now - touched < LINGER,
+  );
 
   $effect(() => {
     if (!shown) return;
@@ -95,11 +100,10 @@ export function playerControls(): PlayerControls {
     set keyboard(value: boolean) {
       keyboard = value;
     },
-    get hold(): boolean {
-      return hold;
-    },
-    set hold(value: boolean) {
-      hold = value;
+    // 呼ぶのは effect の中 (`stageMenu`)。数えた値にその effect を結び付けない (`untrack`)
+    holdOpen(): () => void {
+      untrack(() => holds++);
+      return () => holds--;
     },
     get writing(): boolean {
       return writing;
@@ -109,7 +113,7 @@ export function playerControls(): PlayerControls {
     },
     /**
      * 指は押したときだけ出す (滑らせただけでは何もしない)。マウスは本当に動いたときだけ出す。止まったカーソルの
-     * 下で中身が動いただけでも `pointermove` が来るので、全画面のまま操作バーが消えなくなっていた
+     * 下で中身が動いただけでも `pointermove` が来るので、全画面のまま操作バーが消えなくなる
      */
     wake(event: PointerEvent): void {
       if (event.pointerType !== "mouse") {
@@ -132,7 +136,7 @@ export function playerControls(): PlayerControls {
     },
     stir,
     hide,
-    // いまの状態で決めると `wake` が出したものを見て消し、指では出せなかった
+    // いまの状態で決めると `wake` が出したものを見て消し、指では出せない
     toggle(): void {
       if (byTouch && wasShown) hide();
     },
@@ -143,9 +147,9 @@ export function playerControls(): PlayerControls {
  * 舞台の中のメニュー (`SpeedMenu`・`SettingsMenu`・`SoundButton` の音量のつまみ) の決まり。**部品の初めに呼ぶ** (context と `$effect` を使う)。
  *
  * - **開いている間は操作バーを残す。** 操作バーは触らなくなって 2.5 秒で引っ込むが、メニューは
- *   操作バーの中にあるので、選んでいる最中に**メニューごと消えて**いた。舞台の外では何もしない
+ *   操作バーの中にあるので、選んでいる最中に**メニューごと消える**。舞台の外では何もしない
  * - **メニューは舞台の枠の中に収める。** 枠の外へ出ると、上はページの見出しにかぶる。
- *   スマホの縦で全画面をやめると枠は 224px しか無く、速さのメニューが上へはみ出していた。
+ *   スマホの縦で全画面をやめると枠は 224px しか無く、速さのメニューが上へはみ出す。
  *   返す枠を `Menu` の `boundary` に渡すと、入りきらなければメニューの中を巻き取る。
  *   舞台の外 (と、枠がまだ無いうち) は画面に収める
  */
@@ -156,11 +160,8 @@ export function stageMenu(
     PLAYER_CONTROLS,
   );
   $effect(() => {
-    if (controls === undefined) return;
-    controls().hold = isOpen();
-    return () => {
-      controls().hold = false;
-    };
+    if (controls === undefined || !isOpen()) return;
+    return controls().holdOpen();
   });
   return getContext<(() => HTMLElement | null) | undefined>(PLAYER_STAGE);
 }

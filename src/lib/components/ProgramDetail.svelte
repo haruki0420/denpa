@@ -3,7 +3,7 @@
   import { onMount, type Snippet } from "svelte";
 
   import ProgramFacts from "#lib/components/ProgramFacts.svelte";
-  import type { ProgramDetail } from "#lib/types.js";
+  import type { DetailNote, ProgramDetail } from "#lib/types.js";
 
   /**
    * 番組の詳細を出すモーダル。
@@ -12,7 +12,7 @@
    * 下に並べるボタンと、時刻の行に添える状態 (予約済み・放送終了など) だけは開いた場所で違うので
    * snippet で受ける (`actions`・`status`)。
    *
-   * **閉じるは左下の「閉じる」** (幕を押しても Esc でも閉じる)。主のボタン (再生・予約) は右下に
+   * **閉じるは左下の「閉じる」** (幕を押しても Esc でも閉じる)。主のボタン (予約・再生・視聴のどれか) は右下に
    * 1 つだけ置き、ほかは控えにする。左右に分ければ主が埋もれない
    * (狭い画面では下から出る一枚になる。ボタンは全幅にせず、入りきらない控えは上の段へ折り返す。
    * 全幅で縦に積んでいた頃は、ボタンが一枚を埋めて中身が読めなかった)。
@@ -31,7 +31,7 @@
   }: {
     program: ProgramDetail;
     onclose: () => void;
-    notes?: { title: string; text: string }[];
+    notes?: DetailNote[];
     cmNote?: string | null;
     /** エンコードしたもののコマ数。録画から開いたときだけ入る (ProgramFacts へ素通し) */
     fps?: number | null;
@@ -46,8 +46,12 @@
   /** 番組名の見出しの id。箱の名前にする (読み上げは開いたときに番組名を言う) */
   const titleId = $props.id();
 
+  let dialog: HTMLDialogElement | undefined = $state();
+
   /**
-   * **開いたら箱へ焦点を移し、閉じたら開く前の場所へ戻す。** 開いた画面は `{#if}` で外すので、外れるときに戻す。
+   * **開いたら `showModal()` でダイアログにし、箱へ焦点を移す。閉じたら開く前の場所へ戻す。**
+   * ほかのダイアログ (`LogoZoom`・`DriveNotice`) と同じく、後ろのページは押せず、Tab も外へ出ない。
+   * 開閉は渡す側が持っている (出すときだけ `{#if}` で描く) ので、外れるときに戻す。
    * 戻す先が消えていれば (行が読み直しで作り直されたなど) 戻さない
    */
   onMount(() => {
@@ -55,6 +59,7 @@
       document.activeElement instanceof HTMLElement
         ? document.activeElement
         : null;
+    if (dialog !== undefined && !dialog.open) dialog.showModal();
     box?.focus({ preventScroll: true });
     return () => {
       if (before?.isConnected) before.focus({ preventScroll: true });
@@ -62,33 +67,24 @@
   });
 </script>
 
-<svelte:window
-  onkeydown={(e) => {
-    // 箱の中で開いたメニュー (「その他…」) があれば、Esc はそれを閉じるだけにする (よそのポップオーバーは見ない)
-    if (
-      e.key === "Escape" &&
-      !e.defaultPrevented &&
-      box?.querySelector(":popover-open") == null
-    )
-      onclose();
-  }}
-/>
-
 <!--
-    **高さは `%` で採る** (`app.css` で `html` に高さを与えてある)。
-    `vh` はアドレスバーが引っ込んだときの高さ、`dvh` も端末 (PWA) によって合わない。
-    外枠は `position: fixed` なので、その `100%` は**そのページが縦に動かずに
-    出せる高さ**そのものになる。上下に少し余白を置いて、中身はその中で巻き取らせる。
+  **高さは `%` で採る** (`app.css` で `html` に高さを与えてある)。
+  `vh` はアドレスバーが引っ込んだときの高さ、`dvh` も端末 (PWA) によって合わない。
+  外枠は `position: fixed` なので、その `100%` は**そのページが縦に動かずに
+  出せる高さ**そのものになる。上下に少し余白を置いて、中身はその中で巻き取らせる。
 
-    `<dialog>` にはしていない。開閉は渡す側が持っている (出すときだけ描く) ので、
-    ここは箱と背景だけで足りる
+  Esc はブラウザが `cancel` で知らせる。ダイアログは自分では閉じず、渡す側に外させる。
+  箱の中で開いたメニュー (「その他…」) があれば、Esc はブラウザがそのメニューだけを閉じ、`cancel` は来ない
 -->
-<div
+<dialog
+  bind:this={dialog}
   class="detail-modal"
-  role="dialog"
-  aria-modal="true"
   aria-labelledby={titleId}
   data-testid="program-detail"
+  oncancel={(e) => {
+    e.preventDefault();
+    onclose();
+  }}
 >
   <button
     type="button"
@@ -98,17 +94,17 @@
     tabindex="-1"
   ></button>
   <!--
-        **巻き取るのは中身だけ。** 押すものは箱の下端に重ねたまま出しておく
-        (説明が長くても開いた時点で見える。FactsAside と同じ考え方)。並びの地は塗らず、
-        中身はボタンの間と後ろに透けて見える。
-        続きがあるときは、ボタンの手前で中身を薄く消していく (下の CSS)
-    -->
+    **巻き取るのは中身だけ。** 押すものは箱の下端に重ねたまま出しておく
+    (説明が長くても開いた時点で見える。FactsAside と同じ考え方)。並びの地は塗らず、
+    中身はボタンの間と後ろに透けて見える。
+    続きがあるときは、ボタンの手前で中身を薄く消していく (下の CSS)
+  -->
   <div bind:this={box} class="detail-box modal-box" tabindex="-1">
     <!--
-            フェードの長さ (`animation-duration`) は要素に直に書く。時間で動くものではない (巻き取った量で濃さが
-            決まるだけ) が、動きを減らす設定で Pico の層が `!important` で 1ms に縮める。層の中の `!important` には
-            層の外の規則では勝てず、要素に直に書いたものだけが勝つ
-        -->
+      フェードの長さ (`animation-duration`) は要素に直に書く。時間で動くものではない (巻き取った量で濃さが
+      決まるだけ) が、動きを減らす設定で Pico の層が `!important` で 1ms に縮める。層の中の `!important` には
+      層の外の規則では勝てず、要素に直に書いたものだけが勝つ
+    -->
     <div
       class="detail-body"
       style:--detail-bottom={`calc(${actionsHeight}px + 2 * var(--dp-space-5))`}
@@ -118,9 +114,9 @@
     </div>
 
     <!--
-            「閉じる」と、開いた画面が渡す並び (`.modal-actions`) を分けて置く。狭い画面で並びが上の段へ
-            折り返しても、「閉じる」は下の段の左端に残る
-        -->
+      「閉じる」と、開いた画面が渡す並び (`.modal-actions`) を分けて置く。狭い画面で並びが上の段へ
+      折り返しても、「閉じる」は下の段の左端に残る
+    -->
     <div class="detail-actions" bind:offsetHeight={actionsHeight}>
       <button
         type="button"
@@ -135,9 +131,13 @@
       {/if}
     </div>
   </div>
-</div>
+</dialog>
 
 <style>
+  /*
+   * 幕は下の `.detail-backdrop` が塗るので、`<dialog>` の地 (`app.css`・Pico) と `::backdrop` は塗らない。
+   * 開く動きも幕と箱が持つので、`<dialog>` の動き (`app.css`) は止める
+   */
   .detail-modal {
     position: fixed;
     inset: 0;
@@ -146,7 +146,19 @@
     display: flex;
     align-items: center;
     justify-content: center;
+    width: 100%;
+    max-width: none;
     height: 100%;
+    max-height: none;
+    margin: 0;
+    padding: 0;
+    overflow: hidden;
+    border: 0;
+    background: none;
+    transition: none;
+  }
+  .detail-modal::backdrop {
+    background: none;
   }
   .detail-backdrop {
     position: absolute;
@@ -163,11 +175,11 @@
     transition: opacity var(--dp-duration-enter) var(--dp-ease);
   }
   /*
-     * **出るときは、幕は透明から、箱は少し縮んだ姿から** (メニュー・ダイアログと同じ。`app.css`)。
-     *
-     * 箱の見た目 (面・角丸・影・幅) は `app.css` の `.modal-box` (ダイアログと同じ)。ここは中身を巻き取る並べ方だけ。
-     * **巻き取るのは箱いっぱいの中身** (余白は中身の側で取り、スクロールバーは箱の右端に出す)。ボタンの並びは上に重ねる
-     */
+   * **出るときは、幕は透明から、箱は少し縮んだ姿から** (メニュー・ダイアログと同じ。`app.css`)。
+   *
+   * 箱の見た目 (面・角丸・影・幅) は `app.css` の `.modal-box` (ダイアログと同じ)。ここは中身を巻き取る並べ方だけ。
+   * **巻き取るのは箱いっぱいの中身** (余白は中身の側で取り、スクロールバーは箱の右端に出す)。ボタンの並びは上に重ねる
+   */
   .detail-box {
     display: flex;
     flex-direction: column;
@@ -187,13 +199,13 @@
     }
   }
   /*
-     * **続きがあるときだけ、ボタンの手前で中身を薄く消していく** (フェード)。字がボタンの後ろを
-     * そのまま通ると、ボタンも字も読みにくい。マスクは箱 (巻き取る枠) に掛かるので、中身を巻き取っても
-     * 消える位置はボタンの手前のまま。濃さ (`--detail-fade`) は巻き取った量で決め、いちばん下まで
-     * 読んだら消える (最後の行がはっきり見える)。巻き取れないほど短い中身では掛からない
-     * (スクロールの物差しが無いので `--detail-fade` は初めの 0 のまま)。スクロール連動のアニメーションが
-     * 無いブラウザでは、アニメーションがすぐ終わって 0 になり、フェードの無い形になる
-     */
+   * **続きがあるときだけ、ボタンの手前で中身を薄く消していく** (フェード)。字がボタンの後ろを
+   * そのまま通ると、ボタンも字も読みにくい。マスクは箱 (巻き取る枠) に掛かるので、中身を巻き取っても
+   * 消える位置はボタンの手前のまま。濃さ (`--detail-fade`) は巻き取った量で決め、いちばん下まで
+   * 読んだら消える (最後の行がはっきり見える)。巻き取れないほど短い中身では掛からない
+   * (スクロールの物差しが無いので `--detail-fade` は初めの 0 のまま)。スクロール連動のアニメーションが
+   * 無いブラウザでは、アニメーションがすぐ終わって 0 になり、フェードの無い形になる
+   */
   .detail-body {
     min-height: 0;
     flex: 1 1 0%;
@@ -222,10 +234,10 @@
     }
   }
   /*
-     * 箱の下端に重ね、地は塗らない。ボタンの無い所は押しても中身に届く (字を選ぶ・巻き取る)。
-     * 閉じるは左端、ほかは右に寄せる (並べ方は `app.css` の `.modal-actions`)。
-     * 並びが折り返したら、閉じるは下の段にそろえる
-     */
+   * 箱の下端に重ね、地は塗らない。ボタンの無い所は押しても中身に届く (字を選ぶ・巻き取る)。
+   * 閉じるは左端、ほかは右に寄せる (並べ方は `app.css` の `.modal-actions`)。
+   * 並びが折り返したら、閉じるは下の段にそろえる
+   */
   .detail-actions {
     position: absolute;
     inset-inline: var(--dp-space-5);

@@ -3,9 +3,12 @@ import { afterEach, describe, expect, test } from "bun:test";
 import type { ResponseMessage } from "@danything/arib/bml-protocol";
 
 import {
+  aribKey,
   type Bml,
   type BmlOptions,
   createBml,
+  keyGroup,
+  MAX_IMAGES,
   MAX_QUEUE,
   MAX_TIMERS,
   type Service,
@@ -16,7 +19,7 @@ import type { ImageSource } from "./render";
 
 /*
  * エンジンを丸ごと動かす。描く先はブラウザではないので、何でも受け取る小さな偽の DOM に描かせる
- * (中身は見ない。確かめるのはエンジンがページの手を放すか)
+ * (中身は見ない。確かめるのはエンジンがメインスレッドを明け渡すか)
  */
 
 type Loose = Record<PropertyKey, unknown>;
@@ -128,8 +131,8 @@ const inside = (bml: Bml) =>
   };
 
 /**
- * `until` が真になるまで待ちながら、ページの手が空かなかった最も長い間 (ms) を計る。
- * 0ms のタイマーを回し続け、その間隔の最大を見る (エンジンが握っている間はタイマーが来ない)
+ * `until` が真になるまで待ちながら、メインスレッドが空かなかった最も長い間 (ms) を計る。
+ * 0 ms のタイマーを回し続け、その間隔の最大を見る (エンジンが動いている間はタイマーが来ない)
  */
 async function watch(
   until: () => boolean,
@@ -174,10 +177,10 @@ describe("エンジンはページを固めない", () => {
     expect(fetches).toBeLessThan(10);
   });
 
-  test("すぐ返る待ち (届いているファイルの BinaryTable) をくり返すスクリプトでも、手を放す", async () => {
+  test("すぐ返る待ち (届いているファイルの BinaryTable) をくり返すスクリプトでも、メインスレッドを明け渡す", async () => {
     const { bml } = open();
     // 届いているファイルの BinaryTable はすぐ返る。直す前は、待ち → 続き → 待ち… が
-    // マイクロタスクでつながり、ループが終わるまで一度も手を放さなかった
+    // マイクロタスクでつながり、ループが終わるまで一度もメインスレッドを明け渡さなかった
     const script = `function start() {
             var n = 0;
             for (var i = 0; i < 100000; i++) {
@@ -200,7 +203,7 @@ describe("エンジンはページを固めない", () => {
     expect(longest).toBeLessThan(100);
   }, 70_000);
 
-  test("長いループでも 1 回に握るのは区切りの長さほど", async () => {
+  test("長いループでも 1 回に占めるのは区切りの長さほど", async () => {
     const { bml } = open();
     const script = `function start() {
             var s = 0;
@@ -216,9 +219,9 @@ describe("エンジンはページを固めない", () => {
     expect(longest).toBeLessThan(100);
   }, 70_000);
 
-  test("受け手が自分を呼び直し続ける (lockModuleOnMemory の通知で押さえ直す) と、手を放しながら回る", async () => {
+  test("ハンドラが自分を呼び直し続ける (lockModuleOnMemory の通知で押さえ直す) と、メインスレッドを明け渡しながら回る", async () => {
     const { bml } = open();
-    // 押さえ直すと、届いているモジュールはすぐ通知が来る。直す前は、通知 → 受け手 →
+    // 押さえ直すと、届いているモジュールはすぐ通知が来る。直す前は、通知 → ハンドラ →
     // 押さえ直す → 通知… がマイクロタスクで回り続けた
     const script = `var n = 0;
             function start() { browser.lockModuleOnMemory("/40/0000"); }
@@ -244,9 +247,9 @@ describe("エンジンはページを固めない", () => {
     expect(longest).toBeLessThan(100);
   }, 30_000);
 
-  test("setInterval の受け手が間隔より重くても、待ちに重ねて積まない", async () => {
+  test("setInterval のハンドラが間隔より重くても、待ちに重ねて積まない", async () => {
     const { bml } = open();
-    // 1ms ごとに、1 回に区切りを何度もまたぐ受け手。直す前は動いている間の刻みが全部積まれ、
+    // 1 ms ごとに、1 回に区切りを何度もまたぐハンドラ。直す前は動いている間の刻みが全部積まれ、
     // 止めた後も積んだ分が動き続けた
     const script = `var n = 0, id;
             function start() { id = browser.setInterval("tick();", 1, 0); }
@@ -267,9 +270,9 @@ describe("エンジンはページを固めない", () => {
     expect(Number(inside(bml).ureg[1])).toBeLessThanOrEqual(6);
   }, 30_000);
 
-  test("手が空かないまま続く文書は止めて知らせる", async () => {
+  test("休みなく動き続ける文書は止めて知らせる", async () => {
     const { bml, logs } = open({ budget: { window: 100 } });
-    // 終わらないループ。命令の数の上限に届く前に、手が空かない時間の上限で止まる
+    // 終わらないループ。命令の数の上限に届く前に、動き続けた時間の上限で止まる
     for (const message of carousel([
       startup("", "function start() { for (;;) {} }"),
     ]))
@@ -575,6 +578,33 @@ describe("移れない文書へ移ろうとしても閉じない", () => {
     });
   }
 
+  test("a 要素の href が放送に無いモジュールを指す: 決定を押しても入口へ出直さず、今の文書のまま", async () => {
+    const visible: boolean[] = [];
+    const { bml, logs } = open({ onVisible: (on) => visible.push(on) });
+    const files = hiddenEntry("menu.bml");
+    files[1] = bmlFile(
+      "menu.bml",
+      '<a id="go" href="/40/0005/a.bml">x</a>',
+      'function start() { document.getElementById("go").focus(); browser.Ureg[2] = browser.getActiveDocument(); }',
+    );
+    feedAll(bml, [PROGRAM, ...carousel(files)]);
+    const { done } = await watch(() => inside(bml).ureg[2] !== "");
+    expect(done).toBe(true);
+    expect(bml.path).toBe("/40/0000/menu.bml");
+    bml.key(18, true);
+    bml.key(18, false);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(bml.path).toBe("/40/0000/menu.bml");
+    expect(visible.at(-1)).toBe(true);
+    expect(
+      logs.some(
+        (line) =>
+          line.includes("モジュールが放送に無い") &&
+          line.includes("/40/0005/a.bml"),
+      ),
+    ).toBe(true);
+  });
+
   /** 双方向をオンにして、決めた URL に決めたものを返す中継 (リクエストされた URL を控える) */
   function relay(
     pages: Record<string, { status?: number; type: string; body: string }>,
@@ -700,6 +730,47 @@ describe("通信の文書", () => {
       "https://www.example.com/d/lib/app.js",
     ]);
   });
+
+  test("通信の文書から unlockAllModulesOnMemory を呼んでも、放送の文書が押さえたものを外す", async () => {
+    const remote = bmlFile(
+      "x",
+      "",
+      `function start() {
+                var before = browser.getLockedModuleInfo().length;
+                browser.unlockAllModulesOnMemory();
+                browser.Ureg[1] = before + "," + browser.getLockedModuleInfo().length;
+            }`,
+    )[2];
+    const { bml } = open({
+      ip: {
+        connected: () => true,
+        transmit: async () => ({
+          resultCode: 0,
+          status: "",
+          body: new Uint8Array(),
+        }),
+        confirm: async () => null,
+        get: async () => ({
+          status: 200,
+          contentType: "text/X-arib-bml; charset=EUC-JP",
+          body: Uint8Array.from(Buffer.from(remote, "latin1")),
+        }),
+      },
+    });
+    feedAll(bml, [
+      PROGRAM,
+      ...carousel([
+        startup(
+          "",
+          'function start() { browser.lockModuleOnMemoryEx("/40/0000"); browser.launchDocument("https://www.example.com/d/menu.bml", "cut"); }',
+        ),
+      ]),
+    ]);
+    const { done } = await watch(() => inside(bml).ureg[1] !== "");
+    expect(done).toBe(true);
+    // Ex で押さえたものは文書を替えても残る。通信の文書からでも全部外れる
+    expect(inside(bml).ureg[1]).toBe("1,0");
+  });
 });
 
 describe("lockModuleOnMemoryEx", () => {
@@ -717,7 +788,7 @@ describe("lockModuleOnMemoryEx", () => {
 });
 
 /**
- * 常に受信している端末 (`DataBroadcast` の `receive`)。**開く前から入口を裏で動かすのは、自動起動の
+ * 自動で受信している端末 (`DataBroadcast` の `receive`)。**開く前から入口を裏で動かすのは、自動起動の
  * 指定 (`auto_start_flag`) がある入口だけ**。開いたら (`open`) 始め、閉じたら (`reset`) 入口へ戻す
  */
 describe("開く前の入口", () => {
@@ -1019,15 +1090,6 @@ describe("16:9 の面の配置", () => {
       },
     );
   });
-
-  test("面の比率が未指定なら 16:9 で収める", () => {
-    expect(planeArea({ width: 400, height: 900 }, {})).toEqual({
-      left: 0,
-      top: 337.5,
-      width: 400,
-      height: 225,
-    });
-  });
 });
 
 describe("MNG", () => {
@@ -1056,7 +1118,80 @@ describe("MNG", () => {
   });
 });
 
-describe("ライブのように流し続けても、持つものと握る時間が一定に収まる", () => {
+describe("イベントメッセージ (EventMessageFired)", () => {
+  /** 部品 `component` のストリーム記述子。すぐ起きるイベントメッセージ 1 つ */
+  const eventOn = (
+    component: number,
+    options: { group?: number; dataEventId?: number; id?: number } = {},
+  ): ResponseMessage => ({
+    type: "esEventUpdated",
+    componentId: component,
+    dataEventId: options.dataEventId ?? 1,
+    events: [
+      {
+        type: "immediateEvent",
+        eventMessageGroupId: options.group ?? 0,
+        timeMode: 0,
+        eventMessageType: 0,
+        eventMessageId: ((options.id ?? 3) << 8) | 1,
+        privateDataByte: [0x42, 0x41, 0x4c, 0x4c],
+      },
+    ],
+  });
+  const script = `function start() { browser.Ureg[1] = "ready"; }
+        function fired() {
+            var e = document.currentEvent;
+            browser.Ureg[2] = e.privateData + "|" + e.esRef + "|" + e.messageId + "|" + e.messageGroupId;
+        }`;
+  /** 文書を開き、`ready` になるまで待つ */
+  async function opening(beitem: string): Promise<Bml> {
+    const { bml } = open();
+    feedAll(
+      bml,
+      carousel([
+        startup(
+          `<bevent><beitem id="e" type="EventMessageFired" subscribe="subscribe" onoccur="fired();" ${beitem}/></bevent>`,
+          script,
+        ),
+      ]),
+    );
+    const { done } = await watch(() => inside(bml).ureg[1] === "ready");
+    expect(done).toBe(true);
+    return bml;
+  }
+
+  test("文書と別の部品 (DII の無い部品) で送られたものも、今の文書の回と同じなら起こす", async () => {
+    const bml = await opening('es_ref="/41"');
+    bml.feed(eventOn(0x41));
+    const { done } = await watch(() => inside(bml).ureg[2] !== "", 2_000);
+    expect(done).toBe(true);
+    expect(inside(bml).ureg[2]).toBe("BALL|/41|3|0");
+  });
+
+  test("message_group_id 0 は、今の文書の回 (data_event_id) と違えば起こさない", async () => {
+    const bml = await opening('es_ref="/41"');
+    bml.feed(eventOn(0x41, { dataEventId: 2 }));
+    await watch(() => false, 200);
+    expect(inside(bml).ureg[2]).toBe("");
+  });
+
+  test("message_group_id 1 は、回が違っても起こす", async () => {
+    const bml = await opening('es_ref="/41" message_group_id="1"');
+    bml.feed(eventOn(0x41, { group: 1, dataEventId: 2 }));
+    const { done } = await watch(() => inside(bml).ureg[2] !== "", 2_000);
+    expect(done).toBe(true);
+    expect(inside(bml).ureg[2]).toBe("BALL|/41|3|1");
+  });
+
+  test("es_ref の部品と違う部品で送られたものは起こさない", async () => {
+    const bml = await opening('es_ref="/41"');
+    bml.feed(eventOn(0x42));
+    await watch(() => false, 200);
+    expect(inside(bml).ureg[2]).toBe("");
+  });
+});
+
+describe("ライブのように流し続けても、持つものと占める時間が一定に収まる", () => {
   /** 入口の部品のモジュール 1 つ */
   const moduleOf = (
     id: number,
@@ -1145,7 +1280,7 @@ describe("ライブのように流し続けても、持つものと握る時間�
     try {
       // 実行の上限で止めずに、持つものだけを見る (流す速さはライブの何百倍)。時計はライブと同じ TOT
       const { bml, logs } = open({ clock: () => null, budget: { ratio: 1 } });
-      // 本番の局の書き方に寄せる: 1 回きりのタイマーを受け手のたびに作り直す (chkRen)、
+      // 本番の局の書き方に寄せる: 1 回きりのタイマーをハンドラのたびに作り直す (chkRen)、
       // バージョンが上がったら押さえ直して字を書き換える、イベントのたびに消さないタイマーを足す (後始末し忘れ)
       const script = `var n = 0, m = 0;
                 function start() { browser.setInterval("chk();", 1, 1); browser.Ureg[1] = "ready"; }
@@ -1205,7 +1340,7 @@ describe("ライブのように流し続けても、持つものと握る時間�
       }
       await watch(() => false, 300);
       const inner = engine(bml);
-      // ストリームは届いている (受け手が動いた)
+      // ストリームは届いている (ハンドラが動いた)
       expect(Number(inner.ureg[2])).toBeGreaterThan(10);
       expect(Number(inner.ureg[3])).toBeGreaterThan(10);
       expect(inner.halted).toBe(false);
@@ -1220,16 +1355,16 @@ describe("ライブのように流し続けても、持つものと握る時間�
       // 画像の URL は今のバージョンのぶんだけ (バージョンが上がるたびに返す)
       expect(urls.live()).toBeLessThanOrEqual(2);
       expect(logs.some((line) => line.includes("タイマーが"))).toBe(true);
-      // 手が空かなかった間は短いまま (流し込む側の 10 回ぶんを含めて)
+      // メインスレッドが空かなかった間は短いまま (流し込む側の 10 回ぶんを含めて)
       expect(longest).toBeLessThan(200);
     } finally {
       urls.restore();
     }
   }, 120_000);
 
-  test("受け手が届かないモジュールを待って止まっている間に来たイベントは、上限を超えたら捨てる", async () => {
+  test("ハンドラが届かないモジュールを待って止まっている間に来たイベントは、上限を超えたら捨てる", async () => {
     const { bml, logs } = open();
-    // モジュール 2 は DII にあるが届かない。BinaryTable で待ったまま、次の受け手が動けない
+    // モジュール 2 は DII にあるが届かない。BinaryTable で待ったまま、次のハンドラが動けない
     const script = `function start() {
                 browser.Ureg[1] = "waiting";
                 var t = new BinaryTable("/40/0002/x.bin", "0,U:1B");
@@ -1255,5 +1390,336 @@ describe("ライブのように流し続けても、持つものと握る時間�
     expect(
       logs.filter((line) => line.includes("溢れた分を捨てます")).length,
     ).toBe(1);
+  });
+});
+
+describe("主音声の切り替え (setMainAudioStream)", () => {
+  const pmt = (audios: number[]): ResponseMessage => ({
+    type: "pmt",
+    components: [
+      { pid: 0x100, componentId: 0x00, streamType: 0x02 },
+      ...audios.map((tag) => ({
+        pid: 0x1000 + tag,
+        componentId: tag,
+        streamType: 0x0f,
+      })),
+      { pid: 0x140, componentId: 0x40, streamType: 0x0d },
+    ],
+  });
+
+  test("PMT の音声の何本目かを呼ぶ側に渡し、1 本目と、番組が替わって ES が無くなったときはふだんの音声に戻す", () => {
+    const chosen: (number | null)[] = [];
+    const { bml } = open({ onMainAudio: (index) => chosen.push(index) });
+    const host = bml as unknown as {
+      setMainAudio(ref: string): boolean;
+      mainAudioRef(): string;
+    };
+    bml.feed(pmt([0x10, 0x70, 0x71, 0x72]));
+    expect(host.mainAudioRef()).toBe("/10");
+    // 音声でない部品・PMT に無い部品は替えない
+    expect(host.setMainAudio("/40")).toBe(false);
+    expect(host.setMainAudio("/73")).toBe(false);
+    // いまの局を明示した書き方 (/-1/71) も、音声の object の data と同じく受ける
+    expect(host.setMainAudio("/-1/71")).toBe(true);
+    expect(host.mainAudioRef()).toBe("/71");
+    expect(host.setMainAudio("/10")).toBe(true);
+    expect(host.setMainAudio("/72")).toBe(true);
+    // 同じ PMT が届き直しても渡し直さない。順番が替わって何本目かが変わったら渡し直す
+    bml.feed(pmt([0x10, 0x70, 0x71, 0x72]));
+    bml.feed(pmt([0x10, 0x72, 0x70]));
+    expect(host.mainAudioRef()).toBe("/72");
+    bml.feed(pmt([0x10]));
+    expect(host.mainAudioRef()).toBe("/10");
+    expect(chosen).toEqual([2, null, 3, 1, null]);
+  });
+
+  test("部品タグの無い音声の ES も数に入れる (画面の再生と ffmpeg の 0:a:<n> と同じ数え方)", () => {
+    const chosen: (number | null)[] = [];
+    const { bml } = open({ onMainAudio: (index) => chosen.push(index) });
+    const host = bml as unknown as {
+      setMainAudio(ref: string): boolean;
+      mainAudioRef(): string;
+    };
+    // PMT の 1 本目の AAC に部品タグが無い。components には出ず、audios に null で並ぶ
+    bml.feed({
+      type: "pmt",
+      components: [
+        { pid: 0x1010, componentId: 0x10, streamType: 0x0f },
+        { pid: 0x1070, componentId: 0x70, streamType: 0x0f },
+        { pid: 0x140, componentId: 0x40, streamType: 0x0d },
+      ],
+      audios: [null, 0x10, 0x70],
+    });
+    // 1 本目は部品タグが分からないので /10
+    expect(host.mainAudioRef()).toBe("/10");
+    expect(host.setMainAudio("/70")).toBe(true);
+    expect(host.setMainAudio("/10")).toBe(true);
+    expect(chosen).toEqual([2, 1]);
+  });
+
+  test("引数を読めないときは、読めないと記録に出す (PMT の音声に無いとは出さない)", () => {
+    const { bml, logs } = open({ onMainAudio: () => {} });
+    const host = bml as unknown as { setMainAudio(ref: string): boolean };
+    bml.feed(pmt([0x10, 0x70]));
+    expect(host.setMainAudio("70")).toBe(false);
+    expect(host.setMainAudio("/71")).toBe(false);
+    expect(logs).toEqual([
+      "setMainAudioStream(70) は部品を指す書き方 (/70 の形) ではありません",
+      "setMainAudioStream(/71) は PMT の音声にありません",
+    ]);
+  });
+});
+
+describe("音声の object で主音声を替える", () => {
+  const withAudio: ResponseMessage = {
+    type: "pmt",
+    components: [
+      { pid: 0x1010, componentId: 0x10, streamType: 0x0f },
+      { pid: 0x1070, componentId: 0x70, streamType: 0x0f },
+      { pid: 0x1071, componentId: 0x71, streamType: 0x0f },
+      { pid: 0x140, componentId: 0x40, streamType: 0x0d },
+    ],
+  };
+  const RADIO =
+    '<object id="radio" type="audio/X-arib-mpeg2-aac" data="/70" streamstatus="play"/>';
+  /** 移った先の文書。音声の object は無い。読み込んだら Ureg[1] に印を付ける */
+  const NEXT = bmlFile(
+    "next.bml",
+    "",
+    'function start() { browser.Ureg[1] = "next"; }',
+  );
+
+  test("音声の object の data を書き換えたら、その ES を主音声にする (objectChanged)", async () => {
+    const chosen: (number | null)[] = [];
+    const { bml } = open({ onMainAudio: (index) => chosen.push(index) });
+    const [, ...rest] = carousel([
+      startup(
+        RADIO,
+        'function start() { document.getElementById("radio").data = "/71"; }',
+      ),
+    ]);
+    feedAll(bml, [withAudio, ...rest]);
+    const { done } = await watch(() => chosen.length >= 2);
+    expect(done).toBe(true);
+    expect(chosen).toEqual([1, 2]);
+  });
+
+  test("PMT が文書より後に届いても、音声の object が指す ES が PMT に入ったらその音声にする", async () => {
+    const chosen: (number | null)[] = [];
+    const { bml, logs } = open({ onMainAudio: (index) => chosen.push(index) });
+    // 先に届く PMT にはデータ放送の部品しか無い
+    feedAll(
+      bml,
+      carousel([
+        startup(RADIO, 'function start() { browser.Ureg[1] = "on"; }'),
+      ]),
+    );
+    const { done } = await watch(() => inside(bml).ureg[1] === "on");
+    expect(done).toBe(true);
+    expect(chosen).toEqual([]);
+    expect(logs.some((line) => line.includes("音声の object"))).toBe(true);
+    bml.feed(withAudio);
+    expect(chosen).toEqual([1]);
+  });
+
+  test("setMainAudioStream で選んだ音声は、音声の object が止まっても無くなっても戻さない", async () => {
+    const chosen: (number | null)[] = [];
+    const { bml } = open({ onMainAudio: (index) => chosen.push(index) });
+    const [, ...rest] = carousel([
+      startup(
+        `${RADIO}<object id="tv" type="video/X-arib-mpeg2" data="/00"/>`,
+        `function start() {
+          document.getElementById("tv").setMainAudioStream("/71");
+          document.getElementById("radio").streamStatus = "stop";
+          browser.launchDocument("next.bml", "cut");
+        }`,
+      ),
+      NEXT,
+    ]);
+    feedAll(bml, [withAudio, ...rest]);
+    const { done } = await watch(() => inside(bml).ureg[1] === "next");
+    expect(done).toBe(true);
+    // object で /70 (1 本目)、setMainAudioStream で /71 (2 本目)。止めても移っても渡し直さない
+    expect(chosen).toEqual([1, 2]);
+    expect((bml as unknown as { mainAudioRef(): string }).mainAudioRef()).toBe(
+      "/71",
+    );
+  });
+
+  test("音声の object で選んだ音声は、object の無い文書へ移ったら戻す", async () => {
+    const chosen: (number | null)[] = [];
+    const { bml } = open({ onMainAudio: (index) => chosen.push(index) });
+    const [, ...rest] = carousel([
+      startup(
+        RADIO,
+        'function start() { browser.launchDocument("next.bml", "cut"); }',
+      ),
+      NEXT,
+    ]);
+    feedAll(bml, [withAudio, ...rest]);
+    const { done } = await watch(() => inside(bml).ureg[1] === "next");
+    expect(done).toBe(true);
+    expect(chosen).toEqual([1, null]);
+  });
+
+  test("再生の音声の object の ES を主音声にし、止めたらふだんの音声に戻す。様子は記録に出す", async () => {
+    const chosen: (number | null)[] = [];
+    const { bml, logs } = open({ onMainAudio: (index) => chosen.push(index) });
+    const [, ...rest] = carousel([
+      startup(
+        '<object id="radio" type="audio/X-arib-mpeg2-aac" data="/70" streamstatus="play"/>',
+        `function start() {}`,
+      ),
+    ]);
+    feedAll(bml, [withAudio, ...rest]);
+    const { done } = await watch(() => chosen.length > 0);
+    expect(done).toBe(true);
+    expect(chosen).toEqual([1]);
+    expect(logs.some((line) => line.includes("音声の object"))).toBe(true);
+
+    const host = bml as unknown as {
+      stream(element: unknown, status: string): void;
+      doc: { getElementById(id: string): unknown } | null;
+    };
+    host.stream(host.doc!.getElementById("radio"), "stop");
+    expect(chosen).toEqual([1, null]);
+  });
+});
+
+/*
+ * **キーの組** (TR-B14 第二分冊 5.3.1 表 5-5。web-bml の `keyCodeToKeyGroup` と同じ表)。
+ * データ 1・2 (25・26) はどの組にも無いので、used-key-list に何を書いても文書に届かない
+ */
+describe("キーの組 (used-key-list)", () => {
+  test("十字・決定・戻るは basic、色は data-button、数字 (0〜12) は numeric-tuning", () => {
+    for (const code of [1, 2, 3, 4, 18, 19])
+      expect(keyGroup(code)).toBe("basic");
+    for (const code of [21, 22, 23, 24])
+      expect(keyGroup(code)).toBe("data-button");
+    for (let code = 5; code <= 17; code++)
+      expect(keyGroup(code)).toBe("numeric-tuning");
+  });
+
+  test("d (20) とデータ 1・2 (25・26) はどの組にも入らない", () => {
+    for (const code of [20, 25, 26]) expect(keyGroup(code)).toBeNull();
+  });
+
+  test("キーボードの e・f は割り当てない (f はプレイヤーの全画面に残す)。d・色・数字は割り当てる", () => {
+    expect(aribKey("e")).toBe(-1);
+    expect(aribKey("f")).toBe(-1);
+    expect(aribKey("F")).toBe(-1);
+    expect(aribKey("d")).toBe(20);
+    expect(aribKey("B")).toBe(21);
+    expect(aribKey("7")).toBe(12);
+  });
+
+  test("d は used-key-list を見ずに DataButtonPressed を起こす", async () => {
+    const { bml } = open();
+    feedAll(
+      bml,
+      carousel([
+        bmlFile(
+          "startup.bml",
+          '<bevent><beitem id="d" type="DataButtonPressed" subscribe="subscribe" onoccur="pressed();"/></bevent>',
+          'function start() { browser.Ureg[1] = "ready"; } function pressed() { browser.Ureg[2] = "d"; }',
+          "resolution:960x540;used-key-list:none",
+        ),
+      ]),
+    );
+    expect((await watch(() => inside(bml).ureg[1] === "ready")).done).toBe(
+      true,
+    );
+    bml.key(20, true);
+    bml.key(20, false);
+    expect((await watch(() => inside(bml).ureg[2] === "d")).done).toBe(true);
+  });
+});
+
+/** 取得を待っている画像と「無い」と決めた画像は、名前が増え続けても `MAX_IMAGES` までしか持たない */
+describe("画像の待ちと「無い」の上限", () => {
+  const images = (bml: Bml) =>
+    bml as unknown as {
+      waitingImages: Set<string>;
+      missingImages: Set<string>;
+      imagesDeferred: boolean;
+    };
+
+  async function ready(): Promise<Bml> {
+    const { bml } = open();
+    feedAll(
+      bml,
+      carousel([
+        startup("", 'function start() { browser.Ureg[1] = "ready"; }'),
+      ]),
+    );
+    expect((await watch(() => inside(bml).ureg[1] === "ready")).done).toBe(
+      true,
+    );
+    return bml;
+  }
+
+  test("返らない取得は上限より多く始めない。待ちが 1 つ終わったら描き直す", async () => {
+    const bml = await ready();
+    const resolvers: (() => void)[] = [];
+    inside(bml).resources.fetch = () =>
+      new Promise<void>((resolve) => resolvers.push(resolve));
+    for (let i = 0; i < MAX_IMAGES + 50; i++)
+      inside(bml).image(`/40/0002/a${i}.jpg`, "image/jpeg");
+    expect(images(bml).waitingImages.size).toBe(MAX_IMAGES);
+    expect(resolvers).toHaveLength(MAX_IMAGES);
+    expect(images(bml).imagesDeferred).toBe(true);
+
+    // 1 つが「無い」で終わっても、始めなかった画像のために描き直す
+    resolvers[0]!();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(images(bml).imagesDeferred).toBe(false);
+    expect(images(bml).waitingImages.size).toBe(MAX_IMAGES - 1);
+    inside(bml).image(`/40/0002/a${MAX_IMAGES}.jpg`, "image/jpeg");
+    expect(resolvers).toHaveLength(MAX_IMAGES + 1);
+  });
+
+  test("「無い」は古いものから消して、上限を超えない", async () => {
+    const bml = await ready();
+    inside(bml).resources.fetch = async () => undefined;
+    const count = MAX_IMAGES + 50;
+    for (let i = 0; i < count; i++) {
+      inside(bml).image(`/40/0002/a${i}.jpg`, "image/jpeg");
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    }
+    const missing = images(bml).missingImages;
+    expect(missing.size).toBe(MAX_IMAGES);
+    expect(images(bml).waitingImages.size).toBe(0);
+    // 新しいものは残り、最初のものは消えている
+    expect([...missing].some((key) => key.endsWith(`/a${count - 1}.jpg`))).toBe(
+      true,
+    );
+    expect([...missing].some((key) => key.endsWith("/a0.jpg"))).toBe(false);
+  });
+});
+
+describe("キーを離す", () => {
+  test("決定を押している間にフォーカスが外れたら (releaseKeys)、押している間の見た目を戻す", async () => {
+    const { bml } = open();
+    feedAll(bml, [
+      PROGRAM,
+      ...carousel([
+        bmlFile(
+          "startup.bml",
+          '<a id="go">x</a>',
+          'function start() { document.getElementById("go").focus(); browser.Ureg[1] = "ready"; }',
+        ),
+      ]),
+    ]);
+    const { done } = await watch(() => inside(bml).ureg[1] === "ready");
+    expect(done).toBe(true);
+    const focused = () =>
+      (bml as unknown as { focusedElement: { state: string } | null })
+        .focusedElement;
+    bml.key(18, true);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(focused()?.state).toBe("active");
+    bml.releaseKeys();
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(focused()?.state).toBe("focus");
   });
 });

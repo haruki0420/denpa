@@ -2,7 +2,12 @@
 # 偽 ffmpeg。E2E で「エンコードが走って mkv が出来る」ところまでを実 ffmpeg 無しで通す。
 # 本物と同じく stderr に Duration を、-progress の key=value ブロックを fd 3 (エンコードするほうの `-progress pipe:3`。
 # 開いていなければ stdout) に書き出す。
-set -uo pipefail
+#
+# **pipefail は付けない。** 引数は `printf '%s\n' "$@" | grep -q …` で探す。grep -q は見つけた所で終わり、
+# printf は残りの引数を閉じたパイプへ書いて SIGPIPE で終わる。pipefail だとこれがパイプライン全体の失敗になり、
+# 見つかったのに見つからなかったことになる。CM 検出を一緒にするエンコードが無音を返さず、作業ファイルも書かずに
+# 0 で終わり、置くところで `ENOENT ... rename` になった (CI でたまに。`src/lib/server/fake-ffmpeg.test.ts`)
+set -u
 
 # **渡された引数を、控えのファイルへ 1 回ぶん足す** (`---` の行に続けて 1 行に 1 つ)。テスト側は `---` で切って読む。
 #
@@ -93,7 +98,7 @@ fi
 
 # NVIDIA の NVENC (`h264_nvenc` / `hevc_nvenc` / `av1_nvenc`)。本物はデバイスファイルを受けず、GPU を番号 (`-gpu N`) で受ける。
 # ここでは denpa と同じく `NVIDIA_DIR` の nvidia<番号> を番号の順に並べ、**N 番目が在れば上の GPU と同じく通し、
-# 無ければ初期化で落ちる** (本物も、コンテナから見える GPU の数を超えた番号では降りる)
+# 無ければ初期化で落ちる** (本物も、コンテナから見える GPU の数を超えた番号では失敗して終了する)
 if printf '%s\n' "$@" | grep -qE -- '^(h264|hevc|av1)_nvenc$'; then
     gpu=0
     prev=""
@@ -125,6 +130,9 @@ if printf '%s\n' "$@" | grep -q silencedetect; then
     # 無音は ametadata の書き出し先 (`file=`) へ。本物と同じ形式 (cm-scan.parseSilences)
     silences="$(printf '%s\n' "$@" | grep -o 'ametadata=mode=print:file=[^,]*' | head -1)"
     silences="${silences#ametadata=mode=print:file=}"
+    # パスはフィルタの引数として '…' で囲んである (cm-scan.filterPath)。一時フォルダのパスに : や ' は無いので、囲みだけ外す
+    silences="${silences#\'}"
+    silences="${silences%\'}"
     if [ -n "$silences" ]; then
         printf 'frame:1 pts:1 pts_time:299.5\nlavfi.silence_start=299.5\nframe:2 pts:2 pts_time:300.5\nlavfi.silence_end=300.5\nlavfi.silence_duration=1\nframe:3 pts:3 pts_time:359.5\nlavfi.silence_start=359.5\nframe:4 pts:4 pts_time:360.5\nlavfi.silence_end=360.5\nlavfi.silence_duration=1\n' > "$silences"
     fi
@@ -141,7 +149,7 @@ if [ "$output" = "pipe:1" ] && printf '%s\n' "$@" | grep -qx -- '-c:s' && printf
     exit 0
 fi
 
-# 再エンコードせずに書き直すパス (-c copy。チャプターを足す / CM を切って concat で繋ぐ)。
+# 再エンコードせずに書き直すパス (-c copy。チャプターを足す)。
 # 進捗も Duration も出さず、出力ファイルだけ作って終わる本物と同じ振る舞いにする
 if printf '%s\n' "$@" | grep -qx -- '-c' && printf '%s\n' "$@" | grep -qx -- 'copy'; then
     mkdir -p "$(dirname "$output")"
@@ -166,8 +174,8 @@ if [ "$input" = "pipe:0" ]; then
     # E2E から「映像側は入口で落ちる」と指示するための目印。
     #
     # 実機の tvk (T15) で出た形をそのまま真似る。局が 3 つ入っている TS で
-    # -probesize が足りず、-map が解決できないまま降りる。**1 バイトも出さずに
-    # 降りるので、伝えないと画面は前のコマを貼ったまま 6 秒たって黒くなるだけ**。
+    # -probesize が足りず、-map が解決できないまま終了する。**1 バイトも出さずに
+    # 終了するので、伝えないと画面は前のコマを貼ったまま 6 秒たって黒くなるだけ**。
     # 字幕側は落とさない (映像だけが死ぬ場合を試したい)
     if [ -f "${FAKE_FFMPEG_LIVE_FAIL_FILE:-/nonexistent}" ] &&
         printf '%s\n' "$@" | grep -qx -- 'libx264'; then
@@ -187,7 +195,7 @@ if [ "$input" = "pipe:0" ]; then
     fi
 
     # 字幕を持たない放送 (E2E が偽の放送の PMT から字幕を外すのと一緒に置く)。本物と同じ言い分で、
-    # 字幕の出口をリクエストされていたら組み立ての時点で降りる (`server/captions.ts` の `NO_SUBTITLE`)。
+    # 字幕の出口をリクエストされていたら組み立ての時点で終了する (`server/captions.ts` の `NO_SUBTITLE`)。
     # 起こしたことは上で残してあるので、テストから起こし直したかを数えられる
     if [ -f "${FAKE_FFMPEG_NO_CAPTIONS_FILE:-/nonexistent}" ]; then
         map="$(printf '%s\n' "$@" | grep -E '^0(:p:[0-9]+)?:s:[0-9]+$' | head -1)"
@@ -218,7 +226,7 @@ if [ "$input" = "pipe:0" ]; then
     # (`server/live.ts` の pump)、渡ったものの PAT に局が 1 つしか無いことを
     # テストから確かめられるようにする。**頭だけ。** 全部残すと際限なく太る
     #
-    # **写し先が閉じても tee は降ろさない** (`--output-error=warn-nopipe`)。head は 200KB で
+    # **写し先が閉じても tee は終了しない** (`--output-error=warn-nopipe`)。head は 200KB で
     # 抜けるので、既定の tee はそこで SIGPIPE を受けて死に、**偽 ffmpeg ごと終わって**
     # 「映像を出せませんでした」になる。偽の放送が本物の映像を流すようになって量が増え、
     # 10 秒ほどのテストでも 200KB に届くようになった (docs/stream.md#放送そのままmpeg-2を送る)
@@ -250,9 +258,17 @@ fi
 
 # **エンコードしている間を残す** (始まりと終わりの時刻 (ミリ秒)・入力・出力をタブで区切る)。コーデックを同時にエンコードしているか
 # (2 本の間が重なるか)、中止で全部止まったか (終わりが無い) をテストから見るため。1 行ずつ 1 回で書く
+#
+# **時刻は bash の EPOCHREALTIME から作る。`date +%s%3N` は使わない。** Ubuntu 26.04 の date (uutils coreutils 0.10.0) は
+# `%3N` で秒の端数の先頭の 0 を落としてから 3 桁を出す (12.052 秒が 12.526 秒になる)。毎秒の最初の 0.1 秒は
+# 最大 0.9 秒ずれ、CI で 2 本のエンコードが重ならないように見えた (`src/lib/server/fake-ffmpeg.test.ts`)
+now_ms() {
+    local t="${EPOCHREALTIME//[!0-9]/}"
+    printf '%s' "${t:0:-3}"
+}
 spans="${FAKE_FFMPEG_ENCODE_SPANS_FILE:-}"
 if [ -n "$spans" ] && [ "$output" != "-" ]; then
-    printf 'start\t%s\t%s\t%s\n' "$(date +%s%3N)" "$input" "$output" >> "$spans"
+    printf 'start\t%s\t%s\t%s\n' "$(now_ms)" "$input" "$output" >> "$spans"
 fi
 
 # 進み具合の出口。エンコードするほうは fd 3 を開いて渡す (`-progress pipe:3`)。開いていなければ stdout
@@ -268,7 +284,7 @@ if [ -f "${FAKE_FFMPEG_SLOW_FILE:-/nonexistent}" ] && [ "$output" != "-" ]; then
     steps=100
     # **止められてもすぐには消えない。本物もそう。** SIGTERM を受けてから溜めた
     # コマを書き出して mux を締めるので、実測で 1 秒ほどかかる (923ms / 1078ms)。
-    # 中止が「畳み終わってから返る」ことを試すには、この間が要る
+    # 中止が「後始末を終えてから返る」ことを試すには、この間が要る
     trap 'sleep 2; exit 143' TERM
 fi
 for i in $(seq 1 "$steps"); do
@@ -278,6 +294,19 @@ for i in $(seq 1 "$steps"); do
     sleep 0.2
 done
 
+# E2E から「同じ録画を N 本そろってエンコードするまで終えない」と指示するための目印 (ファイルの中身が N)。
+# コーデックを同時にエンコードしているかを、2 本の間が重なるかで確かめるのに要る。上のエンコードは 0.8 秒しかなく、
+# 混んだ CI では 2 本目の起動がそれより遅れて重ならないことがあった。**始まった本数で待つので、時刻の差に頼らない。**
+# 本当に 1 本ずつエンコードしていたら 2 本目は始まらないので、30 秒で諦めて終える (重ならず、テストが落ちる)
+if [ -s "${FAKE_FFMPEG_ENCODE_TOGETHER_FILE:-/nonexistent}" ] && [ -n "$spans" ] && [ "$output" != "-" ]; then
+    together="$(cat "$FAKE_FFMPEG_ENCODE_TOGETHER_FILE")"
+    for _ in $(seq 1 300); do
+        started=$(awk -F'\t' -v i="$input" '$1 == "start" && $3 == i { n++ } END { print n + 0 }' "$spans")
+        if [ "$started" -ge "$together" ]; then break; fi
+        sleep 0.1
+    done
+fi
+
 if [ "$output" != "-" ]; then
     mkdir -p "$(dirname "$output")"
     # 中身は問わないが、サイズ 0 だと「失敗」と見分けが付かないので少しだけ書く
@@ -286,6 +315,6 @@ fi
 
 printf 'frame=1200\nfps=120\nbitrate=2000.0kbits/s\ntotal_size=4096\nout_time_us=10000000\nspeed=8.0x\ndrop_frames=0\nprogress=end\n' >&4
 if [ -n "$spans" ] && [ "$output" != "-" ]; then
-    printf 'end\t%s\t%s\t%s\n' "$(date +%s%3N)" "$input" "$output" >> "$spans"
+    printf 'end\t%s\t%s\t%s\n' "$(now_ms)" "$input" "$output" >> "$spans"
 fi
 exit 0

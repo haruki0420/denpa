@@ -22,7 +22,7 @@
       <h2>EPGStation からの引き継ぎ</h2>
     </div>
     <Lead>
-      EPGStation (v2・v3) から<strong>ルール・手動予約・録画</strong
+      EPGStation (v2・v3) から<strong>ルール・手動予約・録画と録画の履歴</strong
       >を取り込みます
       {#snippet more()}
         <p>
@@ -39,7 +39,7 @@
     </Lead>
 
     <!--
-      実行の条件なので、変えても保存しない。「実行」で送る。送ったあとフォームは戻る (「取り込む」は外れる) が、
+      実行の条件なので、変えても保存しない。「実行」で送る。送ったあとフォームは戻る (「取り込む」はオフに戻る) が、
       URL は入れたものに戻す (`defaultValue`。値が変わらないと `value` は入れ直されず、空に戻っていた)
     -->
     <form method="POST" action="?/migrate" use:submitting class="fields">
@@ -57,7 +57,7 @@
         />
         <span class="hint">
           denpa のサーバから届く URL。サブディレクトリも含めて書きます。Basic
-          認証があれば <code>http://ユーザー:パスワード@…</code> の形で。保存はしません
+          認証があれば <code>http://ユーザー:パスワード@…</code> の形式で。保存はしません
         </span>
       </label>
       <CheckRow
@@ -65,7 +65,7 @@
         checked={false}
         testid="migrate-apply"
         title="取り込む"
-        hint="外したままなら下見だけで、何も変えません"
+        hint="オフのままなら下見だけで、何も変えません"
         detail="何が取り込まれるか、取得する大きさと置き場の空きを表示するだけで、ファイルにもデータベースにも触りません。"
       />
       <div class="cluster">

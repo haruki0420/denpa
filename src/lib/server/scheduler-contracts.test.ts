@@ -116,7 +116,6 @@ describe("scanContracts: 有料放送契約の定期スキャンと期限切れ�
         network_id: 4,
         name: "プレミアム映画",
         type: "BS",
-        channel: "BS01",
         updated_at: Date.now(),
       })
       .run();
@@ -225,7 +224,6 @@ describe("scanContracts: 有料放送契約の定期スキャンと期限切れ�
         network_id: 4,
         name: "スポーツ生中継",
         type: "BS",
-        channel: "BS02",
         updated_at: Date.now(),
       })
       .run();
@@ -315,7 +313,6 @@ describe("scanContracts: 有料放送契約の定期スキャンと期限切れ�
         network_id: 4,
         name: "ドキュメンタリー",
         type: "BS",
-        channel: "BS03",
         updated_at: Date.now(),
       })
       .run();
@@ -423,7 +420,6 @@ describe("scanContracts: 有料放送契約の定期スキャンと期限切れ�
         .values({
           id: 201,
           type: "BS",
-          channel: "BS01_0",
           service_id: 201,
           network_id: 4,
           name: "有料BSプレミアム",

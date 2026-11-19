@@ -3,7 +3,7 @@
 # ---------------------------------------------------------------------------
 # 依存の解決だけを分ける。ソースを変えてもここは再実行されない
 # ---------------------------------------------------------------------------
-FROM docker.io/oven/bun:1.4.4-slim@sha256:1846adf22496bd711036aae8be147e57bdebbaea2e5264e3e0b5af1db187d9a4 AS deps
+FROM docker.io/oven/bun:1.4.5-slim@sha256:b780593f3e10918cbdaec3d5a08d52224b9198069a65eb47812085c2ec007643 AS deps
 WORKDIR /app
 COPY package.json bun.lock* ./
 # ワークスペース (packages/) の package.json も、依存を解くのに要る
@@ -101,7 +101,7 @@ RUN cd /usr/share/denpa-font && \
 # ---------------------------------------------------------------------------
 # 開発用。compose からソースを bind mount して使う
 # ---------------------------------------------------------------------------
-FROM docker.io/oven/bun:1.4.4-slim@sha256:1846adf22496bd711036aae8be147e57bdebbaea2e5264e3e0b5af1db187d9a4 AS dev
+FROM docker.io/oven/bun:1.4.5-slim@sha256:b780593f3e10918cbdaec3d5a08d52224b9198069a65eb47812085c2ec007643 AS dev
 WORKDIR /app
 ENV NODE_ENV=development
 COPY --from=deps /app/node_modules ./node_modules
@@ -189,7 +189,7 @@ ENV CURL="curl -fsSL --retry 5 --retry-delay 5 --retry-all-errors --connect-time
 # GPU が無ければ試しのエンコードが落ちて使わないだけなのは VA-API と同じ。
 # デコードとインタレ解除は CPU でするので、NVIDIA のデコーダ (nvdec) と CUDA のフィルタは組まない
 # (GPU に寄せるときは `--enable-nvdec`・`--enable-cuda-llvm` と clang を足す。docs/encode.md「NVIDIA でエンコードする」)
-ENV DEV="curl ca-certificates build-essential cmake pkg-config nasm patch zlib1g-dev libx264-dev libdav1d-dev libva-dev"
+ENV DEV="curl ca-certificates build-essential cmake pkg-config nasm patch zlib1g-dev libx264-dev libdav1d-dev libva-dev libzimg-dev"
 
 # renovate: datasource=github-tags depName=FFmpeg/FFmpeg extractVersion=^n(?<version>.*)$
 ENV FFMPEG_VERSION=9.0.2
@@ -230,21 +230,23 @@ COPY patches/ /patches/
 #   hevc は GPU で H.265 にエンコードした録画 (その場の変換・CM 検出のやり直し) と、ほかの録画ソフトから移した録画。
 #   ac3・eac3・mp2・aac_latm は、ほかの録画ソフトから移した録画 (サムネイル・音声だけ) のため
 # - lavfi の入力 (GPU の試しの素材) は wrapped_avframe で届くので、その「デコーダ」も要る。
-#   pcm_s16le のデコーダは、イメージの確かめで lavfi の音 (sine) を受けるためだけ
+#   pcm_s16le のデコーダは lavfi の音 (sine) を受ける。データ放送だけの局のライブの無音 (live.ts の SILENCE) と、イメージの確かめで使う
 # - エンコーダ: wrapped_avframe と pcm_s16le は `-f null` の既定。mpeg2video は GPU の試しの素材、mjpeg はサムネイル、
 #   rawvideo は CM 検出のロゴのコマ。H.265 (hevc_*) は GPU のものだけで、libx265 は組まない
 #   (ソフトウェアでは H.265 をエンコードしない。docs/encode.md「H.265 は GPU でだけ」)。
 #   nvenc は amd64、rkmpp は arm64 だけで、相手の arch では configure が黙って外す
 # - パーサ: demuxer が頼るのに configure が自分で足さないもの。画像の *_pipe は区切りをパーサに任せる
-# - bsf: h264_mp4toannexb・hevc_mp4toannexb は concat の demuxer が H.264・H.265 の mkv に差し込む (cm-cut.ts)。
-#   extract_extradata は libavformat が入力を調べるときに使う (無いと `-ss` で途中から読んだ MPEG-2 が次のシーケンスヘッダまで
+# - bsf: extract_extradata は libavformat が入力を調べるときに使う (無いと `-ss` で途中から読んだ MPEG-2 が次のシーケンスヘッダまで
 #   デコードできず、エラーを並べる)
 # - フィルタ: 引数に書いたもののほか、ffmpeg が自分で差し込むもの (buffer・null・format・aformat・scale・
 #   aresample・trim・atrim・fps、回転の印がある画像の transpose・hflip・vflip・rotate)
 # - overlay は切り抜きに字幕・コメントを重ねる (clips.ts)
 # - scale_vaapi は回線に合わせて画質を下げたライブ・変換で、VA-API でデコードした映像を GPU の上で縮める
 #   (hwenc.ts の liveHwArgs の `cap`。フレームを CPU に降ろさないため)
-# - testsrc2・sine・telecine・tinterlace・noise は denpa は使わず、イメージの確かめで素材を作るためだけ
+# - setparams・zscale・tonemap (libzimg) は 4K の局のライブで、HLG (BT.2020・10 ビット) を SDR (BT.709・8 ビット) に直す
+#   (live.ts の HLG_TO_SDR)
+# - sine はデータ放送だけの局のライブの無音 (live.ts の SILENCE) と、イメージの確かめの素材に使う
+# - testsrc2・telecine・tinterlace・noise は denpa は使わず、イメージの確かめで素材を作るためだけ
 #   (.github/image-smoke.sh と scripts/fps-smoke.ts)。合わせても数百 KB
 RUN case "${TARGETARCH}" in \
       amd64) arch_dev=libffmpeg-nvenc-dev arch_flags="--enable-ffnvcodec --enable-nvenc" ;; \
@@ -287,6 +289,7 @@ RUN case "${TARGETARCH}" in \
       --enable-libsvtav1 \
       --enable-libx264 \
       --enable-libdav1d \
+      --enable-libzimg \
       --enable-vaapi \
       $arch_flags \
       --disable-everything \
@@ -294,11 +297,11 @@ RUN case "${TARGETARCH}" in \
       --enable-decoder=mpeg2video,h264,aac,opus,libdav1d,png,mjpeg,webp,hevc,ac3,eac3,mp2,aac_latm,wrapped_avframe,pcm_s16le \
       --enable-encoder=libsvtav1,libx264,libopus,aac,h264_vaapi,av1_vaapi,hevc_vaapi,h264_nvenc,av1_nvenc,hevc_nvenc,h264_rkmpp,hevc_rkmpp,mpeg2video,mjpeg,rawvideo,wrapped_avframe,pcm_s16le \
       --enable-hwaccel=mpeg2_vaapi,h264_vaapi \
-      --enable-demuxer=mpegts,matroska,mov,concat,ffmetadata,image2,png_pipe,jpeg_pipe,webp_pipe \
+      --enable-demuxer=mpegts,matroska,mov,ffmetadata,image2,png_pipe,jpeg_pipe,webp_pipe \
       --enable-muxer=matroska,mp4,adts,avif,rawvideo,null,image2,mpegts \
       --enable-parser=mpegvideo,h264,aac,av1,opus,png,mjpeg,webp,hevc,ac3,mpegaudio,aac_latm \
-      --enable-bsf=h264_mp4toannexb,hevc_mp4toannexb,aac_adtstoasc,extract_extradata \
-      --enable-filter=buffer,buffersink,abuffer,abuffersink,null,anull,format,aformat,scale,aresample,trim,atrim,fps,transpose,hflip,vflip,rotate,bwdif,setsar,scdet,metadata,ametadata,silencedetect,channelsplit,pan,hwupload,deinterlace_vaapi,scale_vaapi,crop,split,vstack,field,separatefields,signalstats,thumbnail,nullsrc,testsrc2,sine,telecine,tinterlace,noise,overlay \
+      --enable-bsf=aac_adtstoasc,extract_extradata \
+      --enable-filter=buffer,buffersink,abuffer,abuffersink,null,anull,format,aformat,scale,aresample,trim,atrim,fps,transpose,hflip,vflip,rotate,bwdif,setsar,scdet,metadata,ametadata,silencedetect,channelsplit,pan,hwupload,deinterlace_vaapi,scale_vaapi,crop,split,vstack,field,separatefields,signalstats,thumbnail,nullsrc,testsrc2,sine,telecine,tinterlace,noise,overlay,setparams,zscale,tonemap \
       --enable-indev=lavfi \
       --enable-protocol=file,pipe \
     && \
@@ -369,7 +372,7 @@ RUN bun run build && find build -name "*.map" -delete
 #
 # **node_modules は載せない。**
 #
-# adapter-bun の出力は要るものを畳み込んでいて、外から引くのは `node:*` と
+# adapter-bun の出力は要るものを取り込んでいて、外から引くのは `node:*` と
 # bun の組み込み (`bun:sqlite`・`bun:ffi`) だけ。載せていた頃は playwright も vite も
 # typescript もイメージに入っていて、**312MB がまるごと無駄**だった。
 # 置くのは下のものだけ: build/ (アプリ)、server.js (入口) とそれが読む
@@ -377,7 +380,7 @@ RUN bun run build && find build -name "*.map" -delete
 # (マイグレーション)。これで起動して /api/health が答えるかは CI で毎回見ている
 # (.github/image-smoke.sh。PR の docker-build-check と、push の前の build-and-deploy。Windows・Mac は test.yml の server-windows・server-macos)
 #
-# 引き換えに、**外から引くものを増やすなら畳み込ませること** — package.json の
+# 引き換えに、**外から引くものを増やすなら取り込ませること** — package.json の
 # `dependencies` に足すと adapter-bun がそれを外に出すので、ここで転ぶ。
 # 依存を全部 devDependencies に置いて `dependencies` を空にしてあるのはそのため
 # ---------------------------------------------------------------------------
@@ -416,7 +419,7 @@ COPY --from=mpeg2wasm /opt/denpa/mpeg2 /mpeg2
 # (エージェントを同じコンテナに入れる denpa-aio は libssl を要るので、あちらで足す。.github/aio.Dockerfile)。
 # その段が「土台にもうあるライブラリ」を見分けるのにも使うので、段に名前を付けておく
 # ---------------------------------------------------------------------------
-FROM gcr.io/distroless/base-nossl-debian13:latest@sha256:d710a5c8bfe4cf7e726d7e1afd73e363a9fb02c2a11ad893d2d6185c1b9a89cb AS distroless
+FROM gcr.io/distroless/base-nossl-debian13:latest@sha256:3a2dbf10c2fdafe5865e2b03a4a3b9b23f2e280229a81730415379b76dc70592 AS distroless
 
 # ---------------------------------------------------------------------------
 # 本番イメージへ写すライブラリを集める段。**本番イメージにはシェルも apt も無い**ので、
@@ -447,7 +450,7 @@ RUN case "${TARGETARCH}" in \
     sed -i 's/^Components: main$/Components: main non-free/' /etc/apt/sources.list.d/debian.sources && \
     apt-get update && \
     apt-get -y --no-install-recommends install \
-      libx264-164 libdav1d7 \
+      libx264-164 libdav1d7 libzimg2 \
       libva2 libva-drm2 $gpu && \
     apt-get clean && rm -rf /var/lib/apt/lists/*
 
@@ -536,7 +539,7 @@ ENV NVIDIA_DRIVER_CAPABILITIES=compute,video,utility \
 COPY --from=runtime-libs /rootfs/ /
 
 # bun 本体。SvelteKit (adapter-bun) の出力を bun で動かす
-COPY --from=docker.io/oven/bun:1.4.4-slim@sha256:1846adf22496bd711036aae8be147e57bdebbaea2e5264e3e0b5af1db187d9a4 /usr/local/bin/bun /usr/local/bin/bun
+COPY --from=docker.io/oven/bun:1.4.5-slim@sha256:b780593f3e10918cbdaec3d5a08d52224b9198069a65eb47812085c2ec007643 /usr/local/bin/bun /usr/local/bin/bun
 
 # 写したライブラリだけで ffmpeg / ffprobe が起きるかを、本番の中身でも見る (シェルが無いので exec の形で)
 RUN ["/usr/local/bin/ffmpeg", "-hide_banner", "-loglevel", "error", "-version"]

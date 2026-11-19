@@ -3,6 +3,7 @@ import { existsSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 
 import {
+  filterPath,
   parseCuts,
   parseSilences,
   scanLine,
@@ -57,14 +58,14 @@ describe("書き出しを読む", () => {
     });
     expect(
       scanLine(
-        "[scdet@cm @ 0x1] lavfi.scd.score: 100.000, lavfi.scd.time: 1.0",
+        "[Parsed_scdet_0 @ 0x1] lavfi.scd.score: 100.000, lavfi.scd.time: 1.0",
       ),
     ).toBeNull();
     expect(scanLine("[mpeg2video @ 0x1] ac-tex damaged at 12 34")).toBeNull();
   });
 });
 
-describe("ffmpeg に渡す出口", () => {
+describe("ffmpeg に渡す出力", () => {
   test("映像は切れ目の点を書き出してからロゴの枠を白黒で切り出し、音は主音声の無音を書き出す", () => {
     const args = scanOutputs(
       {
@@ -75,7 +76,7 @@ describe("ffmpeg に渡す出口", () => {
       files,
     );
     expect(args).toContain(
-      "scdet@cm=threshold=100,metadata=mode=print:key=lavfi.scd.score:file=/tmp/x.cuts,crop=10:10:0:0,format=gray",
+      "scdet=threshold=100,metadata=mode=print:key=lavfi.scd.score:file='/tmp/x.cuts',crop=10:10:0:0,format=gray",
     );
     // コマを間引かない (時刻とロゴの枠を順番で突き合わせる)
     expect(args.join(" ")).toContain("-fps_mode passthrough");
@@ -85,7 +86,7 @@ describe("ffmpeg に渡す出口", () => {
       args.some(
         (a) =>
           a.startsWith("silencedetect=") &&
-          a.endsWith("ametadata=mode=print:file=/tmp/x.silences"),
+          a.endsWith("ametadata=mode=print:file='/tmp/x.silences'"),
       ),
     ).toBe(true);
   });
@@ -121,8 +122,8 @@ describe("読み取り", () => {
         onFrame: (_f, i) => frames.push(i),
       },
     });
-    const cuts = /file=([^,\s]+\/cuts)/.exec(reader.outputs.join(" "))![1]!;
-    const silences = /file=([^,\s]+\/silences)/.exec(
+    const cuts = /file='([^']+\/cuts)'/.exec(reader.outputs.join(" "))![1]!;
+    const silences = /file='([^']+\/silences)'/.exec(
       reader.outputs.join(" "),
     )![1]!;
     writeFileSync(
@@ -149,5 +150,23 @@ describe("読み取り", () => {
     expect(found.duration).toBe(600);
     // 一時フォルダごと片付ける
     expect(existsSync(dirname(cuts))).toBe(false);
+  });
+});
+
+/**
+ * 書き出しのパスはフィルタの引数に入る。Windows の一時フォルダ (`C:\Windows\Temp\…`) は `:` と `\` で崩れ、
+ * CM 検出が毎回「読み込みに失敗しました」になっていた (#2816)。本物の ffmpeg 7.1 で、下の形のパスに書き出せることを確かめた
+ */
+describe("フィルタの引数に入れるパス", () => {
+  test("Windows のパスは / にして : をエスケープし、' で囲む", () => {
+    expect(filterPath("C:\\Windows\\Temp\\denpa-scan-jmsQ9b\\cuts")).toBe(
+      "'C\\:/Windows/Temp/denpa-scan-jmsQ9b/cuts'",
+    );
+  });
+
+  test("' は引数の中でエスケープし、囲みをいったん閉じて挟む。, [ ] ; は囲みの中ならそのまま", () => {
+    expect(filterPath("/tmp/C:x y'z,[a];b/cuts")).toBe(
+      "'/tmp/C\\:x y\\'\\''z,[a];b/cuts'",
+    );
   });
 });

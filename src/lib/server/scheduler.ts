@@ -12,6 +12,8 @@ import {
 
 import { COPY_NEVER_REASON } from "../format";
 import type { Reservation } from "../types";
+import { type CardNarrow, cardNarrower } from "./agent-cards";
+import { shareKey } from "./agent-channels";
 import { config } from "./config";
 import { assign, type Busy, type Capacity, capacityOf } from "./conflict";
 import { checkContracts, type ContractRow, getActiveCardId } from "./contracts";
@@ -24,6 +26,7 @@ import {
   startRecording,
   stopRecording,
 } from "./recorder";
+import { plannedStartSql } from "./recording";
 import {
   cardContracts,
   contractNotifications,
@@ -37,14 +40,16 @@ import {
 import { cardStatus } from "./scramble";
 import { isDraining } from "./shutdown";
 import {
-  type AgentTuner,
-  getTuners,
   recordingHolds,
   recordingOf,
   recordingUse,
   type StreamUse,
+  tunerSnapshot,
 } from "./tuner";
 import { notifyContractExpired, notifyContractExpiring } from "./webhook";
+
+/** 割り振りでカードを訊くときに答えを待つ上限 (ms。振り分けの `ROUTE_ASK_WAIT` と同じ) */
+const CARD_ASK_WAIT = 3_000;
 
 interface Candidate extends Reservation {
   type: string;
@@ -60,21 +65,25 @@ interface Candidate extends Reservation {
  * - `capacity`: 動いているチューナーを、エージェントが選ぶ順 (`rank`) に組にしたもの (`Capacity`)
  * - `busy`: 録画中の予約が、いまどのチューナーにいて、いつ離すか (tuner.ts の `recordingHolds`)
  *
- * エージェントに繋がらないときは空 (「制限なし」) を返し、予約を勝手に conflict にしない (実際に
- * 録画が始まるときにあちらが弾くので、予約表を壊すより実行時に失敗させるほうが害が小さい)。
+ * 数えるのは全部のエージェントのチューナー (`tunerSnapshot`)。落ちているエージェントは最後に返した一覧で数える。
+ * どのエージェントにも繋がらないか、起動してから一度も一覧を返していないエージェントがあれば空 (「制限なし」) を返し、
+ * 予約を勝手に conflict にしない (実際に録画が始まるときにあちらが弾くので、予約表を壊すより実行時に失敗させるほうが害が小さい)。
  */
 export async function tunerState(): Promise<{
   capacity: Capacity;
   busy: Busy[];
+  narrow: CardNarrow;
 }> {
-  let tuners: AgentTuner[];
-  try {
-    tuners = await getTuners();
-  } catch {
-    return { capacity: [], busy: [] };
-  }
+  const keep: CardNarrow = (_service, places) => places;
+  const tuners = await tunerSnapshot();
+  if (tuners === null) return { capacity: [], busy: [], narrow: keep };
   const capacity = capacityOf(tuners);
-  if (capacity.length === 0) return { capacity, busy: [] };
+  if (capacity.length === 0) return { capacity, busy: [], narrow: keep };
+  // 録画の選局はカードの契約で絞って振り分ける (`tuner.route` の手順 1)。割り振りも同じ順で受けられる所を絞る
+  const narrow = await cardNarrower(
+    [...new Set(tuners.map((t) => t.agent))],
+    CARD_ASK_WAIT,
+  );
   const ids = tuners.flatMap((t) =>
     t.users.flatMap((u) => recordingOf(u.use) ?? []),
   );
@@ -92,19 +101,23 @@ export async function tunerState(): Promise<{
           .all()
           .map((rec) => [rec.id, recordingUntil(rec)] as const),
   );
-  return { capacity, busy: recordingHolds(tuners, (id) => until.get(id)) };
+  return {
+    capacity,
+    busy: recordingHolds(tuners, (id) => until.get(id)),
+    narrow,
+  };
 }
 
 export async function resolveConflicts(): Promise<{
   accepted: number;
   rejected: number;
 }> {
-  const { capacity, busy } = await tunerState();
+  const { capacity, busy, narrow } = await tunerState();
   const all: Candidate[] = orm()
     .select({
       ...getTableColumns(reservations),
       type: services.type,
-      channel: services.channel,
+      channel: shareKey(),
       copy_never: sql<boolean>`COALESCE(${programs.copy_never}, 0) = 1`.mapWith(
         Boolean,
       ),
@@ -140,7 +153,10 @@ export async function resolveConflicts(): Promise<{
    * 番組表が書き換わって禁止でなくなったものは、ここで割り振りに戻る
    */
   const skipped = all.filter((c) => c.copy_never);
-  const candidates = all.filter((c) => !c.copy_never);
+  // 受けられる所はカードの契約で絞る (振り分けと同じ順。`agent-cards.cardNarrower`)
+  const candidates = all
+    .filter((c) => !c.copy_never)
+    .map((c) => ({ ...c, channel: narrow(c.service_id, c.channel) }));
 
   // 前後のマージンぶんチューナーを使う時間は延びる。予約表と実行時のズレを無くすため
   // 同じ物差しで数える
@@ -185,8 +201,8 @@ export async function resolveConflicts(): Promise<{
        * **譲ったぶんを覚える。マージンだけ譲ったものも。** 譲っていなければ NULL に戻す。
        * 前の回で削られていても、相手が消えれば丸ごと録れるようになる。
        *
-       * マージンだけのときに NULL にしていた頃は、隣り合う番組で前が終了マージンまで使い続け、
-       * 後ろが開始マージンから使おうとしていた。割り振りの通りに離さないと、後ろは別のチューナーに
+       * マージンだけのときに NULL にすると、隣り合う番組で前が終了マージンまで使い続け、
+       * 後ろが開始マージンから使おうとする。割り振りの通りに離さないと、後ろは別のチューナーに
        * 入る (兼用のチューナーを塞いで、その後の衛星が録れない) か、空き待ちで冒頭が欠ける。
        * 「欠けます」のラベルはマージンだけなら出ない (`format.clipNote` は番組の時刻と比べる)
        */
@@ -224,7 +240,49 @@ export async function resolveConflicts(): Promise<{
 }
 
 let lastContractScan = 0;
-let scanningContracts = false;
+
+/**
+ * 走らせる処理を 1 本ずつにする。走っている間に呼ばれたら、終わったあとに 1 回だけ走らせ直す
+ * (何回呼ばれても 1 回にまとめる)。返す Promise は、走らせ直した分まで終わったら済む。`run` は例外を送出しないこと
+ */
+export function oneAtATime(
+  run: () => Promise<void>,
+): (() => Promise<void>) & { readonly running: boolean } {
+  let current: Promise<void> | null = null;
+  let again = false;
+  const call = (): Promise<void> => {
+    if (current !== null) {
+      again = true;
+      return current;
+    }
+    current = (async () => {
+      do {
+        again = false;
+        await run();
+      } while (again);
+    })().finally(() => {
+      current = null;
+    });
+    return current;
+  };
+  return Object.defineProperty(call, "running", {
+    get: () => current !== null,
+  }) as (() => Promise<void>) & { readonly running: boolean };
+}
+
+/**
+ * 有料放送の契約を確かめ直す。12 時間ごとの `tick` と、カードが契約の更新 (EMM) を受け入れたという
+ * エージェントの通知 (`card`。runtime.ts) から呼ぶ。走っている間に呼ばれたら、終わったあとに 1 回だけ確かめ直す。
+ * カードが無ければ断られて、記録に 1 行出る
+ */
+export const recheckContracts = oneAtATime(async () => {
+  lastContractScan = now();
+  try {
+    await checkContracts();
+  } catch (error) {
+    console.warn(`[contracts] 契約を確かめ直せませんでした: ${error}`);
+  }
+});
 
 /** テスト用: 最後に契約確認スキャンを実行した時刻をリセットする */
 export function resetContractScanTimeForTest(time = 0): void {
@@ -256,6 +314,9 @@ export function shouldScanContracts(
   const currentDay = Math.floor((at + JST_OFFSET_MS - TARGET_HOUR_MS) / DAY_MS);
   return currentDay > prevDay;
 }
+
+/** 定期契約確認スキャンの二重実行防止フラグ */
+let scanningContracts = false;
 
 /**
  * 有料放送局の契約状態を確認し、直前のスキャン結果と比較して
@@ -384,8 +445,11 @@ export async function scanContracts(): Promise<{
 export async function tick(): Promise<void> {
   const at = now();
 
-  // 定期的な有料放送契約確認スキャン (深夜 JST 03:00、または既定12時間間隔)
-  if (shouldScanContracts(at, lastContractScan, config.contractScanInterval)) {
+  // 定期的な有料放送契約確認スキャン (深夜 JST 03:00、または既定 12 時間間隔)
+  if (
+    !recheckContracts.running &&
+    shouldScanContracts(at, lastContractScan, config.contractScanInterval)
+  ) {
     lastContractScan = at;
     void scanContracts().catch((error: unknown) => {
       console.warn(`[contracts] 定期契約確認スキャンに失敗しました: ${error}`);
@@ -409,14 +473,14 @@ export async function tick(): Promise<void> {
     stopped.push(recordingUse(id));
   }
 
-  // 持ち主のいない「録画中」を畳む。起動時の回収だけでは畳めない場合がある (`failStrayRecordings`)
+  // 持ち主のいない「録画中」を終える。起動時の回収だけでは終えられない場合がある (`failStrayRecordings`)
   if (failStrayRecordings(at) > 0) {
     emit("recordings");
     emit("reservations");
   }
 
   // 始まらないまま終わってしまった予約を片付ける。
-  // アプリが止まっていた間に放送が終わったものがここに残り続けていた。
+  // アプリが止まっていた間に放送が終わったものは、ここで片付けないと残り続ける。
   // **録らないと決めたもの (コピー禁止の `skipped`) は移さない。** 意図して録らなかったものが
   // 失敗 (録り逃し) に見えないよう、「録画しない」のまま理由ごと残す
   const expired = affected(
@@ -436,8 +500,8 @@ export async function tick(): Promise<void> {
   /*
    * **止まる途中 (録画の終わりを待っている間) でも始める。**
    *
-   * 始めないでいた頃は、**待っている間に始まる録画の冒頭が丸ごと欠けて**
-   * いた。待つのは「いま動いている録画が終わるまで」なので、欠ける幅は
+   * 始めないと、**待っている間に始まる録画の冒頭が丸ごと欠ける。**
+   * 待つのは「いま動いている録画が終わるまで」なので、欠ける幅は
    * 最長で番組 1 本ぶんになる。実機では 00:00 の番組が 29 秒、19:54 の番組が
    * **9 分 42 秒**欠けた (どちらも、その時刻にちょうど入れ替えが始まっていた)。
    *
@@ -456,10 +520,7 @@ export async function tick(): Promise<void> {
       and(
         eq(reservations.state, "scheduled"),
         isNull(reservations.started_at),
-        lte(
-          sql`COALESCE(${reservations.record_from}, ${reservations.start_at} - ${config.startMargin})`,
-          at,
-        ),
+        lte(plannedStartSql(), at),
         gt(
           sql`COALESCE(${reservations.record_to}, ${reservations.end_at})`,
           at,
@@ -477,8 +538,6 @@ export async function tick(): Promise<void> {
   for (const reservation of due) {
     /*
      * 録り始めた時刻を先に立ててから開始する。tick が重なっても二重に開始しない。
-     * 状態の文字列を 'recording' に進めていた頃と同じ鍵の掛け方だが、
-     * こちらは録画の行と食い違いようがない (録り始めたかどうかは事実ひとつ)
      */
     const claimed = orm()
       .update(reservations)
@@ -496,7 +555,7 @@ export async function tick(): Promise<void> {
     /*
      * **止めた録画を引き継ぎとして渡す** (`after`)。止めたことがエージェントに届くのは
      * 非同期なので、届く前に次の選局が着くと、前のチューナーがまだ塞がって見えて次の順位のチューナーに
-     * 入っていた (割り振りと違うチューナーに入り、後の録画が録れない)。渡しておけば、エージェントは
+     * 入る (割り振りと違うチューナーに入り、後の録画が録れない)。渡しておけば、エージェントは
      * 止めた録画をもう離れたものとして選ぶ。割り振り (`conflict.ts`) も、離すのと使うのが
      * 同じ時刻なら離すほうを先に数えているので、それと同じになる。
      *

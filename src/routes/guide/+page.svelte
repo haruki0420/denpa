@@ -10,16 +10,25 @@
 
   import { dragScroll } from "#lib/actions.js";
   import { GENRE_TREE } from "#lib/arib.js";
-  import ChannelNotice from "#lib/components/ChannelNotice.svelte";
-  import { guideNavigation } from "#lib/components/GuidePending.svelte";
+  import {
+    CHANNEL_NOTICE_ACTION,
+    CHANNEL_NOTICE_SECTION,
+  } from "#lib/channel-notice.js";
+  import {
+    guideNavigation,
+    rememberGuideTabs,
+  } from "#lib/components/GuidePending.svelte";
   import Menu from "#lib/components/Menu.svelte";
-  import NowLine from "#lib/components/NowLine.svelte";
+  import NowMark from "#lib/components/NowMark.svelte";
   import Icon from "#lib/components/player/Icon.svelte";
   import ProgramActions from "#lib/components/ProgramActions.svelte";
   import ProgramDetail from "#lib/components/ProgramDetail.svelte";
+  import ProgramState from "#lib/components/ProgramState.svelte";
   import ServiceLogo from "#lib/components/ServiceLogo.svelte";
+  import Toasts, { warningNotice } from "#lib/components/Toasts.svelte";
+  import { writeCookie } from "#lib/cookie.js";
   import {
-    badgeClass,
+    beforeJapanese,
     channelNumber,
     date,
     playableRecordingId,
@@ -27,6 +36,7 @@
     stateLabel,
     time,
   } from "#lib/format.js";
+  import { cellRows, placeRows } from "#lib/guide-cell.js";
   import { skeletonMask } from "#lib/guide-skeleton.js";
   import { minuteClock } from "#lib/minute-clock.svelte.js";
   import { PHONE_FORM } from "#lib/phone-form.js";
@@ -39,7 +49,6 @@
     SUBCHANNELS_COOKIE,
   } from "#lib/subchannels.js";
   import {
-    CHANNEL_TYPES,
     type GridProgram,
     type GuideSheet,
     type ProgramDetail as Facts,
@@ -99,6 +108,8 @@
    * (同じ種別の別の日なら局の並びはほぼ同じなので、そのまま残す)
    */
   const toGuide = guideNavigation();
+  // ほかの画面から移る途中の姿も、同じタブを並べる (ケーブルとスカパー！プレミアムのタブは局があるときだけ。`GuidePending`)
+  $effect(() => rememberGuideTabs(data.types));
   /** 押した先の種別。今と同じ日・同じ種別 (読み直し・同じリンク) なら null */
   const switching = $derived.by(() => {
     const to = toGuide.to;
@@ -119,11 +130,9 @@
   );
 
   const services = $derived(data.services);
-  /** 文に入れる種別。英字 (BS・CS・SKY) のあとには半角の空白を入れる (docs/writing.md) */
+  /** 文に入れる種別。英字 (BS・CS) のあとには半角の空白を入れる (docs/writing.md。`beforeJapanese`) */
   const typeWord = $derived(
-    /^[A-Z]/.test(SERVICE_TYPE_LABEL[data.type] ?? "")
-      ? `${SERVICE_TYPE_LABEL[data.type]} `
-      : SERVICE_TYPE_LABEL[data.type],
+    beforeJapanese(SERVICE_TYPE_LABEL[data.type] ?? data.type),
   );
   const programs = $derived<GridProgram[]>(sheet?.programs ?? []);
 
@@ -155,8 +164,8 @@
     subchannels = on;
     // 列が増減するだけなので、少しずつ描き直さない (`drawAll`)
     drawAll();
-    // パスは接頭辞込み (録画一覧の「まとめて表示」と同じ)
-    document.cookie = `${SUBCHANNELS_COOKIE}=${on ? "1" : "0"}; path=${resolve("")}; max-age=31536000; samesite=lax`;
+    // パスは接頭辞込み (`cookie.writeCookie`。録画一覧の「まとめて表示」と同じ)
+    writeCookie(SUBCHANNELS_COOKIE, on ? "1" : "0", resolve(""));
   }
 
   /**
@@ -201,6 +210,8 @@
   /** まだ描き終えていない。`data-drawing` で外から分かるようにする (表の箱。下のマークアップ) */
   const drawing = $derived(shownCells < cells.length);
   const visibleCells = $derived(drawing ? cells.slice(0, shownCells) : cells);
+  /** マスの行。同じ列のマスどうしで重ならないよう、描く前に全部のマスで出す (`placeRows`) */
+  const rowsOf = $derived.by(() => placeRows(cells, data.start, slots, SLOT));
 
   /**
    * **マスは局ごとの箱 (`.station`) に入れて置く。** 箱は本チャンネルとそのサブの列をまとめたもの
@@ -242,17 +253,15 @@
     for (const cell of visibleCells) {
       const group = groups[groupOf[cell.column] ?? -1];
       if (group === undefined) continue;
-      const from = Math.max(0, Math.floor((cell.start_at - data.start) / SLOT));
-      const to = Math.min(
-        slots,
-        Math.ceil((Math.min(cell.end_at, end) - data.start) / SLOT),
-      );
-      const span = Math.max(1, to - from);
+      const row =
+        rowsOf.get(cell.key) ??
+        cellRows(cell.start_at, cell.end_at, data.start, slots, SLOT);
+      const span = row.to - row.from;
       group.cells.push({
         key: cell.key,
         program: cell.program,
-        // `--s` / `--e` は番組の始まりと終わりのマスの位置 (端数つき)。過ぎた所を暗くするのに使う (`.program` の背景の覆い)
-        style: `grid-column: ${cell.column - group.first + 1} / span ${cell.span}; grid-row: ${from + 1} / span ${span}; --lines: ${lines(span)}; --s: ${(cell.start_at - data.start) / SLOT}; --e: ${(cell.end_at - data.start) / SLOT};`,
+        // `--s` / `--e` はマスの上端と下端、`--end` は番組の実際の終わり (端数つき)。過ぎた所を暗くするのに使う (`.program` の背景の覆い)
+        style: `grid-column: ${cell.column - group.first + 1} / span ${cell.span}; grid-row: ${row.from + 1} / span ${span}; --lines: ${lines(span)}; --s: ${row.from}; --e: ${row.to}; --end: ${row.end};`,
       });
     }
     return groups;
@@ -344,6 +353,15 @@
    * 同じ決め方でないと、押した先で別の局が映る
    */
   const watchable = $derived(new Set(data.watchable));
+  /**
+   * 番組表に出すが観られない局 (番組表を読めるが復号できない局) と、そのわけ。**決めているのはサーバ** (`+page.server.ts` の `unwatchable`)。
+   * 列の局名の下に「観られません」を出し、詳細では予約とライブのボタンの代わりにわけを出す
+   */
+  const unwatchable = $derived(
+    new Map(
+      Object.entries(data.unwatchable).map(([id, why]) => [Number(id), why]),
+    ),
+  );
 
   const HOUR = 60 * 60 * 1000;
   /** 5 分を 1 マスにする。細かすぎると行数が増えるだけ、粗いと短い番組が潰れる */
@@ -370,7 +388,7 @@
    * 表示中の日にいまが含まれていれば、表の先頭 (4:00) から何マスぶん下か (端数つき)。
    *
    * **時刻は 1 マス (5 分) ごとに飛ばさず、分の位置へ `translate` で送る。** 行 (`grid-row`) で
-   * 置いていた頃は 5 分ごとに 1 マスずつ飛んでいた。1 分ごとの移りは短い transition でなめらかに
+   * 置いていた頃は 5 分ごとに 1 マスずつ飛んでいた。1 分ごとに移るときは短い transition でなめらかに動かす
    * (`.now`。動きを減らす設定ではすぐ移る)
    */
   const nowSlots = $derived(
@@ -379,12 +397,12 @@
       : null,
   );
   /**
-   * **過ぎた所を暗くする位置** (表の先頭から何マスぶん。マスの `--s` / `--e` と比べる。`.program` の背景の覆い)。
-   * 前の日は全部、先の日は何も暗くしないよう、表の外は端の外へ寄せる。2,000 を超えるマスを毎分書き直さないよう、表に 1 つだけ持つ
+   * **過ぎた所を暗くする位置** (表の先頭から何マスぶん。マスの `--s` / `--e` / `--end` と比べる。`.program` の背景の覆い)。
+   * 先の日は何も暗くしないよう、表より前は先頭の外へ寄せる。表より後は切らない。
+   * 表の末尾より後に終わる番組 (`--end` が表の外) も、実際に終わっていれば終わった番組の濃さにするため。
+   * 2,000 を超えるマスを毎分書き直さないよう、表に 1 つだけ持つ
    */
-  const elapsedSlots = $derived(
-    Math.min(Math.max((clock - data.start) / SLOT, -1), slots + 1),
-  );
+  const elapsedSlots = $derived(Math.max((clock - data.start) / SLOT, -1));
 
   let grid = $state<HTMLElement | null>(null);
   let nowMark = $state<HTMLElement | null>(null);
@@ -405,7 +423,7 @@
 
   /*
    * 開いたときに「いま」が見えている状態にする。24 時間ぶん出るので、
-   * 先頭(4:00)のままだと毎回スクロールさせることになる。
+   * 先頭 (4:00) のままだと毎回スクロールさせることになる。
    *
    * 位置は offsetTop では測れない (親が body になり、ナビや見出しの高さまで足し込まれる)。見えている位置の差から出す (`nowTop`)。
    *
@@ -432,13 +450,11 @@
     let frames = 0;
     const settle = () => {
       place();
-      // 画像(局ロゴ)やバッジが入って高さが変わることがあるので数回追う
+      // 画像 (局ロゴ) が後から入って高さが変わることがあるので数回追う
       if (++frames < 5) requestAnimationFrame(settle);
     };
     requestAnimationFrame(settle);
   });
-
-  const end = $derived(data.start + data.hours * HOUR);
 
   const hourMarks = $derived(
     Array.from({ length: data.hours }, (_, i) => ({
@@ -619,7 +635,7 @@
    * 同じ画面のまま中身だけ入れ替わるので、DOM は使い回され、横スクロールの
    * 位置がそのまま残る。地上波で右のほうを見ていたあと BS を開くと、
    * 局の並びは別物なのに同じ位置から始まり、左端の局が隠れていた。
-   * 縦(時刻)はどの種別でも同じ意味なので、そのままにする
+   * 縦 (時刻) はどの種別でも同じ意味なので、そのままにする
    */
   $effect(() => {
     data.type;
@@ -629,8 +645,8 @@
   /*
    * 前日・翌日を先に取り寄せておく。`data-sveltekit-preload-data="hover"` は指を乗せてからなので、狙って押すと間に合わない。
    *
-   * **マスを描き終わってから** (`drawing` が下りてから) 取得する。表が届いた時点で取得していた頃は、BS で 1 件 1 MB 超の
-   * 応答の解読が描画と取り合っていた。描き終わった直後もレイアウトが走っているので、少し置いて (`PREFETCH_DELAY`)
+   * **マスを描き終わってから** (`drawing` が false になってから) 取得する。表が届いた時点で取得していた頃は、BS で 1 件 1 MB 超の
+   * 応答のパースが描画と取り合っていた。描き終わった直後もレイアウトが走っているので、少し置いて (`PREFETCH_DELAY`)
    * 空いたとき (`requestIdleCallback`。Safari には無いので置くだけ) に取得する。
    * 同じ日・同じ種別の読み直しでは取り直さない (`prefetchedFor`)
    */
@@ -662,26 +678,29 @@
   });
 </script>
 
+<!-- 予約できたが、有料の番組がスクランブルのまま録れるかもしれない。詳細は閉じているので画面の通知に出す -->
+<Toasts notices={warningNotice(form, "reserve-warning")} source={form} />
+
 <!--
-    **表は画面の残りをぜんぶ使う。** 枠 (カード) で囲まず、本文の余白も打ち消して
-    端から端まで表にする (`app.css` の `.guide-frame`)。1 画面に入る局と時間を増やすため
+  **表は画面の残りをぜんぶ使う。** 枠 (カード) で囲まず、本文の余白も打ち消して
+  端から端まで表にする (`app.css` の `.guide-frame`)。1 画面に入る局と時間を増やすため
 -->
 <div class="guide-frame">
   <!--
-        **どこを見るかは表の外の細い 1 行にまとめる** (種別・日付・時刻・サブ ch・ジャンル)。縦は表に回す。
+    **どこを見るかは表の外の細い 1 行にまとめる** (種別・日付・時刻・サブ ch・ジャンル)。縦は表に回す。
 
-        表の中 (左上の角・局名の行) には入れない。角は時刻の列の幅 (1.75rem) しか無く、
-        入れるならメニューに畳むことになり、種別や日を変えるたびに 1 回多く押す。
-        局名の行に入れると、操作の幅のぶん局名が隠れる。表の外の 1 行なら、
-        隠れるものも押す回数も増えない。
+    表の中 (左上の角・局名の行) には入れない。角は時刻の列の幅 (1.75rem) しか無く、
+    入れるならメニューにたたむことになり、種別や日を変えるたびに 1 回多く押す。
+    局名の行に入れると、操作の幅のぶん局名が隠れる。表の外の 1 行なら、
+    隠れるものも押す回数も増えない。
 
-        **スマホの形では下のタブのすぐ上に浮かせる** (親指が届く。表を読んでいる間は下のタブと一緒に引っ込む。`app.css` の `.guide-bar`)。
-        DOM の順 (種別 → 日付 → 時刻 → …) は読み上げの順なので変えない。
-        入りきらない幅では、時刻のボタンを「⋯」に、さらに狭いと日付のメニューに移す
-    -->
+    **スマホの形では下のタブのすぐ上に浮かせる** (親指が届く。低い画面で表を読んでいる間は引っ込む。`app.css` の `.guide-bar`)。
+    DOM の順 (種別 → 日付 → 時刻 → …) は読み上げの順なので変えない。
+    入りきらない幅では、時刻のボタンを「⋯」に、さらに狭いと日付のメニューに移す
+  -->
   <div class="toolbar guide-bar dock" data-testid="guide-toolbar">
     <div role="group" class="segmented" data-testid="type-tabs">
-      {#each CHANNEL_TYPES as type (type)}
+      {#each data.types as type (type)}
         <a
           class="button small {data.type === type ? '' : 'secondary outline'}"
           aria-current={data.type === type ? "page" : undefined}
@@ -694,10 +713,10 @@
     </div>
 
     <!--
-            日付は種別のすぐ隣。どちらも「表のどこを見るか」の操作なので離さない。
-            広い画面は日付を並べて直接押す (`.strip`。前の日は今日の左に控えた字で)。← → は入りきらないときだけ。
-            狭い画面は ← 日付 → で、日付を押すと 1 週間ぶんと時刻のメニューが開く
-        -->
+      日付は種別のすぐ隣。どちらも「表のどこを見るか」の操作なので離さない。
+      広い画面は日付を並べて直接押す (`.strip`。前の日は今日の左に控えた字で)。← → は入りきらないときだけ。
+      狭い画面は ← 日付 → で、日付を押すと 1 週間ぶんと時刻のメニューが開く
+    -->
     <div class="days" class:crowded>
       <a
         class="button small secondary outline arrow prev"
@@ -836,11 +855,11 @@
 
     <div class="end">
       <!--
-                **サブチャンネルを出すか** (issue #509)。テレビの番組表の「サブチャンネル表示」と同じ。
-                見え方の好みなので設定画面ではなくここに置き、端末ごとに覚える。
-                入っているかは aria-pressed とオンの短い下線で (`app.css` の「入っている切り替え」)。
-                その日に分割放送が無ければ出さない (押しても列が増えない)
-            -->
+        **サブチャンネルを出すか** (issue #509)。テレビの番組表の「サブチャンネル表示」と同じ。
+        見え方の好みなので設定画面ではなくここに置き、端末ごとに覚える。
+        入っているかは aria-pressed とオンの短い下線で (`app.css` の「入っている切り替え」)。
+        その日に分割放送が無ければ出さない (押しても列が増えない)
+      -->
       {#if canSplit}
         <button
           type="button"
@@ -861,9 +880,10 @@
       {/if}
 
       <!--
-                **ジャンルの色の見本。** 押すとそのジャンルだけ目立たせる (ほかのマスを淡く)。もう一度押すか
-                「すべて」で戻す。見本の色はマスと同じ規則 (`:is(.program, .swatch)[data-genre]`) から
-            -->
+        **ジャンルの色の見本。** 押すとそのジャンルだけ目立たせる (ほかのマスを淡く)。もう一度押すか
+        「すべて」で戻す。中の設定が既定から変わっている間 (ジャンルを目立たせている・中に入れたサブ ch を切った) は、
+        ボタンにほかのメニューと同じ短い下線 (`data-on`)。見本の色はマスと同じ規則 (`:is(.program, .swatch)[data-genre]`) から
+      -->
       <Menu
         side={menuSide}
         align="end"
@@ -878,6 +898,9 @@
             aria-label={narrow && canSplit
               ? "サブチャンネルとジャンルの色"
               : "ジャンルの色"}
+            data-on={highlight !== null || (narrow && canSplit && !subchannels)
+              ? ""
+              : undefined}
             data-testid="guide-genres"
           >
             {#if highlight !== null}
@@ -941,53 +964,57 @@
   </div>
 
   {#if services.length === 0}
-    <div class="panel empty-state" data-testid="empty-grid">
+    <!-- まだ何も無いので見せる画面にする (`.glow`。docs/design.md 8 章)。読み込めなかったとき (下) は平らのまま -->
+    <div class="empty-state glow" data-testid="empty-grid">
       {#if data.typeEmpty}
-        <!-- 局がまだ無い。上の案内と同じ文とボタンを、表の場所の真ん中に (上の案内はこのとき出さない) -->
-        <ChannelNotice
-          kind="all"
-          variant="center"
-          text={`${typeWord}のチャンネルがありません。チャンネルスキャンをしてください`}
-        />
+        <!-- 局がまだ無い。上の案内と同じことを、ほかの空の状態と同じ並びで表の場所の真ん中に (上の案内はこのとき出さない) -->
+        <p class="bold">{typeWord}のチャンネルがありません</p>
+        <p class="small muted">チャンネルスキャンをしてください</p>
+        <div class="actions">
+          <a
+            class="button small"
+            href={`${resolve("settings/reception")}#${CHANNEL_NOTICE_SECTION.all}`}
+            >{CHANNEL_NOTICE_ACTION.all}</a
+          >
+        </div>
       {:else}
         <!-- 局はあるが、いま流している番組が無い (番組表を集めている途中など) -->
-        <p class="muted">
-          {typeWord}の番組表はまだありません。集まるまでお待ちください
-        </p>
+        <p class="bold">{typeWord}の番組表はまだありません</p>
+        <p class="small muted">集まるまでお待ちください</p>
       {/if}
     </div>
   {:else if sheet !== null && sheet.failed !== null && switching === null}
     <!--
-            組めなかった。**骨組みのまま放っておかない**。読み込み中と区別が
-            付かず、いつまでも待たせることになる。本当の理由はサーバのログに出る
-        -->
-    <div class="panel empty-state">
-      <p><strong>番組表を読み込めませんでした</strong></p>
+      組めなかった。**骨組みのまま放っておかない**。読み込み中と区別が
+      付かず、いつまでも待たせることになる。本当の理由はサーバのログに出る
+    -->
+    <div class="empty-state">
+      <p class="bold">番組表を読み込めませんでした</p>
       <p class="small muted">{sheet.failed}</p>
       <div class="actions">
         <button type="button" class="small secondary outline" onclick={reload}
-          >読み直す</button
+          >再読み込み</button
         >
       </div>
     </div>
   {:else}
     <!--
-            **見出しの裏を「見えている」に数えない** (`scroll-padding`)。
+      **見出しの裏を「見えている」に数えない** (`scroll-padding`)。
 
-            局名の行と時刻の列は `sticky` で表の上に重なっている。そのままだと、
-            キーボードでマスへ移ったとき (`focus`) や `scrollIntoView` のスクロールが、
-            見出しの裏に半分隠れたマスを見えているとみなして動かない (e2e では 3 時台に
-            翌日の 4:00 のマスを押すと、真ん中が見出しに当たって詳細が開かなかった)
+      局名の行と時刻の列は `sticky` で表の上に重なっている。そのままだと、
+      キーボードでマスへ移ったとき (`focus`) や `scrollIntoView` のスクロールが、
+      見出しの裏に半分隠れたマスを見えているとみなして動かない (e2e では 3 時台に
+      翌日の 4:00 のマスを押すと、真ん中が見出しに当たって詳細が開かなかった)
 
-            **表の箱の縦の巻き取りで、スマホの形の下のタブと操作の 1 行を出し入れする** (`data-retract-scroll`。`+layout.svelte`)
+      **表の箱の縦の巻き取りで、スマホの形の下のタブと操作の 1 行を出し入れする** (`data-retract-scroll`。`+layout.svelte`)
 
-            **`aria-busy` は骨組みの間だけ。描いている途中は `data-drawing` で示す。**
-            Pico と `app.css` には `[aria-busy="true"] > *` の規則があり、`aria-busy` を付け外しすると
-            その中の要素がぜんぶスタイルの計算し直しになる (`white-space: nowrap` も付くので、字の並べ直しまで起きる)。
-            描き終わりで外していた頃は、マスを描いた直後にもう一度ほぼ全部の要素を計算し直していて、
-            リロードすると骨組みのあと 0.2〜0.3 秒ほど画面が止まっていた。
-            骨組みから表に変わるときは中身がほぼ入れ替わるので、そこで外すぶんには余計な計算が出ない
-        -->
+      **`aria-busy` は骨組みの間だけ。描いている途中は `data-drawing` で示す。**
+      Pico と `app.css` には `[aria-busy="true"] > *` の規則があり、`aria-busy` を付け外しすると
+      その中の要素がぜんぶスタイルの計算し直しになる (`white-space: nowrap` も付くので、字の並べ直しまで起きる)。
+      描き終わりで外していた頃は、マスを描いた直後にもう一度ほぼ全部の要素を計算し直していて、
+      リロードすると骨組みのあと 0.2〜0.3 秒ほど画面が止まっていた。
+      骨組みから表に変わるときは中身がほぼ入れ替わるので、そこで外すぶんには余計な計算が出ない
+    -->
     <div
       class="grid-box"
       style="scroll-padding: calc(var(--guide-head, 0px) + {headHeight}px) 0 0
@@ -1000,9 +1027,9 @@
       data-drawing={!showCells || drawing ? "" : undefined}
     >
       <!--
-            **横幅を列の合計にしておく。** 外側の枠が画面の幅のままだと、`sticky` の時刻の列は枠から出られず、
-            「画面の幅 − 列の幅」ぶん送ったところで置いていかれた。局が少ないときは min-width で伸ばし、余りは 1fr が分け合う
-        -->
+        **横幅を列の合計にしておく。** 外側の枠が画面の幅のままだと、`sticky` の時刻の列は枠から出られず、
+        「画面の幅 − 列の幅」ぶん送ったところで置いていかれた。局が少ないときは min-width で伸ばし、余りは 1fr が分け合う
+      -->
       <div
         class="rows"
         style="grid-template-columns: {TIME_COLUMN} repeat({columns.length}, minmax(11rem, 1fr)); grid-template-rows: auto repeat({slots}, {SLOT_HEIGHT}); width: calc({TIME_COLUMN} + {columns.length} * 11rem); min-width: 100%; --now: {elapsedSlots};"
@@ -1025,35 +1052,33 @@
               : "guide-service"}
           >
             {#if headSkeleton}
-              <!-- 別の種別へ移る途中。局の並びが届くまで名前は出さない (上の `switching`) -->
-              <span class="skeleton-head head-skeleton" aria-hidden="true"
-              ></span>
-            {:else}
+              <!-- 別の種別へ移る途中。局の並びが届くまで名前は出さない (上の `switching`。形は `app.css` の `.guide-frame .skeleton-head`) -->
+              <span class="skeleton-head" aria-hidden="true"></span>
+            {:else if watchable.has(service.id)}
               <!--
-                        ロゴを持たない局もあるので、有るものだけ出す。場所は
-                        どちらでも空けておく。局名の始まりが列ごとにずれると、
-                        横に並べたときにどれがどの局か追いにくい
-                    -->
-              <ServiceLogo
-                id={service.id}
-                has={service.has_logo}
-                style="display: block; width: 2rem; height: 1.25rem"
-                fallback=""
-              />
-              <!-- テレビに出ている番号 (`channelNumber`) -->
-              {#if channelNumber(service) !== null}
-                <span class="ch-number">{channelNumber(service)}</span>
-              {/if}
-              <span class="truncate broadcast">{service.name}</span>
+                押すとその局でライブを開く (詳細の「視聴」と同じ行き先)。番組がまだ無い局もここから観られる。
+                いまライブに出ない局 (分割放送をしていない時間のサブ) は、押した先で別の局が映るのでリンクにしない
+              -->
+              <a
+                class="service-link"
+                href={resolve(`live?service=${service.id}`)}
+                aria-label="{service.name} をライブで観る"
+                draggable="false"
+                data-testid="guide-service-live"
+              >
+                {@render head(service)}
+              </a>
+            {:else}
+              {@render head(service)}
             {/if}
           </div>
         {/each}
 
         <!--
-                時刻の列。**横にも縦にも追従させる。** 横は列を `sticky` (`left: 0`) に。1 時間を 1 つのグリッド領域にしているので、
-                数字は中でもう一段 `sticky` にして、時間の途中まで下ろしても領域の中で下りてくるようにする。
-                上端は局名の行のぶんだけ空ける (高さは実測。決め打ちだと 1px ずれて数字が見出しの裏へ潜る)
-            -->
+          時刻の列。**横にも縦にも追従させる。** 横は列を `sticky` (`left: 0`) に。1 時間を 1 つのグリッド領域にしているので、
+          数字は中でもう一段 `sticky` にして、時間の途中まで下ろしても領域の中で下りてくるようにする。
+          上端は局名の行のぶんだけ空ける (高さは実測。決め打ちだと 1px ずれて数字が見出しの裏へ潜る)
+        -->
         {#each hourMarks as mark (mark.at)}
           <div
             class="hour"
@@ -1070,33 +1095,33 @@
 
         {#if nowSlots !== null}
           <!--
-                        「いま」の時刻 (ホームと同じ `NowLine`。表に重ねる `overlay`)。ホームのような一言は添えない。
-                        **時刻は時刻の列の中に置く**。列の外へ出すと番組名に被る。同じ時の数字とは重なるが、
-                        時刻のカプセルの面で隠す。`sticky` (`left: 0`) で横に流しても左端に残る
-                        (`absolute` だと枠 `grid-column: 1 / -1` の左端に付いて流れていく)
-                    -->
-          <NowLine
+            「いま」の時刻 (ホームと同じ `NowMark`。表に重ねる `overlay`)。ホームのような一言は添えない。
+            **時刻は時刻の列の中に置く**。列の外へ出すと番組名に被る。同じ時の数字とは重なるが、
+            時刻のカプセルの面で隠す。`sticky` (`left: 0`) で横に流しても左端に残る
+            (`absolute` だと枠 `grid-column: 1 / -1` の左端に付いて流れていく)
+          -->
+          <NowMark
             layout="overlay"
             class="now"
             time={time(clock)}
             labelWidth={TIME_COLUMN}
             style="grid-column: 1 / -1; grid-row: 2; translate: 0 calc({nowSlots} * {SLOT_HEIGHT});"
             bind:element={nowMark}
-            data-testid="now-line"
+            data-testid="now-mark"
           />
         {/if}
 
         <!--
-                    少しずつ足していく (`drawGradually`)。全部出るまで `data-drawing` が付いている。
-                    本チャンネルと同じ番組を流しているサブチャンネルの列へは本チャンネルのマスを横に伸ばす (`span`)。
-                    分割放送の前後で幅が変わると、同じ番組が上下 2 つのマスになる (`cell.key`)
-                -->
+          少しずつ足していく (`drawGradually`)。全部出るまで `data-drawing` が付いている。
+          本チャンネルと同じ番組を流しているサブチャンネルの列へは本チャンネルのマスを横に伸ばす (`span`)。
+          分割放送の前後で幅が変わると、同じ番組が上下 2 つのマスになる (`cell.key`)
+        -->
         {#if !showCells}
           <!--
-                        **マスのところだけ骨組み。** 局名の行と時刻の列は本物で、骨組みは同じ列 (`subgrid`) に
-                        24 時間ぶん敷く。画面の下の端まで埋まり、どこまで送っても切れない。
-                        マスは 1 つずつ置かず、列ごとに 1 枚の面を `mask` で切り抜く (局が多いと数千個になる)
-                    -->
+            **マスのところだけ骨組み。** 局名の行と時刻の列は本物で、骨組みは同じ列 (`subgrid`) に
+            24 時間ぶん敷く。画面の下の端まで埋まり、どこまで送っても切れない。
+            マスは 1 つずつ置かず、列ごとに 1 枚の面を `mask` で切り抜く (局が多いと数千個になる)
+          -->
           <div
             class="skeleton cells-skeleton"
             style="grid-column: 2 / -1; grid-row: 2 / -1;"
@@ -1130,11 +1155,11 @@
                   data-start-at={program.start_at}
                 >
                   <!--
-                                    マスは上ぞろえ。button は中身を縦中央に置くので、短い番組と
-                                    長い番組で開始時刻の高さが揃わず、横に目で追えなかった。
-                                    縦の flex にして上から積む (色の決め方は下の `.program`)。
-                                    淡くする (ジャンルを 1 つ目立たせる) のは CSS で決める (`.rows[data-highlight]`)
-                                -->
+                    マスは上ぞろえ。button は中身を縦中央に置くので、短い番組と
+                    長い番組で開始時刻の高さが揃わず、横に目で追えなかった。
+                    縦の flex にして上から積む (色の決め方は下の `.program`)。
+                    淡くする (ジャンルを 1 つ目立たせる) のは CSS で決める (`.rows[data-highlight]`)
+                  -->
                   <button
                     type="button"
                     class="program"
@@ -1187,6 +1212,35 @@
   {/if}
 </div>
 
+<!--
+  列の見出しの中身。ロゴを持たない局もあるので、有るものだけ出す。場所は
+  どちらでも空けておく。局名の始まりが列ごとにずれると、
+  横に並べたときにどれがどの局か追いにくい
+-->
+{#snippet head(service: (typeof columns)[number])}
+  <ServiceLogo
+    id={service.id}
+    has={service.has_logo}
+    style="display: block; width: 2rem; height: 1.25rem"
+    fallback=""
+  />
+  <!-- テレビに出ている番号 (`channelNumber`) -->
+  {#if channelNumber(service) !== null}
+    <span class="ch-number">{channelNumber(service)}</span>
+  {/if}
+  {#if unwatchable.has(service.id)}
+    <!-- 番組表は読めるが復号できない局。局名の下に添える (わけは番組の詳細で) -->
+    <span class="service-names">
+      <span class="truncate broadcast">{service.name}</span>
+      <span class="tiny muted" data-testid="guide-service-unwatchable"
+        >観られません</span
+      >
+    </span>
+  {:else}
+    <span class="truncate broadcast">{service.name}</span>
+  {/if}
+{/snippet}
+
 <!-- 時刻へ送るメニューの項目 (「⋯」と、狭い画面の日付のメニュー) -->
 {#snippet jumpItems()}
   {@const off = nowSlots === null || grid === null}
@@ -1217,32 +1271,22 @@
   {@const program = selected}
   <ProgramDetail program={facts} onclose={close}>
     {#snippet status()}
-      {#if program.reservation_state}
-        <!-- バッジの色は検索・ホームと同じ決め方 (`badgeClass`。予約済みは色を付けない) -->
-        <span
-          class="tag {badgeClass(program.reservation_state)}"
-          data-testid="detail-state"
-        >
-          {stateLabel(program.reservation_state)}
-        </span>
-      {:else if program.end_at <= clock}
-        <!--
-                    もう終わった番組。予約ボタンを出しても、押した先で
-                    「放送が終わっています」と断られるだけ (reservations.reserve)
-                -->
-        <span class="tag" data-testid="detail-ended">放送終了</span>
-      {/if}
+      <ProgramState
+        state={program.reservation_state ?? null}
+        ended={program.end_at <= clock}
+      />
     {/snippet}
     {#snippet actions()}
       <!--
-                何を出すか・どれを主にするかは検索の詳細と同じ (`ProgramActions`)。
-                失敗の理由も詳細の中に出す。番組表にインラインで足すと、その分だけグリッドが下にずれてスクロールバーが出る
-            -->
+        何を出すか・どれを主にするかは検索の詳細と同じ (`ProgramActions`)。
+        失敗の理由も詳細の中に出す。番組表にインラインで足すと、その分だけグリッドが下にずれてスクロールバーが出る
+      -->
       <ProgramActions
         {program}
         cancel={{ programId: program.id }}
         recordingId={playableRecordingId(program)}
         watchable={watchable.has(program.service_id)}
+        refusal={unwatchable.get(program.service_id) ?? null}
         {clock}
         message={failedFor === program.id ? (form?.message ?? null) : null}
         onsubmit={closeOnSuccess}
@@ -1253,9 +1297,9 @@
 
 <style>
   /*
-     * 外枠と操作の 1 行の形は `app.css` の `.guide-frame`・`.guide-bar`。
-     * 入りきらないぶんは日付の並びが縮んで横に流れ、時刻は「⋯」へ (下の幅ごとの決まり)
-     */
+   * 外枠と操作の 1 行の形は `app.css` の `.guide-frame`・`.guide-bar`。
+   * 入りきらないぶんは日付の並びが縮んで横に流れ、時刻は「⋯」へ (下の幅ごとの決まり)
+   */
   .days {
     display: flex;
     flex: 0 1 auto;
@@ -1267,8 +1311,8 @@
     flex: none;
   }
   /*
-     * 日付の並び。**中身の幅だけ取り、入りきらなければ縮んで横に流れる** (流す印は出さない。両端の ← → で送れる)
-     */
+   * 日付の並び。**中身の幅だけ取り、入りきらなければ縮んで横に流れる** (流す印は出さない。両端の ← → で送れる)
+   */
   .strip {
     display: flex;
     flex: 0 1 auto;
@@ -1281,18 +1325,18 @@
     display: none;
   }
   /*
-     * 日付の 1 つ。ふだんは字だけ (押せることは字の濃さと、指を乗せたときの地で)。
-     * **選んでいる日は主の色の下線と字・太字** (`app.css` の `.pick-line`。塗らない)。土日は土日の字の色のまま
-     */
+   * 日付の 1 つ。ふだんは字だけ (押せることは字の濃さと、指を乗せたときの地で)。
+   * **選んでいる日は主の色の下線と字・太字** (`app.css` の `.pick-line`。塗らない)。土日は土日の字の色のまま
+   */
   .day-chip {
-    --pick-inset: 0.55rem;
+    --pick-inset: var(--dp-space-2);
     position: relative;
     display: inline-flex;
     flex: none;
     align-items: center;
     justify-content: center;
     min-height: var(--dp-btn-h-sm);
-    padding-inline: 0.55rem;
+    padding-inline: var(--dp-space-2);
     border-radius: var(--dp-btn-radius);
     color: var(--pico-secondary);
     font-size: var(--dp-text-sm);
@@ -1305,11 +1349,11 @@
     color: var(--pico-secondary-hover);
   }
   /*
-     * **今日は日付の前に小さく「今日」** (主の色の字・太字)。選んでいる日の下線とは別の印なので、
-     * 前の日を見ているときも今日がどれか分かる
-     */
+   * **今日は日付の前に小さく「今日」** (主の色の字・太字)。選んでいる日の下線とは別の印なので、
+   * 前の日を見ているときも今日がどれか分かる
+   */
   .today-mark {
-    margin-inline-end: 0.3rem;
+    margin-inline-end: var(--dp-space-1);
     color: var(--dp-primary-text);
     font-size: var(--dp-text-xs);
     font-weight: var(--dp-weight-bold);
@@ -1319,9 +1363,9 @@
     color: var(--dp-muted);
   }
   /*
-     * **土日は字の色で。** 土曜は主の色の字、日曜は録画の赤の字 (どちらも淡い地の上で 4.5:1 以上になる段。`app.css`)。
-     * 日付のメニューの中も同じ
-     */
+   * **土日は字の色で。** 土曜は主の色の字、日曜は録画の赤の字 (どちらも淡い地の上で 4.5:1 以上になる段。`app.css`)。
+   * 日付のメニューの中も同じ
+   */
   .sat {
     color: var(--dp-primary-text);
   }
@@ -1341,9 +1385,9 @@
     cursor: not-allowed;
   }
   /*
-     * 矢印は広い画面では「入りきらないとき」(`crowded`) だけ。
-     * 日付のメニューと「今日」は狭い画面だけ
-     */
+   * 矢印は広い画面では「入りきらないとき」(`crowded`) だけ。
+   * 日付のメニューと「今日」は狭い画面だけ
+   */
   .days:not(.crowded) :is(.prev, .next),
   .days .date-label,
   .days .today {
@@ -1355,7 +1399,7 @@
     width: auto;
   }
   .jumps > button {
-    padding-inline: 0.6rem;
+    padding-inline: var(--dp-space-2);
   }
   .more {
     flex: none;
@@ -1376,7 +1420,7 @@
     white-space: nowrap;
   }
   .genre-button {
-    gap: 0.4rem;
+    gap: var(--dp-space-2);
   }
   /* 時刻のボタンが入る幅。サブ ch が出ていても 1180px で 1 行に収まる (実測は PR に) */
   @media (min-width: 1180px) {
@@ -1388,10 +1432,10 @@
     }
   }
   /*
-     * **768px より狭い画面では中を詰める。** 中身は ← 日付 → (日付を押すと 1 週間ぶんと時刻) と、
-     * 印だけのボタン 1 つ (ジャンル。サブ ch があればそれも中に)。日付の並びと時刻のボタンは出さない (日付のメニューに入っている)。
-     * それでも入りきらない幅 (360px で今日以外を見ているとき) は横に流す
-     */
+   * **768px より狭い画面では中を詰める。** 中身は ← 日付 → (日付を押すと 1 週間ぶんと時刻) と、
+   * 印だけのボタン 1 つ (ジャンル。サブ ch があればそれも中に)。日付の並びと時刻のボタンは出さない (日付のメニューに入っている)。
+   * それでも入りきらない幅 (360px で今日以外を見ているとき) は横に流す
+   */
   @media (max-width: 767.98px) {
     .toolbar {
       gap: var(--dp-space-1);
@@ -1400,7 +1444,8 @@
     }
     .days > a.button,
     .date-label {
-      padding-inline: 0.4rem;
+      /* 段の間の 6px (docs/design.md の「作り方」)。`--dp-space-2` では 390px で 1 行に収まらなくなるおそれがあり、`--dp-space-1` では詰まりすぎる */
+      padding-inline: 0.375rem;
     }
     /* サブ ch はジャンルのメニューに入れる (2 つ並べると、今日以外を見ているときに 390px で入りきらない) */
     .strip,
@@ -1440,9 +1485,9 @@
     margin-inline-start: auto;
   }
   /*
-     * ジャンルの見本。**マスの時刻の前の点と同じ** (色は下の `:is(.program, .swatch)[data-genre]` からマスと同じ値を受ける)。
-     * 「すべて」は色の無い点
-     */
+   * ジャンルの見本。**マスの時刻の前の点と同じ** (色は下の `:is(.program, .swatch)[data-genre]` からマスと同じ値を受ける)。
+   * 「すべて」は色の無い点
+   */
   .swatch {
     --tint: var(--dp-line-strong);
     flex: none;
@@ -1481,11 +1526,11 @@
     }
   }
   /*
-     * **広い形 (スマホの形でないとき。`#lib/phone-form.ts`) では表をヘッダーの裏まで伸ばす** (docs/design.md の「浮かせ方」)。箱は画面の上端から始め、
-     * 中身は表の先頭 (`--guide-head`。`app.css`) の下から並べる。巻くとマスが操作の 1 行とヘッダーの裏を流れ、
-     * ヘッダーは表の巻いた量で浮く。スクロールバーは出さない (ヘッダーの裏に透けて見える)。
-     * つかんで動かす・ホイール・キー・指では今までどおり動く
-     */
+   * **広い形 (スマホの形でないとき。`#lib/phone-form.ts`) では表をヘッダーの裏まで伸ばす** (docs/design.md の「浮かせ方」)。箱は画面の上端から始め、
+   * 中身は表の先頭 (`--guide-head`。`app.css`) の下から並べる。巻くとマスが操作の 1 行とヘッダーの裏を流れ、
+   * ヘッダーは表の巻いた量で浮く。スクロールバーは出さない (ヘッダーの裏に透けて見える)。
+   * つかんで動かす・ホイール・キー・指では今までどおり動く
+   */
   :global(:where(html:not([data-phone]))) .grid-box {
     margin-top: calc(-1 * var(--guide-head));
     scrollbar-width: none;
@@ -1505,9 +1550,9 @@
     }
   }
   /*
-     * **Pico のスピナー (`[aria-busy]::before`) は出さない。** 表の先頭に 1 行ぶん差し込まれ、
-     * マスを待つ間だけ表が下にずれて、届いた瞬間に跳ねていた。待っていることは骨組みで見せる
-     */
+   * **Pico のスピナー (`[aria-busy]::before`) は出さない。** 表の先頭に 1 行ぶん差し込まれ、
+   * マスを待つ間だけ表が下にずれて、届いた瞬間に跳ねていた。待っていることは骨組みで見せる
+   */
   .grid-box[aria-busy="true"]::before {
     display: none;
   }
@@ -1520,13 +1565,13 @@
     padding-bottom: var(--guide-float-h, 0px);
   }
   /*
-     * **局名と時の列は操作の層。** 表を巻くとマスがその裏を流れるので、ヘッダーと同じ半透明の面 (`--dp-float`) で浮かせる
-     * (docs/design.md の「浮かせ方」)。線は引かない。時の列と角の影はマスの側にだけ落とす (列は右。局名は下の `.service::before`)。
-     * **面は、裏に何か来たときだけ出す。** 時の列の裏にマスが来るのは横に送ったときだけ (`--guide-x`)。
-     * 角は地の色で平らに塗り (縦に巻くと裏に来る時の数字と「いま」の時刻を隠すだけ。面にすると局名の左に色の塊が見えた)、
-     * 面は時の列と同じく横に送ったときだけ、上に重ねた一枚 (`::after`) で出す。面は透明度だけで出し入れする。
-     * 対応していないブラウザと動きを減らす設定の端末 (Pico がアニメーションをすぐ終わらせる) は、いつも面が出ている
-     */
+   * **局名と時の列は操作の層。** 表を巻くとマスがその裏を流れるので、ヘッダーと同じ半透明の面 (`--dp-float`) で浮かせる
+   * (docs/design.md の「浮かせ方」)。線は引かない。時の列と角の影はマスの側にだけ落とす (列は右。局名は下の `.service::before`)。
+   * **面は、裏に何か来たときだけ出す。** 時の列の裏にマスが来るのは横に送ったときだけ (`--guide-x`)。
+   * 角は地の色で平らに塗り (縦に巻くと裏に来る時の数字と「いま」の時刻を隠すだけ。面にすると局名の左に色の塊が見えた)、
+   * 面は時の列と同じく横に送ったときだけ、上に重ねた一枚 (`::after`) で出す。面は透明度だけで出し入れする。
+   * 対応していないブラウザと動きを減らす設定の端末 (Pico がアニメーションをすぐ終わらせる) は、いつも面が出ている
+   */
   .corner::after,
   .hour::before {
     background: var(--dp-float);
@@ -1565,10 +1610,10 @@
     }
   }
   /*
-     * 局名は局ごとの小さな角丸の面 (ヘッダー・操作の 1 行と同じ材質。局の列と一緒に横へ動くので、1 本につながった面にはしない)。
-     * 広い形では、表を縦に巻いてマスが裏に入ったときだけ出す (上の `.service::before` の `@supports`)。
-     * 操作の 1 行に詰めて並ぶので、影は近い影だけ (`--dp-shadow-tight`)。上は操作の 1 行との隙間 (0.25rem) をそのまま使う
-     */
+   * 局名は局ごとの小さな角丸の面 (ヘッダー・操作の 1 行と同じ材質。局の列と一緒に横へ動くので、1 本につながった面にはしない)。
+   * 広い形では、表を縦に巻いてマスが裏に入ったときだけ出す (上の `.service::before` の `@supports`)。
+   * 操作の 1 行に詰めて並ぶので、影は近い影だけ (`--dp-shadow-tight`)。上は操作の 1 行との隙間 (0.25rem) をそのまま使う
+   */
   .service::before {
     content: "";
     position: absolute;
@@ -1580,10 +1625,10 @@
     pointer-events: none;
   }
   /*
-     * **局名の行より上の時の列は、地の色で覆う。** 広い形では表がヘッダーと操作の 1 行の裏まで伸びていて、
-     * 浮いた面の左の隙間から、裏へ巻かれた時の数字と「いま」の時刻のカプセルがはみ出して見えていた
-     * (時の列は操作の層。別の操作の層の裏から覗かせない)
-     */
+   * **局名の行より上の時の列は、地の色で覆う。** 広い形では表がヘッダーと操作の 1 行の裏まで伸びていて、
+   * 浮いた面の左の隙間から、裏へ巻かれた時の数字と「いま」の時刻のカプセルがはみ出して見えていた
+   * (時の列は操作の層。別の操作の層の裏から覗かせない)
+   */
   .corner::before {
     content: "";
     position: absolute;
@@ -1618,11 +1663,42 @@
     gap: 0.375rem;
     overflow: hidden;
     white-space: nowrap;
-    padding: 0.5rem;
+    padding: var(--dp-space-2);
     font-size: var(--dp-text-sm);
     /* 行の高さ (= 時刻の数字が止まる位置 headHeight) は 36px */
     line-height: 1.25rem;
     font-weight: var(--dp-weight);
+  }
+  /*
+   * 局名の見出しはその局のライブへのリンク。見出しの枠いっぱいを押せるようにし、字は見出しのまま。
+   * 指を乗せたら地をごく薄く (日付と同じ `--dp-hover-soft`)。焦点の線は見出しが `overflow: hidden` なので内側に引く
+   */
+  .service-link {
+    display: flex;
+    flex: 1;
+    align-items: center;
+    gap: inherit;
+    min-width: 0;
+    margin: calc(-1 * var(--dp-space-2));
+    padding: var(--dp-space-2);
+    border-radius: var(--dp-bar-radius);
+    color: inherit;
+    text-decoration: none;
+  }
+  .service-link:hover {
+    background: var(--dp-hover-soft);
+  }
+  .service-link:focus-visible {
+    outline-offset: -2px;
+  }
+  /*
+   * 観られない局 (番組表を読めるが復号できない局) の局名と、その下の「観られません」。2 行になるのはこの局の見出しだけで、
+   * 行の高さ (`headHeight`) は測っているので、時刻の数字はそのぶん下で止まる
+   */
+  .service-names {
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
   }
   /* 番号は事実なのでバッジにしない (docs/design.md の「印の意味」)。ライブの一覧の `.channel-number` と同じ字 */
   .ch-number {
@@ -1636,7 +1712,7 @@
     left: 0;
     z-index: 10;
     clip-path: inset(0 -1.5rem 0 0);
-    padding-inline: 0.25rem;
+    padding-inline: var(--dp-space-1);
     font-size: var(--dp-text-xs);
     /* 数字の行の高さは 1rem に揃える。高いと、前の時間の数字が枠の下に残って次の時間の数字と並んで見える */
     line-height: 1rem;
@@ -1645,17 +1721,17 @@
     position: sticky;
     display: block;
   }
-  /* 「いま」の時刻 (`NowLine`)。時の列 (`.hour`) より上に。1 分ごとの移りを飛ばさずに (上の `nowSlots`)。場所が動くので `--dp-duration-move` (docs/design.md) */
+  /* 「いま」の時刻 (`NowMark`)。時の列 (`.hour` の 10) より 1 つ上に。1 分ごとに飛ばさずに移す (上の `nowSlots`)。場所が動くので `--dp-duration-move` (docs/design.md) */
   .rows :global(.now) {
-    z-index: 10;
+    z-index: 11;
     transition: translate var(--dp-duration-move) var(--dp-ease);
   }
   /*
-     * マスのところの骨組み。列は表と同じ (`subgrid`)。光の筋は `app.css` の `.skeleton`。
-     * 時刻の列・局名の行・「いま」の時刻は `z-index` を持つので、この上に重なる。
-     * **表の最後の下の空き (`.rows` の `padding-bottom`) にも敷く。** スマホの形で夜遅くに開くと、
-     * 「いま」へ送った位置が表の最後に近く、その空きが画面の下に見えて骨組みが途中で切れていた
-     */
+   * マスのところの骨組み。列は表と同じ (`subgrid`)。光の筋は `app.css` の `.skeleton`。
+   * 時刻の列・局名の行・「いま」の時刻は `z-index` を持つので、この上に重なる。
+   * **表の最後の下の空き (`.rows` の `padding-bottom`) にも敷く。** スマホの形で夜遅くに開くと、
+   * 「いま」へ送った位置が表の最後に近く、その空きが画面の下に見えて骨組みが途中で切れていた
+   */
   .cells-skeleton {
     display: grid;
     grid-template-columns: subgrid;
@@ -1665,27 +1741,21 @@
     margin-inline: 0.125rem;
     background: var(--dp-subtle);
   }
-  /* 別の種別へ移る途中の局名 (高さは局名の字の行と同じ) */
-  .head-skeleton {
-    display: block;
-    width: 70%;
-    height: 1.25rem;
-  }
   /*
-     * 局ごとの箱 (上の `stations`)。横に外れた局は箱ごと飛ばす。
-     * 大きさは外の表の track で決まる (`contain-intrinsic-size` は中身を組まないときの仮の値)
-     */
+   * 局ごとの箱 (上の `stations`)。横に外れた局は箱ごと飛ばす。
+   * 大きさは外の表の track で決まる (`contain-intrinsic-size` は中身を組まないときの仮の値)
+   */
   .station {
     display: grid;
     content-visibility: auto;
     contain-intrinsic-size: auto 11rem auto 216rem;
   }
   /*
-     * **画面の外のマスは中身を組まない** (`content-visibility: auto`)。BS 60 局・2,171 マスで、マスを足すたびの
-     * Layout が 1 回 450ms × 7 回かかり、描き終わりまで 12 秒だった (付けて 3.4 秒)。
-     * 大きさは grid の track で決まるので、中身を組まなくてもマスの場所は変わらない
-     * (`contain-intrinsic-size` は中身が無いときの仮の大きさ)
-     */
+   * **画面の外のマスは中身を組まない** (`content-visibility: auto`)。BS 60 局・2,171 マスで、マスを足すたびの
+   * Layout が 1 回 450ms × 7 回かかり、描き終わりまで 12 秒だった (付けて 3.4 秒)。
+   * 大きさは grid の track で決まるので、中身を組まなくてもマスの場所は変わらない
+   * (`contain-intrinsic-size` は中身が無いときの仮の大きさ)
+   */
   .cell {
     overflow: hidden;
     padding: 0.125rem;
@@ -1693,16 +1763,16 @@
     contain-intrinsic-size: auto 11rem auto 0.75rem;
   }
   /*
-     * 色はジャンル(大分類)ごと。**色は時刻の前の小さな点で見せ、下地はごく淡く敷くだけ。**
-     * 左の太い線は使わない (左の縦線は「選んでいる」の印。docs/design.md の「印の意味」)。
-     * 下地を 15% 塗っていた頃は、明るいテーマでマスが桃色や水色のブロックになり、
-     * 上に乗る小さい字が地に溶けて読みにくかった。下地は面の色 (--dp-surface) に
-     * ジャンルの色を少しだけ混ぜる。暗いテーマは混ぜても沈みやすいので少し多めにする。
-     * 字は本文と同じ濃さのまま。
-     *
-     * 予約の状態は枠や塗りではなく、説明の代わりに出す状態の言葉 (`.state`) と印で示す。
-     * 塗るのはいま動いている録画中だけ (録画の赤をごく淡く)
-     */
+   * 色はジャンル (大分類) ごと。**色は時刻の前の小さな点で見せ、下地はごく淡く敷くだけ。**
+   * 左の太い線は使わない (左の縦線は「選んでいる」の印。docs/design.md の「印の意味」)。
+   * 下地を 15% 塗っていた頃は、明るいテーマでマスが桃色や水色のブロックになり、
+   * 上に乗る小さい字が地に溶けて読みにくかった。下地は面の色 (--dp-surface) に
+   * ジャンルの色を少しだけ混ぜる。暗いテーマは混ぜても沈みやすいので少し多めにする。
+   * 字は本文と同じ濃さのまま。
+   *
+   * 予約の状態は枠や塗りではなく、説明の代わりに出す状態の言葉 (`.state`) と印で示す。
+   * 塗るのはいま動いている録画中だけ (録画の赤をごく淡く)
+   */
   .program {
     --tint: var(--dp-line);
     --wash: 10%;
@@ -1713,7 +1783,7 @@
     width: 100%;
     overflow: hidden;
     margin: 0;
-    padding: 0.125rem 0.25rem;
+    padding: 0.125rem var(--dp-space-1);
     border: 0;
     border-radius: var(--dp-radius-sm);
     background-color: var(--dp-subtle);
@@ -1723,24 +1793,21 @@
     line-height: normal;
   }
   /*
-     * **放送が過ぎた所は、マスの上から暗くしていく** (赤い線を表に引く代わり)。終わった番組はマス全体、放送中の番組は始まりからいまの位置まで。
-     * 割合は表の `--now` とマスの `--s` / `--e` から CSS だけで出す (毎分書き直すのは表の 1 つだけ)。
-     * 覆いは地の色の上に重ねる背景の 1 枚目 (`background-image`)。字は読めたまま、面だけが沈む。
-     *
-     * **マスに描く層を作らない** (`position`・`isolation`・`opacity` を持たせない。覆いを `::before` にしない)。
-     * 層はマスの数だけ増え、ブラウザがその画面の上の一点を調べるたび (指の下の要素探し、
-     * Chrome が描くついでに画面の真ん中を見る処理) に全部をたどる。番組表から別の画面へのリンクを押すと、
-     * SvelteKit は 1 回描いてから移り始めるので、その 1 回が重いぶん移り始めが遅れていた
-     * (作り物の 7,000 マスで、画面の一点を調べるのに 23ms → 1.5ms)。
-     * 色・ボタンの transition は `app.css` の `:where(button, a.button)` と同じものに、覆いの伸びを足す
-     */
+   * **放送が過ぎた所は、マスの上から暗くしていく** (赤い線を表に引く代わり)。終わった番組はマス全体、放送中の番組は始まりからいまの位置まで。
+   * 割合は表の `--now` とマスの上端・下端 (`--s` / `--e`) から CSS だけで出す (毎分書き直すのは表の 1 つだけ)。
+   * 番組の実際の始まりと終わりで割合を出すと、5 分に合わせて置いたマスの高さとずれ、境目がいまの位置から外れる (`#lib/guide-cell.ts`)。
+   * 覆いは地の色の上に重ねる背景の 1 枚目 (`background-image`)。字は読めたまま、面だけが沈む。
+   *
+   * **マスに描く層を作らない** (`position`・`isolation`・`opacity` を持たせない。覆いを `::before` にしない)。
+   * 層はマスの数だけ増え、ブラウザがその画面の上の一点を調べるたび (指の下の要素探し、
+   * Chrome が描くついでに画面の真ん中を見る処理) に全部をたどる。番組表から別の画面へのリンクを押すと、
+   * SvelteKit は 1 回描いてから移り始めるので、その 1 回が重いぶん移り始めが遅れていた
+   * (作り物の 7,000 マスで、画面の一点を調べるのに 23ms → 1.5ms)。
+   * 色・ボタンの transition は `app.css` の `:where(button, a.button)` と同じものに、覆いの伸びを足す
+   */
   .program {
-    /* 長さ 0 の番組で 0 で割らないよう、分母に下限を置く */
-    --past: clamp(
-      0,
-      (var(--now) - var(--s)) / max(var(--e) - var(--s), 0.001),
-      1
-    );
+    /* マスは 1 マス以上の高さに置くので、分母は 0 にならない */
+    --past: clamp(0, (var(--now) - var(--s)) / (var(--e) - var(--s)), 1);
     --shade: color-mix(in srgb, var(--dp-bg) 78%, transparent);
     /* ジャンルを 1 つ目立たせているときに、ほかのマスに重ねる地 (`--veil`)。字・印は `--dot`・`--state-ink` で透かす。下の `data-highlight` */
     --veil: color-mix(in srgb, var(--dp-bg) 70%, transparent);
@@ -1754,13 +1821,15 @@
   }
   /*
    * **放送中の番組は、過ぎた所を浅く沈める** (終わった番組と同じ濃さだと、いま見られる番組まで終わって見えた)。
-   * `--past` が 1 に届いていないマスだけ 45% にする。`round()` に対応していないブラウザはどちらも 78%
+   * 実際の終わり (`--end`) に届いていないマスだけ 45% にする。マスの下端で決めると、20:54 に終わった番組が 20:55 まで放送中の濃さのままになる。
+   * `--done` は終わっていれば 1、放送中と先の番組は 0。`round()` に対応していないブラウザはどちらも 78%
    */
   @supports (width: round(down, 1px, 1px)) {
     .program {
+      --done: clamp(0, round(down, var(--now) - var(--end) + 1, 1), 1);
       --shade: color-mix(
         in srgb,
-        var(--dp-bg) calc(45% + 33% * round(down, var(--past), 1)),
+        var(--dp-bg) calc(45% + 33% * var(--done)),
         transparent
       );
     }
@@ -1786,12 +1855,12 @@
     );
   }
   /*
-     * ジャンルの色は **色みだけを変えて、濃さと鮮やかさは全部同じ** にする
-     * (hsl の S と L を固定)。集めてきた色を 12 個並べていた頃は、黄色のマスだけが
-     * 前に出て紺色のマスが沈み、番組表を眺めると明るいマスに目が吸われていた。
-     * 濃さが揃っていれば、色は「種類が違う」ことだけを伝える。
-     * ジャンルの見本 (`.swatch`) も同じ規則で受ける (値を 2 か所に書かない)
-     */
+   * ジャンルの色は **色みだけを変えて、濃さと鮮やかさは全部同じ** にする
+   * (hsl の S と L を固定)。集めてきた色を 12 個並べていた頃は、黄色のマスだけが
+   * 前に出て紺色のマスが沈み、番組表を眺めると明るいマスに目が吸われていた。
+   * 濃さが揃っていれば、色は「種類が違う」ことだけを伝える。
+   * ジャンルの見本 (`.swatch`) も同じ規則で受ける (値を 2 か所に書かない)
+   */
   :is(.program, .swatch)[data-genre="0"] {
     --tint: hsl(210 62% 55%);
   } /* ニュース/報道 */
@@ -1829,10 +1898,10 @@
     --tint: hsl(170 62% 55%);
   } /* 福祉 */
   /*
-     * ジャンルを 1 つ目立たせているときの、ほかのマス (`highlight`)。押せるまま淡くするだけ。
-     * **表の側の印 (`data-highlight`) と CSS で決める**。マスごとに持たせると、切り替えるたびに全部のマスを書き直す。
-     * `opacity` は使わない (マスごとに描く層を作る。上の `.program`)。面に地の色を重ね、字と印の色を透かす
-     */
+   * ジャンルを 1 つ目立たせているときの、ほかのマス (`highlight`)。押せるまま淡くするだけ。
+   * **表の側の印 (`data-highlight`) と CSS で決める**。マスごとに持たせると、切り替えるたびに全部のマスを書き直す。
+   * `opacity` は使わない (マスごとに描く層を作る。上の `.program`)。面に地の色を重ね、字と印の色を透かす
+   */
   .rows[data-highlight="0"] .program:not([data-genre="0"]),
   .rows[data-highlight="1"] .program:not([data-genre="1"]),
   .rows[data-highlight="2"] .program:not([data-genre="2"]),
@@ -1856,9 +1925,9 @@
       100%;
   }
   /*
-     * **録画中だけ、地を録画の赤でごく淡く塗る** (いま動いているもの。docs/design.md の「番組表のマス」)。
-     * 予約済み・競合は塗らず枠も引かず、状態の言葉 (`.state`) とその前の印で示す
-     */
+   * **録画中だけ、地を録画の赤でごく淡く塗る** (いま動いているもの。docs/design.md の「番組表のマス」)。
+   * 予約済み・競合は塗らず枠も引かず、状態の言葉 (`.state`) とその前の印で示す
+   */
   .program[data-state="recording"] {
     background-color: color-mix(
       in srgb,
@@ -1879,15 +1948,15 @@
     display: inline-block;
     width: 0.4375rem;
     height: 0.4375rem;
-    margin-inline-end: 0.25rem;
+    margin-inline-end: var(--dp-space-1);
     border-radius: 50%;
     background: var(--dot, var(--tint));
     vertical-align: 0.0625rem;
   }
   /*
-     * **字は行の切れ目で止める。** マスの高さで切ると、最後の行が上半分だけ見えていた。
-     * 番組名と説明 (または予約の状態) をまとめて数え、入る行数 (`lines()`) の最後の行を「…」で終える
-     */
+   * **字は行の切れ目で止める。** マスの高さで切ると、最後の行が上半分だけ見えていた。
+   * 番組名と説明 (または予約の状態) をまとめて数え、入る行数 (`lines()`) の最後の行を「…」で終える
+   */
   .clamp {
     display: -webkit-box;
     -webkit-box-orient: vertical;
@@ -1903,15 +1972,22 @@
     display: block;
   }
   /*
-     * 予約の状態。説明の代わりに太字で出す。印は時刻のすぐ後ろに添える (色だけに頼らない。説明の行が切れる短いマスでも見える)。
-     * 予約済みは主の色の ✓、録画中は録画の赤の ●、競合は赤い ⚠ (一覧の競合と同じ印)。
-     * **競合は予約済みと同じ青にしない**。青だと「録れる」に見え、チューナーが足りずに落ちる番組を見落とす
-     */
+   * 予約の状態。説明の代わりに太字で出す。印は時刻のすぐ後ろに添える (色だけに頼らない。説明の行が切れる短いマスでも見える)。
+   * 予約済みは主の色の ✓、録画中は録画の赤の ●、競合は赤い ⚠ (一覧の競合と同じ印)。失敗は赤、録り逃しは注意の色の字 (ホームの一覧と同じ色)。
+   * **競合は予約済みと同じ青にしない**。青だと「録れる」に見え、チューナーが足りずに落ちる番組を見落とす
+   */
   .program {
     --state: var(--dp-primary-text);
   }
-  .program:is([data-state="recording"], [data-state="conflict"]) {
+  .program:is(
+    [data-state="recording"],
+    [data-state="conflict"],
+    [data-state="failed"]
+  ) {
     --state: var(--dp-rec-text);
+  }
+  .program[data-state="missed"] {
+    --state: var(--dp-warn-text);
   }
   .state,
   .program .num::after {
@@ -1919,7 +1995,7 @@
     color: var(--state-ink, var(--state));
   }
   .program .num::after {
-    margin-inline-start: 0.25rem;
+    margin-inline-start: var(--dp-space-1);
   }
   .program[data-state="scheduled"] .num::after {
     content: "✓";
@@ -1931,9 +2007,9 @@
     content: "⚠";
   }
   /*
-     * **録らないと決めた予約 (コピー禁止) は予約済みの青にしない**。青だと「録れる」に見える。
-     * 待っているだけで手を止めてほしいものでもないので、字を控えるだけにする (継いだ字の色を 80% に透かす)
-     */
+   * **録らないと決めた予約 (コピー禁止) は予約済みの青にしない**。青だと「録れる」に見える。
+   * 待っているだけで手を止めてほしいものでもないので、字を控えるだけにする (継いだ字の色を 80% に透かす)
+   */
   .program[data-state="skipped"] .state {
     color: color-mix(in srgb, currentColor 80%, transparent);
   }
@@ -1951,9 +2027,9 @@
     vertical-align: middle;
   }
   /*
-     * 説明は番組名より一段だけ控える。0.6 まで落とすと淡い下地の上で字が溶けた。
-     * 控えるのは字の色の透けで (`opacity` はマスごとに描く層を作る。上の `.program`)
-     */
+   * 説明は番組名より一段だけ控える。0.6 まで落とすと淡い下地の上で字が溶けた。
+   * 控えるのは字の色の透けで (`opacity` はマスごとに描く層を作る。上の `.program`)
+   */
   .desc {
     color: color-mix(in srgb, currentColor 80%, transparent);
   }

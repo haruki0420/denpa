@@ -10,7 +10,7 @@
  * あった変化だけ**を放送の実時刻 (TDT/TOT) つきで並べておく
  * ([data-capture.ts](data-capture.ts) の `DataBroadcastCapture`。**TS をデコードする側は
  * サーバ専用**なので別ファイル。ここは観る画面 (ブラウザ) も読み込む)。
- * 再生時は、実時刻を再生位置に写して (`toPlaybackTimeline`)、再生位置までの変化を新しい `Carousel` に流し込めば、
+ * 実時刻は書き出すときに再生位置へ写しておき (`toPlaybackTimeline`)、再生時は再生位置までの変化を新しい `Carousel` に流し込めば、
  * **その時点の画面**が復元できる (`replayAt`)。シークもこれで作り直すだけ。
  *
  * ## なぜ「変化ログ」で足りるのか
@@ -30,9 +30,9 @@ import { fromTsTime, type Ruler } from "./watch";
 
 export interface TimedMessage {
   /**
-   * 放送の実時刻 (TDT/TOT 由来, unix ms)。**先頭で時計を見る前のものは null。**
+   * 放送の実時刻 (TDT/TOT 由来、unix ms)。**先頭で時計を見る前のものは null。**
    *
-   * TDT は数秒おきにしか来ないので、間のメッセージは「最後に見た時刻」を負う。
+   * TDT は数秒おきにしか来ないので、間のメッセージには「最後に見た時刻」を付ける。
    * データ放送は秒単位で変わるものなので、この粒度で足りる
    */
   at: number | null;
@@ -45,11 +45,11 @@ export interface TimedMessage {
  * タイムラインは放送の実時刻 (TDT) で並ぶが、再生時に突き合わせたいのは
  * 動画の再生位置。2 段で直す。
  *
- * 1. **元の TS の物差しへ。** `headUnixMs` は「元の TS の先頭の放送実時刻」
+ * 1. **元の TS の物差しへ。** `headUnixMs` は「元の TS が始まる所の放送実時刻」
  *    (`DataBroadcastCapture.head`)。番組の始まり (`start_at`) ではない。録画は
  *    前のマージンのぶん早く始まるので、そちらを基準にすると番組連動がマージン (既定 10 秒) ぶん早く出る
  * 2. **エンコードしたものの物差しへ** (`ruler`。観る画面の `Ruler` と同じもの)。
- *    先頭から捨てた長さ (`encode_skip`) を引き、CM を切ったものは残した区間 (`cm_kept`) だけを積む。
+ *    先頭から捨てた長さ (`encode_skip`) を引き、前のバージョンで CM を切ってエンコードしたものは、残した区間 (`cm_kept`) だけを積む。
  *    CM の穴に落ちた時刻は、その後の本編の先頭に寄せる (`fromTsTime`)
  */
 export function playbackMsAt(
@@ -60,7 +60,7 @@ export function playbackMsAt(
   return Math.round(fromTsTime((atUnixMs - headUnixMs) / 1000, ruler) * 1000);
 }
 
-/** 再生位置 (ms) を負ったメッセージ。サイドカーに書くのはこの形式 */
+/** 再生位置 (ms) を付けたメッセージ。サイドカーに書くのはこの形式 */
 export interface PlacedMessage {
   /** 動画の再生位置 (ms)。先頭の準備 (`at === null`) は 0 に寄せる */
   at: number;
@@ -119,7 +119,7 @@ export function feedFor(
 }
 
 /**
- * 実時刻 `at` の時点の画面。**そこまでの変化を積んで復元する。**
+ * `at` の時点の画面。**そこまでの変化を積んで復元する。**
  *
  * 出す順は `Carousel` に委ねる (pmt → programInfo → DII → モジュール)。シークで戻った
  * ときも、先頭から積み直すだけで正しい状態になる。変化ログなので、積む順は届いた順。

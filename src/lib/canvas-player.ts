@@ -2,12 +2,12 @@
  * **録画を canvas に描いて観る**。観る画面が `<video>` を使わずに観るときのプレイヤー。
  *
  * 使うのは、`<video>` の再生が止まる端末 (テスラの車載ブラウザ) の互換モード (`canvas-video.ts`) と、
- * 元の TS (MPEG-2) を選んだとき。サーバへのリクエストの仕方は `<video>` で
+ * 元の TS (MPEG-2) で観るとき (選んだときと、エンコード済みの無い録画を家の中の自動で開いたとき)。サーバへのリクエストの仕方は `<video>` で
  * その場で流すとき (`remux-player.ts`) と同じ `/api/recordings/<id>/stream` で、届いたものを MSE ではなく
  * ライブ・追っかけと同じエンジン (`raw/engine.ts`) へ流す。
  *
- * - `fmp4` … H.264 / AV1 の fMP4。時刻はページの物差しのまま (`PlayAxis`)。箱の切れ目で割ってから渡す
- *   (`ts/fmp4.ts` の `Fmp4Splitter`。worker は箱ごとに受け取る)
+ * - `fmp4` … H.264 / AV1 の fMP4。時刻はページの物差しのまま (`PlayAxis`)。ボックスの切れ目で割ってから渡す
+ *   (`ts/fmp4.ts` の `Fmp4Splitter`。worker はボックスごとに受け取る)
  * - `ts-mpeg2` … 元の TS (MPEG-2)。時刻は放送の PTS なので、応答の `X-Denpa-Origin` (物差しの 0 にあたる PTS)
  *   を引いて物差しに直す (`ts/seek.ts` の `sinceHead`)
  * - `mkv` … **端末に保存した録画** (エンコード済みの Matroska)。サーバではなく Blob を切り出して読む
@@ -21,14 +21,17 @@
  * - **先へ読みすぎない** … 手元が `AHEAD` 秒を超えたら読むのを待つ (fetch のストリームはそこで詰まり、サーバも
  *   送るのを待つ)。デコードし始める前 (デコーダの読み込み中) はバイト数で区切る (`EARLY_BYTES`)
  * - **終わり** … 末尾まで読んだら `finish`。残りを鳴らしきったら `ended`
- * - **切れたら** 観ていた位置からリクエストし直す (`remux-player.ts` と同じ数)。混んでいて断られたらリクエストし直さない
+ * - **切れたら** リクエストし直す (`remux-player.ts` と同じ数)。混んでいて断られたらリクエストし直さない。
+ *   元の TS は**持っているものを捨てずに、受け取ったバイトの続きから**リクエストする (`ts/raw-resume.ts`)。
+ *   手元のぶんを再生している間に続きが届けば止まらない。fMP4 と保存した録画は観ていた位置から読み直す
+ *   (fMP4 はサーバがその場で作るので、同じバイト列の続きを出せない。保存した録画は端末の中を読むので切れない)
  * - **受け取りの速さを測る** (`ts/meter.ts`。`remux-player.ts` と同じく読んでいる間だけ)。観る画面が回線に合わせて段を
  *   上げ下げするのに使う (`#lib/watch-adapt.ts`)。継ぎ目なく替える経路は無いので、段を替えるときは観る画面がプレイヤーを作り直す
  *
  * 速さは等速だけ (音を自前で鳴らしている)。DOM はエンジン (`RawEngine`) が触る canvas と `<audio>` だけ
  */
 
-import { CLOCK, WRAP } from "@danything/arib/pes";
+import { CLOCK } from "@danything/arib/pes";
 
 import type { AudioSide } from "#lib/arib.js";
 import { RawEngine } from "#lib/raw/engine.js";
@@ -40,16 +43,20 @@ import {
   busyAnswer,
   ORIGIN_HEADER,
   retryable,
-  retryWait,
-  STREAM_RETRIES,
+  StreamRetry,
   type StreamState,
 } from "#lib/ts/playback.js";
+import { RawCursor, rawHeard } from "#lib/ts/raw-resume.js";
 import { inWrap, sinceHead } from "#lib/ts/seek.js";
 
 /** 鳴らし始めるまでに貯める長さ (秒) */
 const TARGET = 1;
-/** 先へ読む上限 (秒。手元の音の尺)。元の TS は重い (1 秒 2MB ほど) ので短く */
-const AHEAD: Record<RawInput, number> = { fmp4: 30, mkv: 30, "ts-mpeg2": 10 };
+/**
+ * 先へ読む上限 (秒。手元の音の尺)。元の TS は重い (1 秒 2〜3 MB) ので、worker が圧縮のまま持てる 30 秒・120 MB
+ * (`raw/worker.ts` の `FOLLOW_PENDING_MOST`・`FOLLOW_BYTES_MOST`) の手前で止める。追っかけで送るのを止めさせる量
+ * (`live-chase.ts` の `HOLD_ABOVE`) と同じ。切れたときに続きが届くまで再生し続けられる長さでもある
+ */
+const AHEAD: Record<RawInput, number> = { fmp4: 30, mkv: 30, "ts-mpeg2": 20 };
 /** デコードし始める前に渡しておく上限 (バイト)。デコーダを読み終えるまでは、手元の尺で測れない */
 const EARLY_BYTES = 8 * 1024 * 1024;
 /** `bytesPerSecond` で抑えるときも、ここまでは読む (バイト。先頭と最初のキーフレームが入る量) */
@@ -69,9 +76,15 @@ interface CanvasOptions {
   input: RawInput;
   /**
    * `from` 秒から、`audio` (`playback` の `audios` の `id`) の音声でリクエストする。サーバの `/stream` は fetch、
-   * 端末に保存した録画は Blob を切り出したもの (`mkv-source.ts`)。どちらも Response で返す
+   * 端末に保存した録画は Blob を切り出したもの (`mkv-source.ts`)。どちらも Response で返す。
+   * `offset` は元の TS の続きをリクエストするときだけ渡す (`?offset=`。そのとき `from` は使わない)
    */
-  request(from: number, audio: string, signal: AbortSignal): Promise<Response>;
+  request(
+    from: number,
+    audio: string,
+    signal: AbortSignal,
+    offset?: number,
+  ): Promise<Response>;
   /**
    * 尺 (秒)。**ここまで飛んだらリクエストせずに終わりにする** (`<video>` が末尾へ飛ぶと `ended` になるのと同じ)。
    * 0 は尺が分からないとき。終わりは届いたストリームの終わりで決める
@@ -91,11 +104,11 @@ interface CanvasOptions {
   paused: boolean;
   /** 繋ぎ直している・打ち切った・戻った・混んでいて断られた */
   state(state: StreamState): void;
-  /** 描けなくなった (間に合わない・デコーダが失敗し続ける・音が来ない)。**画面がほかの方式へ移す** */
-  gaveUp(reason: string): void;
+  /** 描けなくなった (間に合わない・デコーダが失敗し続ける・音が来ない)。**画面がほかの方式へ移す**。`slow` は `RawEvents.gaveUp` と同じ */
+  gaveUp(reason: string, slow?: string): void;
   /** 外 (ロック画面・車の操作) から止められた・再開された */
   remote(paused: boolean): void;
-  /** 貯めを使い切って止まった / また流れ出した (読み込み中の輪) */
+  /** バッファを使い切って止まった / また流れ出した (読み込み中の輪) */
   waiting(on: boolean): void;
   /** 終わりまで鳴らした */
   ended(): void;
@@ -182,16 +195,17 @@ export function canvasPlayer(options: CanvasOptions): CanvasPlayer {
   let audio = options.audio;
   let run = 0;
   let controller: AbortController | null = null;
-  let retries = 0;
-  let retryTimer: ReturnType<typeof setTimeout> | null = null;
+  const retry = new StreamRetry((state) => options.state(state));
   let closed = false;
   /** リクエストし直してから渡したバイト数 (デコードし始める前の区切り。`EARLY_BYTES`) */
   let fed = 0;
   /** リクエストし直した位置 (秒)。そこから観た長さぶんだけ先へ読む (`bytesPerSecond`) */
   let loadedFrom = options.start;
-  /** 貯めを使い切って止まっているか (読み込み中の輪) */
+  /** バッファを使い切って止まっているか (読み込み中の輪) */
   let starving = false;
   const meter = new Meter();
+  /** 元の TS をどこまで受け取ったか。切れたら続きをここからリクエストする */
+  const cursor = new RawCursor();
 
   const engine = new RawEngine(
     options.host,
@@ -203,9 +217,11 @@ export function canvasPlayer(options: CanvasOptions): CanvasPlayer {
         if (paused || ended) return;
         starving = true;
         options.waiting(true);
+        // 続きを待ちながら手元を再生していて、使い切った。ここから「繋ぎ直しています」を出す
+        retry.starved();
       },
-      gaveUp: (reason) => {
-        if (!closed) options.gaveUp(reason);
+      gaveUp: (reason, slow) => {
+        if (!closed) options.gaveUp(reason, slow);
       },
       remote: (stop) => {
         if (stop === paused) return;
@@ -249,7 +265,7 @@ export function canvasPlayer(options: CanvasOptions): CanvasPlayer {
     // 元の TS の先頭の少し前 (音と映像の先頭のずれ) は負になる。物差しの先頭に揃える
     time = Math.max(
       0,
-      input === "ts-mpeg2" ? sinceHead(pts % WRAP, origin) : pts / CLOCK,
+      input === "ts-mpeg2" ? sinceHead(pts, origin) : pts / CLOCK,
     );
     return time;
   }
@@ -258,7 +274,7 @@ export function canvasPlayer(options: CanvasOptions): CanvasPlayer {
    * 先へ読んでよいか。**手元の尺が `AHEAD` を超えたら待つ** (デコードし始める前はバイト数で)。
    *
    * **端末に保存した録画はバイト数でも抑える** (`bytesPerSecond`)。手元の尺は worker がデコードして返してから
-   * 伸びるので、ネットワークより速く読める Blob はその前に末尾まで読めてしまう。900MB を一度に worker へ
+   * 伸びるので、ネットワークより速く読める Blob はその前に末尾まで読めてしまう。900 MB を一度に worker へ
    * 渡すと、返ってくる音の通知で画面の処理が詰まって描き直せず (音は途切れる)、映像が溜まりすぎて `full`
    * になり、同じ所から読み直していた (iPhone で真っ黒のまま音だけ進んだ)
    */
@@ -286,13 +302,13 @@ export function canvasPlayer(options: CanvasOptions): CanvasPlayer {
   async function load(from: number): Promise<void> {
     const mine = ++run;
     controller?.abort();
-    if (retryTimer !== null) clearTimeout(retryTimer);
-    retryTimer = null;
+    retry.cancel();
     // 飛んだ。前の音はすぐ止める (映像は次が描けるまで前のまま)
     engine.reset();
     time = from;
     loadedFrom = from;
     fed = 0;
+    cursor.clear();
     meter.pause();
     /*
      * **末尾 (の手前 `END_EDGE`) へ飛んだらリクエストせずに終わり**。最後が CM の録画で CM を飛ばした・シークバーを
@@ -303,30 +319,68 @@ export function canvasPlayer(options: CanvasOptions): CanvasPlayer {
       finished();
       return;
     }
+    await read(mine, from, null);
+  }
+
+  /**
+   * 元の TS の続きを、バイト位置 `at` からリクエストする (`ts/raw-resume.ts`)。**持っているものは捨てない。**
+   * 続きが届くまでは手元のぶんを再生し続ける
+   */
+  function resume(at: number): void {
+    const mine = ++run;
+    controller?.abort();
+    // 続きを読み始めた。手元を使い切っていても、デコードし始める前と同じくバイト数で区切って読む (`room`)
+    fed = 0;
+    meter.pause();
+    void read(mine, position(), at);
+  }
+
+  /**
+   * リクエストして、届いたものをエンジンへ渡す。`at` は元の TS の続きをリクエストするバイト位置で、
+   * 飛んだあとの最初のリクエストなら null (`from` 秒から。エンジンは `load` が空にしてある)
+   */
+  async function read(
+    mine: number,
+    from: number,
+    at: number | null,
+  ): Promise<void> {
     const abort = new AbortController();
     controller = abort;
     let reader: ReadableStreamDefaultReader<Uint8Array> | null = null;
     try {
-      const response = await options.request(from, audio, abort.signal);
+      const response = await options.request(
+        from,
+        audio,
+        abort.signal,
+        at ?? undefined,
+      );
       if (mine !== run) return;
       if (response.status === 503 && (await busyAnswer(response))) {
         if (mine === run) options.state("busy");
         return;
       }
+      // 続きを出せない (ファイルが替わった・消えた)。観ていた位置から読み直す (そこでも出せなければ打ち切る)
+      if (at !== null && response.status >= 400 && response.status < 500) {
+        void load(position());
+        return;
+      }
       if (!response.ok || response.body === null)
         throw new Error(`HTTP ${response.status}`);
       options.heard?.(response);
-      let start = Math.round(from * CLOCK);
       if (input === "ts-mpeg2") {
-        const header = response.headers.get(ORIGIN_HEADER);
-        const head = header === null ? Number.NaN : Number(header);
+        const heard = rawHeard(response.headers);
         // 物差しに直せない。何度リクエストしても同じ
-        if (!Number.isFinite(head))
-          throw new Error(`${ORIGIN_HEADER} がありません`);
-        origin = head;
-        start = inWrap(origin + start);
-      }
-      engine.reset(start);
+        if (heard === null) throw new Error(`${ORIGIN_HEADER} がありません`);
+        if (!cursor.open(heard, at)) {
+          void response.body.cancel().catch(() => undefined);
+          void load(position());
+          return;
+        }
+        if (at === null) {
+          origin = heard.origin;
+          engine.reset(inWrap(origin + Math.round(from * CLOCK)));
+        }
+      } else engine.reset(Math.round(from * CLOCK));
       const splitter = input === "fmp4" ? new Fmp4Splitter() : null;
       reader = response.body.getReader();
       for (;;) {
@@ -337,18 +391,19 @@ export function canvasPlayer(options: CanvasOptions): CanvasPlayer {
         }
         const asked = performance.now();
         const { done, value } = await reader.read();
-        if (mine !== run) return;
+        if (mine !== run) {
+          void reader.cancel().catch(() => undefined);
+          return;
+        }
         if (done) break;
         meter.add(value.byteLength, asked, performance.now());
         fed += value.length;
+        cursor.take(value.length);
         if (splitter === null) engine.feed(own(value), 0);
         else
           for (const segment of splitter.feed(value))
             engine.feed(own(segment.data), 0);
-        if (retries > 0) {
-          retries = 0;
-          options.state("flowing");
-        }
+        retry.flowing();
       }
       // 末尾まで読んだ。残りを鳴らしきったら終わり
       engine.finish();
@@ -362,23 +417,14 @@ export function canvasPlayer(options: CanvasOptions): CanvasPlayer {
         options.state("failed");
         return;
       }
-      retry();
+      /*
+       * 切れた。倍々に待ってリクエストし直す。元の TS は受け取ったバイトの続きから (手元のぶんは再生し続け、
+       * 使い切るまでは「繋ぎ直しています」を出さない)。続きの位置が分からなければ観ていた位置から
+       */
+      const next = cursor.resumeAt;
+      if (next !== null) retry.schedule(() => resume(next), engine.lead > 0);
+      else retry.schedule(() => void load(position()));
     }
-  }
-
-  /** 切れた。倍々に待って、観ていた位置からリクエストし直す */
-  function retry(): void {
-    if (retries >= STREAM_RETRIES) {
-      options.state("failed");
-      return;
-    }
-    const wait = retryWait(retries);
-    retries++;
-    options.state("retrying");
-    retryTimer = setTimeout(() => {
-      retryTimer = null;
-      void load(position());
-    }, wait);
   }
 
   const ticker = setInterval(() => {
@@ -465,7 +511,7 @@ export function canvasPlayer(options: CanvasOptions): CanvasPlayer {
       closed = true;
       run++;
       controller?.abort();
-      if (retryTimer !== null) clearTimeout(retryTimer);
+      retry.cancel();
       clearInterval(ticker);
       engine.destroy();
     },

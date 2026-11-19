@@ -140,7 +140,7 @@ function encodeGray(
 ): Uint8Array {
   const raw = new Uint8Array(height * (1 + width));
   for (let row = 0; row < height; row++) {
-    // 各行の頭にフィルタの種類 (0 = なし)
+    // 各行の先頭にフィルタの種類 (0 = なし)
     raw.set(
       gray.subarray(row * width, (row + 1) * width),
       row * (1 + width) + 1,
@@ -177,8 +177,8 @@ export function learned(serviceId: number): boolean {
  * テレビ朝日  1064 / 1065 / 1066     BS-TBS       161 / 162 / 163
  * ```
  *
- * のように並んでいた。**同じ映像なのでロゴは 1 つ覚えれば足りる。** 束ねずに
- * 並べていた頃は、画面に「TOKYO MX1」が 2 つ並んでいた。
+ * のように並んでいた。**同じ映像なのでロゴは 1 つ覚えれば足りる。** 束ねないと、
+ * 画面に「TOKYO MX1」が 2 つ並ぶ。
  *
  * 代表は**もう覚えている局を優先**する。無ければ先頭 (呼ぶ側の並び順)。
  *
@@ -240,7 +240,8 @@ export function share(serviceId: number, file: string, replace: boolean): void {
  * **向こうが同じ大きさのものを持っていれば、ふだんは写さない** (自分で育てたほうが確か)。
  * 覚え直した (`replace`。局がロゴを替えた) ときだけは上書きする。同じ映像なので向こうの型も
  * 古く、残すと向こうは古い型で当てて外すか、覚え直しに 1 本ぶん余計にかかる。
- * 書きかけを読まれないよう、隣に写してから差し替える (`logo-own.save` と同じ)
+ * 書きかけを読まれないよう、隣に写してから差し替える。隣の名前は写すたびに変える (`logo-own.save` と同じ。
+ * エンコードは何本か同時に走り、束ねた局へ同じファイルを写しに来ることがある)
  */
 export function copyModel(
   from: string,
@@ -250,7 +251,10 @@ export function copyModel(
 ): void {
   for (const dir of to) {
     if (!replace && existsSync(join(dir, file))) continue;
-    const temp = join(dir, `${file}.${process.pid}-share.tmp`);
+    const temp = join(
+      dir,
+      `${file}.${process.pid}-${Math.random().toString(36).slice(2)}.tmp`,
+    );
     try {
       mkdirSync(dir, { recursive: true });
       copyFileSync(join(from, file), temp);
@@ -266,8 +270,8 @@ export function copyModel(
 /**
  * 画面に出す数。覚えている局と、まだの局。
  *
- * **束ねて数える** (`stations`)。サブチャンネルの枠まで別に数えていた頃は、
- * 下に並ぶ一覧 (こちらも束ねてある) と数が合わなかった
+ * **束ねて数える** (`stations`)。サブチャンネルの枠まで別に数えると、
+ * 下に並ぶ一覧 (こちらも束ねてある) と数が合わない
  */
 export function stats(): { have: number; total: number } {
   const current = stations(
@@ -276,9 +280,17 @@ export function stats(): { have: number; total: number } {
         id: services.id,
         network_id: services.network_id,
         name: services.name,
+        type: services.type,
       })
       .from(services)
-      .where(and(currentServices(), eq(services.service_type, DIGITAL_TV)))
+      // 復号できない局は録れないので、CM のロゴを覚えることも無い (`services.decodable`)。映像の無い局 (ラジオ・データ放送) は CM を検出しないので、テレビの局 (`DIGITAL_TV`) だけ
+      .where(
+        and(
+          currentServices(),
+          eq(services.service_type, DIGITAL_TV),
+          eq(services.decodable, true),
+        ),
+      )
       .all(),
   );
   return {

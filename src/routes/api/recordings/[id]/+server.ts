@@ -1,13 +1,12 @@
 import { error, json } from "@sveltejs/kit";
 
-import { emit } from "#lib/server/events.js";
-import { deleteRecordingFiles } from "#lib/server/files.js";
+import { removeRecording } from "#lib/server/files.js";
 import { recordingJikkyo } from "#lib/server/jikkyo.js";
 import { encodedFile } from "#lib/server/library.js";
 import { recordingOr404 } from "#lib/server/recording.js";
 
 /**
- * 録画の状態を返す。**追っかけ再生の画面が「エンコードが終わったか」を聞く API。**
+ * 録画の状態を返す。**追っかけ再生の画面が「エンコードが終わったか」を問い合わせる API。**
  * 開いたまま録り終えても追っかけで観続けられるが、エンコードが終われば普通の観る画面
  * (シークも字幕も揃う) に移りたい。
  * 画面は `recordings` の通知 (SSE) を受けるたびにここを読む。
@@ -37,7 +36,7 @@ export function GET({ params }) {
  * 「オフラインで消しておいたものを、オンラインに戻ったときにサーバからも消す」
  * ために呼ぶ (`offline.svelte.ts` の flush)。
  *
- * **何度呼んでも同じところに落ちる。** outbox は失敗すると再送するので、
+ * **何度呼んでも結果は同じ。** outbox は失敗すると再送するので、
  * 既に消えているもの (deleted) には 204 を返して「済んだ」と伝える。
  * 行そのものが無ければ 404 (呼んだ側はこれも「済んだ」と読む)。
  */
@@ -46,10 +45,7 @@ export async function DELETE({ params }) {
   const recording = recordingOr404(params.id, true);
   if (recording.deleted_at !== null) return new Response(null, { status: 204 });
 
-  // 録画中のものは消させない。使っているチューナーと書きかけのファイルが残る
-  if (recording.finished_at === null) error(409, "録画中は消せません");
-
-  deleteRecordingFiles(recording, "端末から削除");
-  emit("recordings");
+  if (!removeRecording(recording, "端末から削除"))
+    error(409, "録画中は消せません");
   return new Response(null, { status: 204 });
 }

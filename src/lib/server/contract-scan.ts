@@ -6,9 +6,9 @@ import { ServiceFilter } from "@danything/arib/service-filter";
  * 録画や視聴を邪魔しないよう、優先度を最下位 (1) で開き、
  * 録画開始や他のチューナー要求が発生した場合は即座に中断して空き次第再開する。
  */
-import { and, asc, eq } from "drizzle-orm";
+import { and, asc, eq, inArray } from "drizzle-orm";
 
-import type { ChannelType } from "../types";
+import { serviceChannel, servicePlaces, strictPlaces } from "./agent-channels";
 import {
   freshDecode,
   getActiveCardId,
@@ -32,8 +32,12 @@ export interface ScanState {
 }
 
 let inFlight = false;
-let currentQueue: { channel: string; type: string; serviceIds: number[] }[] =
-  [];
+let currentQueue: {
+  channel: string;
+  places: string;
+  type: string;
+  serviceIds: number[];
+}[] = [];
 let queueDate: string | null = null;
 
 /**
@@ -117,11 +121,12 @@ export function buildScanQueue(
   cardId: string,
   intendedServiceIds: number[] | null,
   nowMs = Date.now(),
-): { channel: string; type: string; serviceIds: number[] }[] {
+): { channel: string; places: string; type: string; serviceIds: number[] }[] {
   const rows = orm()
     .select({
       serviceId: services.id,
-      channel: services.channel,
+      channel: serviceChannel(),
+      places: servicePlaces(),
       type: services.type,
       code: cardContracts.code,
       decodeOk: cardContracts.decode_ok,
@@ -130,11 +135,7 @@ export function buildScanQueue(
     .from(cardContracts)
     .innerJoin(services, eq(services.id, cardContracts.service_id))
     .where(eq(cardContracts.card_id, cardId))
-    .orderBy(
-      asc(services.type),
-      asc(services.channel),
-      asc(services.service_id),
-    )
+    .orderBy(asc(services.type), asc(services.service_id))
     .all();
 
   const intendedSet =
@@ -143,7 +144,7 @@ export function buildScanQueue(
   // チャンネル (中継器) ごとにグルーピング
   const groupMap = new Map<
     string,
-    { channel: string; type: string; serviceIds: number[] }
+    { channel: string; places: string; type: string; serviceIds: number[] }
   >();
 
   for (const row of rows) {
@@ -153,11 +154,18 @@ export function buildScanQueue(
     // カード契約済み (code あり) かつ有効期限内、あるいは直近で復号成功済みならスキップ
     if (row.code !== null && isCodeSubscribed(row.code)) continue;
     if (row.decodeOk === true && freshDecode(row.decodedAt, nowMs)) continue;
+    if (!row.channel || !row.places || strictPlaces(row.places).length === 0)
+      continue;
 
-    const key = `${row.type}\u0000${row.channel}`;
+    const key = `${row.type}\u0000${row.places}`;
     let entry = groupMap.get(key);
     if (!entry) {
-      entry = { channel: row.channel, type: row.type, serviceIds: [] };
+      entry = {
+        channel: row.channel,
+        places: row.places,
+        type: row.type,
+        serviceIds: [],
+      };
       groupMap.set(key, entry);
     }
     entry.serviceIds.push(row.serviceId);
@@ -170,7 +178,12 @@ export function buildScanQueue(
  * 1 つの中継器 (チャンネル) の復号テストを実施する
  */
 async function scanSingleChannel(
-  channelInfo: { channel: string; type: string; serviceIds: number[] },
+  channelInfo: {
+    channel: string;
+    places: string;
+    type: string;
+    serviceIds: number[];
+  },
   cardId: string,
   nowMs: number,
 ): Promise<void> {
@@ -183,14 +196,8 @@ async function scanSingleChannel(
       arib: services.service_id,
     })
     .from(services)
-    .where(
-      and(
-        eq(services.channel, channelInfo.channel),
-        eq(services.type, channelInfo.type as ChannelType),
-      ),
-    )
-    .all()
-    .filter((s) => channelInfo.serviceIds.includes(s.id));
+    .where(inArray(services.id, channelInfo.serviceIds))
+    .all();
 
   const filters = channelServices.map((s) => ({
     serviceId: s.id,
@@ -203,7 +210,7 @@ async function scanSingleChannel(
     // 優先度 1 (最下位) で開くことで、録画・視聴が入れば即時譲り合う
     const stream = await openChannelStream(
       channelInfo.type,
-      channelInfo.channel,
+      strictPlaces(channelInfo.places),
       abortController.signal,
       "live contract-scan",
       1,

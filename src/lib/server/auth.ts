@@ -1,5 +1,6 @@
 import { type NetworkInterfaceInfo, networkInterfaces } from "node:os";
 
+import { localName } from "../host";
 import { inAny, networks, normalize, overlaps, unreadable } from "./address";
 import { config } from "./config";
 import { pwaNames } from "./manifest";
@@ -16,13 +17,11 @@ import { enabled as oidcEnabled } from "./oidc";
  * | 使い捨てのチケット | ライブ視聴の WebSocket だけ (`tickets.ts`) |
  * | Hybridcast の中継のトークン | Hybridcast のアプリの読み込みだけ (`hc-relay.ts`。下の `OPEN_PATHS`) |
  *
- * **どれも設定していなければ、全部断る** (`configured`)。以前は起動時にベーシック認証を
- * 自動で掛けていたが、残っていたのは「画面に出して覚えさせるパスワード」だけだったので
- * 廃止した。全部開けたいなら `TRUSTED_NETWORKS=0.0.0.0/0`
+ * **どれも設定していなければ、全部断る** (`configured`)。全部開けたいなら `TRUSTED_NETWORKS=0.0.0.0/0`
  * (公開の注意は docs/auth.md)。
  */
 
-/** Hybridcast の中継のトークンの形 (16 バイトを 16 進で書いたもの)。`hc-relay.ts` もこれで確かめる */
+/** Hybridcast の中継のトークンの形式 (16 バイトを 16 進で書いたもの)。`hc-relay.ts` もこれで確かめる */
 export const HC_TOKEN = "[0-9a-f]{32}";
 
 /**
@@ -30,9 +29,8 @@ export const HC_TOKEN = "[0-9a-f]{32}";
  *
  * - **ログインの入口。** 守ると入れなくなる (ログイン画面へ行くのにログインが要る)
  * - **`/logout`。** ここも素通し (ログアウトするのにログインを要求しない)
- * - **`/api/health`。** Kubernetes の `livenessProbe` が呼ぶ。守ると**Pod が
- *   再起動を繰り返す** (掛ける範囲を選べるのをやめたときに実際に起き、
- *   E2E のスタックが起動待ちで固まった)。出しているのは
+ * - **`/api/health`。** Kubernetes の `livenessProbe` が呼ぶ。守ると **Pod が
+ *   再起動を繰り返す** (E2E のスタックも起動待ちで止まる)。出しているのは
  *   「生きているか・動いているバージョンと新しいバージョン・局が何件か・録画が何本か・エンコードが何本動いているか」だけ
  * - **`/manifest.webmanifest`。** ブラウザは**資格情報を付けずに**取得する
  *   ので (`<link rel="manifest">` に `crossorigin` を書かない限り)、守ると
@@ -40,7 +38,7 @@ export const HC_TOKEN = "[0-9a-f]{32}";
  * - **ペアリングコードとアクセストークンの受け取り** (`/api/device/code`・`/api/device/token`)。テレビは
  *   まだ何の資格も持っていない。コードを出すだけでは入れず、許すのは `/device` (ここは守る)。
  *   誰でも呼べるので、有効なコードの数に上限がある (device-auth.ts の `MAX_PENDING`)
- * - **http の Hybridcast のアプリの中継** (`/api/bml/hc/<トークン>/…`)。アプリは使い捨てのオリジンの iframe にいて、
+ * - **Hybridcast のアプリの中継** (`/api/bml/hc/<トークン>/…`)。アプリは使い捨てのオリジンの iframe にいて、
  *   そこからの読み込みにはログインの cookie が付かない。推測できないトークンが許可証で、出すのはログインした人にだけ
  *   (`POST /api/bml/hc`。hc-relay.ts)
  */
@@ -61,8 +59,7 @@ export function isOpenPath(pathname: string): boolean {
  * ログイン方法が 1 つでも設定してあるか。**無ければ全部断る** (fail-closed)。
  *
  * 分からない状態で開けておくより、閉まっていることが起動ログとエラーページから
- * はっきり分かるほうがいい。以前の「起動時にパスワードを自動生成して掛ける」は、
- * 掛かってはいるが**受け取り損ねると誰も入れない**うえ、その状態と区別が付かなかった。
+ * はっきり分かるほうがいい。
  */
 export function configured(): boolean {
   return oidcEnabled() || networks(config.trustedNetworks).length > 0;
@@ -123,6 +120,35 @@ export function needsPairing(): Response {
 }
 
 /**
+ * **同じサイトからの呼び出しか。** `Sec-Fetch-Site` を見て、付けない古いブラウザなら `Origin` を比べる。
+ * フォームの形でない送信 (JSON・`application/octet-stream`) には SvelteKit の Origin の確かめが掛からないので、
+ * そういうエンドポイントが自分で呼ぶ
+ */
+export function sameOrigin(request: Request, url: URL): boolean {
+  const site = request.headers.get("sec-fetch-site");
+  return site !== null
+    ? site === "same-origin"
+    : request.headers.get("origin") === url.origin;
+}
+
+/**
+ * **アクセストークン (テレビのアプリ) では使わせない操作を断る理由。** ブラウザの人 (信頼するネットワーク・OIDC) なら null。
+ * 呼ぶ側は 403 と、この文を `message` にして返す。端末に渡した資格で次のことをさせない (docs/auth.md「アプリのペアリング」)
+ *
+ * - DB を持ち出す・入れ替える (denpa を別の機械へ移す、EPGStation・EDCB からの引き継ぎ)
+ * - 録画の通知を送る先 (Webhook) を追加・切り替え・削除・テスト送信する
+ * - 世帯のニコニコのアカウントを差し替える
+ * - ほかのテレビのアプリのアクセストークンを取り消す
+ * - エージェントを登録・名前の変更・URL の変更・削除する (設定の「受信」)
+ * - チューナーの定義・カードリーダーを書き換える、カードの契約と復号を確かめる (設定の「受信」のチューナーの節)
+ */
+export function tokenRefusal(locals: { token?: number }): string | null {
+  return locals.token === undefined
+    ? null
+    : "アクセストークンでは使えません。ブラウザから操作してください";
+}
+
+/**
  * **何も聞かずに通す相手か。** 見るのはアドレス (`TRUSTED_NETWORKS`、CIDR の
  * カンマ区切り)。名前は `foreignHost` で別に確かめる (hooks が両方を見る)。
  *
@@ -132,15 +158,6 @@ export function needsPairing(): Response {
 export function trusted(address: string): boolean {
   return inAny(address, networks(config.trustedNetworks));
 }
-
-/** 名前の後ろがこれなら、外の DNS では引けない (家の中だけの名前。`.localhost` はブラウザが自分に向ける) */
-const LOCAL_SUFFIXES = [
-  ".localhost",
-  ".local",
-  ".lan",
-  ".home.arpa",
-  ".internal",
-];
 
 /**
  * **信頼するネットワークから、ログインなしで開いてよい名前か。**
@@ -152,7 +169,7 @@ const LOCAL_SUFFIXES = [
  * そこで、攻める側が自分の名前として用意できないものだけを通す。
  *
  * - IP の直書き (IPv4・IPv6)、`localhost`、ドットの無い名前
- * - 家の中だけの名前 (`LOCAL_SUFFIXES`)
+ * - 家の中だけの名前 (`#lib/host.ts` の `LOCAL_SUFFIXES`)
  * - 自分の名前として設定にあるもの (`ALLOWED_HOSTS`、`PWA_NAMES`)
  *
  * `host` は `Host` ヘッダの値 (ポート付きでよい)。読めない形なら通さない
@@ -163,7 +180,7 @@ export function knownHost(host: string): boolean {
   if (normalize(name) !== null) return true;
   if (!/^[a-z0-9_.-]+$/.test(name)) return false;
   if (name === "localhost" || !name.includes(".")) return true;
-  if (LOCAL_SUFFIXES.some((suffix) => name.endsWith(suffix))) return true;
+  if (localName(name)) return true;
   return ownNames().some((entry) =>
     entry.startsWith(".")
       ? name === entry.slice(1) || name.endsWith(entry)
@@ -204,7 +221,7 @@ const MAX_REPORTED = 64;
  * `Host` はブラウザのスクリプトから変えられないが、`X-Forwarded-Host` のようなヘッダは
  * 同じオリジンからなら付けられるので、どちらか片方だけでは足りない。
  *
- * 信頼するネットワークの中から知らない名前で来たときに呼ぶ。ログに理由を 1 度だけ出す
+ * 信頼するネットワークの中から来たときに呼ぶ (hooks)。知らない名前なら、ログに理由を 1 度だけ出す
  */
 export function foreignHost(headers: Headers, address: string): string | null {
   const names = [headers.get("host")];
@@ -259,11 +276,16 @@ export function sharedNetworks(
 
 /**
  * 前段と同じネットワークを信頼していそうなら (`sharedNetworks`)、起動ログに出す。
- * **Mac と Windows では見ない。** OS の上でそのまま動くので自分のインターフェースは LAN そのもので、
- * インストーラの既定の `TRUSTED_NETWORKS` と必ず重なる (前段を同じネットワークに置く構成ではない)
+ * **Mac・Windows・Android では見ない。** OS の上でそのまま動くので自分のインターフェースは LAN そのもので、
+ * インストーラ (Android はアプリの denpa.env) の既定の `TRUSTED_NETWORKS` と必ず重なる (前段を同じネットワークに置く構成ではない)
  */
 export function warnIfProxyHidden(): void {
-  if (process.platform === "win32" || process.platform === "darwin") return;
+  if (
+    process.platform === "win32" ||
+    process.platform === "darwin" ||
+    process.platform === "android"
+  )
+    return;
   const shared = sharedNetworks(
     config.trustedNetworks,
     config.trustedProxies,
@@ -282,7 +304,7 @@ export function warnIfProxyHidden(): void {
  *
  * アドレスは入口の server.js が決めて `x-denpa-remote` に入れ、adapter-bun はそれを読む
  * (`ADDRESS_HEADER` は server.js が固定する。前段をどこまで信じるかは `TRUSTED_PROXIES`)。
- * adapter-bun はそのヘッダが無いと**例外を投げる**。server.js が相手のアドレスを
+ * adapter-bun はそのヘッダが無いと**例外を送出する**。server.js が相手のアドレスを
  * 読めなかったときがそれで、そのまま呼ぶと 500 になる。
  *
  * **読めなかったときは素通しにしない** (空文字はどの CIDR にも当たらない)。
@@ -294,9 +316,4 @@ export function clientAddress(event: { getClientAddress(): string }): string {
   } catch {
     return "";
   }
-}
-
-/** OIDC でログインを求めるか (素通しのエンドポイントは呼ぶ側 (hooks) が先に振り分ける) */
-export function needsLogin(): boolean {
-  return oidcEnabled();
 }

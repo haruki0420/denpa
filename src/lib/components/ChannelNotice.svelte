@@ -3,87 +3,59 @@
 
   import {
     CHANNEL_NOTICE_ACTION,
+    CHANNEL_NOTICE_SECTION,
     CHANNEL_NOTICE_TEXT,
     type ChannelNotice,
   } from "#lib/channel-notice.js";
 
   /**
-   * チャンネルのお知らせ (局が無い・チャンネルを書き換えた・地上波が違う) と、設定の「チャンネル」へのリンク (`#lib/channel-notice.ts`)。
-   *
-   * - `bar` … 画面の上に貼る 1 行 (録画・番組表・ライブ。`+layout.svelte`)。閉じるボタンは無い
-   * - `center` … 空の番組表の真ん中に置く。文とボタンを縦に積む
+   * 局が無いときの案内 (エージェントが無い・局が 1 つも無い・どれも復号できない) と、設定の「受信」へのリンク (`#lib/channel-notice.ts`)。
+   * 画面の上に貼る 1 行 (録画・番組表・ライブ。`+layout.svelte`)。閉じるボタンは無い。
+   * 番組表で選んでいる種別に局が無いときは、この 1 行の代わりに表の場所の空の状態で言う (`guide/+page.svelte`)
    */
-  let {
-    kind,
-    variant = "bar",
-    text = CHANNEL_NOTICE_TEXT[kind],
-  }: {
-    kind: ChannelNotice;
-    variant?: "bar" | "center";
-    /** 文を言い替えるとき (番組表で、選んでいる種別の名前を入れる) */
-    text?: string;
-  } = $props();
+  let { kind }: { kind: ChannelNotice } = $props();
 </script>
 
 <div
-  class="channel-notice {variant}"
-  class:notice={variant === "bar"}
-  class:info={variant === "bar"}
+  class="channel-notice notice info"
   role="status"
   data-testid="channel-notice"
 >
-  <p>{text}</p>
+  <p>{CHANNEL_NOTICE_TEXT[kind]}</p>
   <a
-    href={`${resolve("settings/reception")}#channels`}
-    class="button small {variant === 'bar' ? 'secondary outline' : ''}"
-    >{CHANNEL_NOTICE_ACTION[kind]}</a
+    href={`${resolve("settings/reception")}#${CHANNEL_NOTICE_SECTION[kind]}`}
+    class="button small secondary outline">{CHANNEL_NOTICE_ACTION[kind]}</a
   >
 </div>
 
 <style>
+  /*
+   * **枠で囲まない、画面の幅いっぱいの 1 行。** ヘッダーの下に貼る。見た目はページの中の通知 (`app.css` の `.notice.info`。
+   * 淡い面と先頭の ⓘ。地を案内の色で塗らない) を、角を落として 1 行の高さに詰めたもの。
+   * 狭い画面で文が長ければ折り返し、ボタンは右に残す。左右の余白は本文と同じ (`+layout.svelte` の `--dp-gutter`)
+   */
   .channel-notice {
+    --bar-pad: var(--dp-gutter);
     display: flex;
     align-items: center;
+    justify-content: space-between;
     gap: var(--dp-space-2) var(--dp-space-3);
+    padding: 0.375rem var(--bar-pad) 0.375rem
+      calc(var(--bar-pad) + var(--dp-space-2) + 1.125em);
+    border-radius: 0;
+    font-size: var(--dp-text-sm);
   }
   .channel-notice p {
     margin: 0;
   }
-  /*
-     * **枠で囲まない、画面の幅いっぱいの 1 行。** ヘッダーの下に貼る。見た目はページの中の通知 (`app.css` の `.notice.info`。
-     * 淡い面と頭の ⓘ。地を案内の色で塗らない) を、角を落として 1 行の高さに詰めたもの。
-     * 狭い画面で文が長ければ折り返し、ボタンは右に残す
-     */
-  .bar {
-    --bar-pad: 1rem;
-    justify-content: space-between;
-    padding: 0.375rem var(--bar-pad) 0.375rem
-      calc(var(--bar-pad) + 0.5rem + 1.125em);
-    border-radius: 0;
-    font-size: var(--dp-text-sm);
-  }
-  .bar::before {
+  .channel-notice::before {
     top: 50%;
     translate: 0 -50%;
     left: var(--bar-pad);
   }
-  @media (min-width: 768px) {
-    .bar {
-      --bar-pad: 1.5rem;
-    }
-  }
-  .bar .button {
+  .channel-notice .button {
     flex-shrink: 0;
     margin: 0;
-    padding-block: 0.15rem;
-  }
-  .center {
-    flex-direction: column;
-    justify-content: center;
-    gap: var(--dp-space-3);
-    text-align: center;
-  }
-  .center p {
-    color: var(--dp-muted);
+    padding-block: var(--dp-space-1);
   }
 </style>

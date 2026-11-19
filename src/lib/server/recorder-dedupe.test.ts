@@ -27,15 +27,23 @@ mock.module("./webhook", () => ({
 /** 流す p/f の「次」の番組 (録る番組)。テストごとに差し替える */
 let following: SynthEvent;
 const actualTuner = await import("./tuner");
+/*
+ * **差し替えはこのファイルの中だけで効かせる。** `--isolate` を付けずに動かすと `mock.module` は他のファイルにも残り、
+ * `tuner.ts` の中から呼ぶ `openChannel` (`openChannelStream` が呼ぶもの) まで差し替わったままになる。
+ * 終わったら本物の `openChannel` に渡す (すぐ下の `afterAll`)
+ */
+const realOpenChannel = actualTuner.openChannel;
+let faking = true;
+afterAll(() => {
+  faking = false;
+});
 mock.module("./tuner", () => ({
   ...actualTuner,
-  openChannelStream: async (
-    _type: string,
-    _channel: string,
-    signal: AbortSignal,
-  ): Promise<ReadableStream<Uint8Array>> => {
+  openChannel: async (...args: Parameters<typeof realOpenChannel>) => {
+    if (!faking) return realOpenChannel(...args);
+    const signal = args[2];
     let timer: ReturnType<typeof setInterval> | undefined;
-    return new ReadableStream<Uint8Array>({
+    const stream = new ReadableStream<Uint8Array>({
       start(controller) {
         const push = () => controller.enqueue(pfPackets(following));
         push();
@@ -49,6 +57,12 @@ mock.module("./tuner", () => ({
         clearInterval(timer);
       },
     });
+    return {
+      stream,
+      tsmfStreams: 1,
+      transport: "ts" as const,
+      place: { agent: 1, channel: "T16" },
+    };
   },
 }));
 
@@ -58,6 +72,7 @@ config.dbPath = join(dir, "denpa.db");
 config.rawDir = dir;
 
 const { now, orm } = await import("./db");
+const { placeServices } = await import("./fake-channels");
 const { startRecording, stopRecording } = await import("./recorder");
 const { reservationStates } = await import("./reservations");
 const { programs, recordings, reservations, rules, services } =
@@ -125,10 +140,10 @@ beforeEach(() => {
         name,
         type,
         service_type: 1,
-        channel,
         updated_at: now(),
       })
       .run();
+    placeServices([{ id, channel }]);
   }
   orm()
     .insert(rules)

@@ -27,11 +27,11 @@ export const SAVED_MS = 1500;
  *
  * 押すと、いまの 1 コマを、出している字幕・実況のコメントごと写して**サーバへ送る** (`POST /api/clips`。映像と字幕・コメントは
  * 分けて送り、あとから出し入れできる。サーバが重ねて AVIF にして置き、
- * 「切り抜き」の画面に並ぶ)。通知は控えめにする。ボタンが一瞬チェックになり、トーストに「保存しました」の 1 行。
- * PC ではクリップボードにもコピーする (そのまま貼りたいとき用)。
+ * 「切り抜き」の画面に並ぶ)。通知は控えめにする。ボタンが一瞬チェックになり、トーストに「保存しました」の 1 行を出す。
+ * PC ではクリップボードにもコピーし (そのまま貼りたいとき用)、できたときは「保存しました (クリップボードにもコピー)」と出す。
  *
  * **送れなかったとき (オフラインで観ている・サーバが断った) だけ、端末に保存する** (指の端末は共有シート、
- * PC は PNG を落とす。`snapshot.saveOnDevice`)
+ * PC は PNG をダウンロードする。`snapshot.saveOnDevice`)
  */
 export function snapshotter(controls: PlayerControls) {
   let shot = $state<Notice | null>(null);
@@ -40,13 +40,13 @@ export function snapshotter(controls: PlayerControls) {
   let savedTimer: ReturnType<typeof setTimeout> | null = null;
   /**
    * 撮っている最中か。**続けて押しても 1 枚ずつ**。共有シートが開いている間に
-   * もう一度押すと、2 枚目の共有が「もう開いている」で断られて落ちてくる
+   * もう一度押すと、2 枚目の共有が「もう開いている」で断られて失敗する
    */
   let busy = false;
 
   /**
    * **PC ではクリップボードにもコピーする。** 置けるのは https か localhost で押した直後だけなので、
-   * 送る前に始める (中身は後から渡せる)。断られても黙る
+   * 送る前に始める (中身は後から渡せる)。断られても通知は出さない
    */
   function copy(canvas: HTMLCanvasElement): Promise<boolean> {
     if (window.matchMedia("(pointer: coarse)").matches || !canCopyImage())
@@ -96,7 +96,7 @@ export function snapshotter(controls: PlayerControls) {
      * いまの 1 コマを、出している字幕・実況のコメントごと切り抜いて送る。コメントは画面から読む (`readComments`)。
      * @param frame 写すフレームを取ってくる関数。**撮れると決まってから呼ぶ** (`busy` の後)。canvas で
      *   描いているときは worker から 1 枚もらう (`raw/engine.ts` の `grab`) ので、先に呼ぶと
-     *   弾いた押しのぶんのフレーム (1080 で 8MB) が誰にも閉じられずに残る
+     *   弾いた押しのぶんのフレーム (1080 で 8 MB) が誰にも閉じられずに残る
      * @param caption 出している字幕の canvas。出していなければ null
      * @param title 番組名 (端末に保存するときのファイル名の先頭)
      * @param where どこで撮ったか (サーバが番組を引く)。押した瞬間の位置を読むので関数で
@@ -119,7 +119,7 @@ export function snapshotter(controls: PlayerControls) {
       try {
         got = await frame();
         const base = composeFrame(got);
-        // worker から貰ったフレーム (1080 で 8MB) は写し終えたら手放す。GC 任せだと押すたびに溜まる
+        // worker から貰ったフレーム (1080 で 8 MB) は写し終えたら手放す。GC 任せだと押すたびに溜まる
         if (got?.image instanceof ImageBitmap) got.image.close();
         got = null;
         if (base === null) return;

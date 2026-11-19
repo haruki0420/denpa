@@ -13,14 +13,15 @@ import {
   stream,
 } from "@danything/arib/synth";
 
-import { fakeAgentTls, fakeAgentUrl, trustFakeAgent } from "./fake-agent";
+import { fakeAgentTls, fakeAgentUrl } from "./fake-agent";
+import { trustFakeAgent } from "./fake-agent-trust";
 
 /**
  * 「ロゴをいますぐ集める」を、**BS と CS で共通のチューナー 2 台**で回す (#1939)。
  *
  * 実機の報告では、`BS01_0`・`BS01_1`・`BS01_2`・`BS03_0` と外れの中継を当たったところで「CS の空きチューナーが
  * 無くなったため、残りは取りやめました」と止まり、当たりの中継 (`BS15_0`) まで行き着かなかった。
- * エージェントは誰も読まなくなった選局を少しの間畳まずに残す (余韻) ので、外れを閉じた直後の一覧では
+ * エージェントは誰も読まなくなった選局を少しの間閉じずに残す (余韻) ので、外れを閉じた直後の一覧では
  * チャンネルが付いたまま利用者が空になる。それを使用中と数えて、空きを 0 と見ていた。
  *
  * チューナーの API は手元に立てた偽物。閉じた選局はチャンネルを付けたまま利用者だけ空にして残す (余韻)。
@@ -154,7 +155,6 @@ const agent = Bun.serve({
         rank: 0,
         device: null,
         lnb: null,
-        pid: null,
         error: null,
         ...tuner,
       })),
@@ -171,6 +171,7 @@ config.agentUrl = fakeAgentUrl(agent.port!);
 trustFakeAgent();
 
 const { orm } = await import("./db");
+const { placeServices } = await import("./fake-channels");
 const { services } = await import("./schema");
 const { serviceKey } = await import("./tuner");
 const { readLogo, sweepNow, sweepState } = await import("./logo");
@@ -179,20 +180,26 @@ orm()
   .insert(services)
   .values(
     STATIONS.map((s) => ({
-      id: serviceKey(s.network, s.sid),
+      id: serviceKey(s.network, s.sid, s.type),
       service_id: s.sid,
       network_id: s.network,
       name: `局${s.sid}`,
       type: s.type,
-      channel: s.channel,
       updated_at: 1,
     })),
   )
   .run();
+placeServices(
+  STATIONS.map((s) => ({
+    id: serviceKey(s.network, s.sid, s.type),
+    channel: s.channel,
+  })),
+);
 
 const logos = () =>
-  STATIONS.filter((s) => readLogo(serviceKey(s.network, s.sid)) !== null)
-    .length;
+  STATIONS.filter(
+    (s) => readLogo(serviceKey(s.network, s.sid, s.type)) !== null,
+  ).length;
 
 async function finished(): Promise<void> {
   while (sweepState().running) await Bun.sleep(20);
@@ -214,7 +221,9 @@ describe("BS と CS で共通のチューナー 2 台で「ロゴをいますぐ
 
   test("当たりと分かっている中継を外れ探しより先に開き、揃ったら残りの中継は開かない", async () => {
     for (const s of STATIONS)
-      rmSync(join(root, "logos", `${serviceKey(s.network, s.sid)}.png`));
+      rmSync(
+        join(root, "logos", `${serviceKey(s.network, s.sid, s.type)}.png`),
+      );
     opened.length = 0;
     // 1 台は番組表の取得が使っている。空きは 1 台なので 1 つずつ回る
     tuners = [

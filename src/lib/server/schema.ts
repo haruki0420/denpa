@@ -16,7 +16,14 @@ import {
 } from "drizzle-orm/sqlite-core";
 
 import type { Audio } from "../arib";
-import type { ChannelType, ReservationState } from "../types";
+import {
+  type ChannelType,
+  DIGITAL_TV,
+  hasVideo,
+  type ReservationState,
+  type Transport,
+  type VideoLoss,
+} from "../types";
 import type { Range } from "./cm";
 import { config } from "./config";
 
@@ -24,14 +31,8 @@ import { config } from "./config";
  * **テーブルの定義はここにしか無い** (drizzle)。
  *
  * - 行の型はここから導く (`types.ts` の `Recording` など)
- * - DB を作る SQL もここから出す: 変えたら `bun run db:generate` で `drizzle/` に
+ * - DB を作る SQL もここから出す。変えたら `bun run db:generate` で `drizzle/` に
  *   マイグレーションが出るので、一緒にコミットする。当てるのは起動時 (`db.ts`)
- *
- * 前は SQL の文字列 (`CREATE TABLE IF NOT EXISTS` + 後から足した列の一覧) と
- * TS の interface を別々に書いていた。列を足すときに 3 箇所を直すことになり、
- * 片方だけ直しても TS は何も言わなかった (`queryOne<Recording>` はキャスト)。
- * 実際に本番が 500 を返したこともある (列を SQL に書いただけで、動いている DB には
- * 足されていなかった)。
  *
  * 真偽を 0/1 で持つ列 (`enabled` / `manual` / `encode` / `has_logo` / `is_free` など)
  * は `{ mode: 'boolean' }` で読み書きする。DB の中は今までどおり 0/1 で、既定値も
@@ -45,9 +46,9 @@ import { config } from "./config";
 const flag = (name: string) => integer(name, { mode: "boolean" });
 
 /**
- * JSON を文字列で持つ列。読むときにデコードし、書くときに畳む。**読み取り関数は列ごとに書く。**
+ * JSON を文字列で持つ列。読むときにデコードし、書くときにエンコードする。**読み取り関数は列ごとに書く。**
  *
- * drizzle の `{ mode: 'json' }` は使わない。あれは読めない行で例外を投げるが、
+ * drizzle の `{ mode: 'json' }` は使わない。あれは読めない行で例外を出すが、
  * ここに入っているのは放送から取得したものや、取り込みの時期によって形式が違うもの
  * (古い行は `''`、EPGStation から来たジャンルは数の並び) で、1 行が読めないせいで
  * 一覧ごと出なくなるのは困る。読めない行はその列を「持っていない」ことにして、
@@ -62,7 +63,7 @@ function json<T>(name: string, read: (value: unknown) => T) {
       try {
         value = JSON.parse(raw);
       } catch {
-        // 壊れた行。read が「持っていない」の形に落とす
+        // 壊れた行。read が「持っていない」ときの値にする
       }
       return read(value);
     },
@@ -103,6 +104,14 @@ const objects =
   <T extends object>() =>
   (value: unknown): T[] =>
     Array.isArray(value) ? (value as T[]) : [];
+/** 映像が欠けた長さを測った値。形式が違ったり、数でなかったり負だったりすれば無し */
+const videoLoss = (value: unknown): VideoLoss | null => {
+  if (typeof value !== "object" || value === null) return null;
+  const { span, lost, tail } = value as Record<string, unknown>;
+  const fine = (n: unknown): n is number =>
+    typeof n === "number" && Number.isFinite(n) && n >= 0;
+  return fine(span) && fine(lost) ? { span, lost, tail: tail === true } : null;
+};
 /** {見出し: 本文}。それ以外の形式なら無し */
 const record = (value: unknown): Record<string, string> | null =>
   typeof value === "object" && value !== null && !Array.isArray(value)
@@ -164,20 +173,20 @@ export function activeEncodeJobId(recordingId: AnySQLiteColumn) {
         AND state IN ('queued','running') ORDER BY id DESC LIMIT 1)`;
 }
 
-/** 番組のいちばん新しい録画 (消したものは除く)。番組表と予約の一覧が状態を出すのに使う */
+/** 番組のいちばん新しい録画 (消したものは除く)。番組表が観るボタンに使う (状態は `latestReservationRecordingId` から決める) */
 export function latestRecordingId(programId: AnySQLiteColumn) {
   return sql<number>`(SELECT id FROM recordings WHERE program_id = ${programId} AND deleted_at IS NULL ORDER BY id DESC LIMIT 1)`;
 }
 
 /**
- * 予約で録れたいちばん新しい録画。予約の一覧と検索が `reservationState` に渡すのに使う。
+ * 予約で録れたいちばん新しい録画。予約の一覧・番組表・検索が `reservationState` に渡すのに使う。
  * **消したものも含める。** 外すと、録り終えてから消した予約が「完了」でなく予約の状態のまま出る
  */
 export function latestReservationRecordingId(reservationId: AnySQLiteColumn) {
   return sql<number>`(SELECT id FROM recordings WHERE reservation_id = ${reservationId} ORDER BY id DESC LIMIT 1)`;
 }
 
-/** 画面から変えられる設定 (settings.ts)。初期値は config.ts が持ち、ここに行があればそちらが勝つ */
+/** 画面から変えられる設定 (settings.ts)。初期値は settings.ts が持ち (コーデックだけ config.ts)、ここに行があればそちらが勝つ */
 export const settings = sqliteTable("settings", {
   key: text("key").primaryKey(),
   value: text("value").notNull(),
@@ -199,15 +208,43 @@ export const webhooks = sqliteTable("webhooks", {
   created_at: integer("created_at").notNull(),
 });
 
+// テレビの局の種別と映像のある局の決まりは、画面 (サブチャンネルの束ね方) も使うので `types.ts` に置く
+export { DIGITAL_TV, hasVideo };
+
+/** ラジオの局のサービス種別 (ARIB STD-B10 のデジタル音声)。映像が無く、音声 (と、あればデータ放送) を流す */
+const DIGITAL_AUDIO = 2;
+
 /**
- * テレビの局のサービス種別 (ARIB STD-B10 のデジタル TV)。録画できるのはこの種別だけ。
- *
- * スキャンはデータ放送 (NHKデータ1、Gガイド) もワンセグ (tvkワンセグ1) も
- * ラジオも同じ一覧に入れる。これらを録っても映像は入っておらず、
- * データ放送は番組表上「24 時間ぶんの 1 番組」になっていたりする。
- * ルールが引っかけて録画が失敗するので、取り込む時点で落とす (`epg.syncServices`)
+ * データ放送の局のサービス種別 (ARIB STD-B10 のデータ/ワンセグ)。データ放送だけの局 (NHKデータ1) と、
+ * 部分受信の局 (ワンセグ。tvkワンセグ1) のどちらもこの種別。映像が無く、音声も無いことがある
  */
-export const DIGITAL_TV = 1;
+const DIGITAL_DATA = 0xc0;
+
+/** **取り込むサービス種別** (`importedService`)。テレビ・ラジオ・データ放送。エンジニアリング (0xA4) などは取り込まない */
+export const IMPORTED_SERVICE_TYPES: ReadonlySet<number> = new Set([
+  DIGITAL_TV,
+  DIGITAL_AUDIO,
+  DIGITAL_DATA,
+]);
+
+/**
+ * **控えの局を取り込むか** (`epg.syncServices`)。取り込む種別 (`IMPORTED_SERVICE_TYPES`) のうち、部分受信の局 (ワンセグ) を除いたもの。
+ *
+ * ワンセグは本放送と同じ番組を流すので、取り込むと地上波の番組表に同じ番組の列が増える。部分受信かはスキャンが
+ * NIT の部分受信記述子 (0xFB) から控えに書く (`AgentChannel` の `partialReception`)。記述子の無いネットワークでは
+ * どの局も部分受信でないと書く (ケーブルの NIT に記述子が残るかは確かめていない)。
+ * **書く前の控え (`partialReception` が無い) のデータ放送の局は、ワンセグかもしれないので落とす。** スキャンし直すと入る
+ */
+export function importedService(service: {
+  serviceType: number;
+  partialReception?: boolean | undefined;
+}): boolean {
+  if (!IMPORTED_SERVICE_TYPES.has(service.serviceType)) return false;
+  if (service.partialReception === true) return false;
+  return (
+    service.serviceType !== DIGITAL_DATA || service.partialReception === false
+  );
+}
 
 export const services = sqliteTable("services", {
   /** 局の内部 ID (tuner.ts の serviceKey) */
@@ -218,15 +255,48 @@ export const services = sqliteTable("services", {
   type: text("type").$type<ChannelType>().notNull(),
   /**
    * ARIB のサービス種別 (STD-B10)。1 = デジタル TV、2 = デジタル音声、
-   * 192 = データ/ワンセグ、164 = エンジニアリング。録るのは 1 だけ
+   * 192 = データ/ワンセグ、164 = エンジニアリング。取り込むのは 1・2・192 で、192 のうちワンセグは落とす (`importedService`)
    */
   service_type: integer("service_type").notNull().default(DIGITAL_TV),
-  /** 物理チャンネル。同一チャンネルの同時録画はチューナーを共有できる */
-  channel: text("channel").notNull(),
+  /**
+   * 局の入っている TS の transport_stream_id (TLV なら tlv_stream_id)。取り込みのたびに入れ直す (`epg.syncServices`)。
+   * **局からチャンネルを引く鍵。** 種別・`network_id` と組で `agent_channels` を引く (`agent-channels.serviceChannel`)。
+   * 上げてから一度も取り込みで見かけていない局は null
+   */
+  transport_stream_id: integer("transport_stream_id"),
   remote_control_key: integer("remote_control_key"),
   has_logo: flag("has_logo")
     .notNull()
     .default(sql`0`),
+  /**
+   * スクランブルを復号できる局か (`types.decodableService`)。取り込みのたびに決め直す (`epg.syncServices`)。
+   * 復号できない局 (SKY と、B-CAS 以外の方式でスクランブルされた CATV の局と、CATV の 4K の局) は、ライブ・録画・ロゴに使わない
+   */
+  decodable: flag("decodable")
+    .notNull()
+    .default(sql`1`),
+  /**
+   * 番組表を読める局か (`types.epgReadableService`)。取り込みのたびに決め直す (`epg.syncServices`)。**番組表に出すのはこの局。**
+   * 復号できる局はいつも読める。復号できない局は、番組表の表がスクランブルされずに来ているとスキャンが控えに書いた局だけ
+   * (TLV は MH-EIT が信号のメッセージで来るのでいつも、SKY と CATV の TS は EIT の観測 `ca-observe.ts` で決める)
+   */
+  epg_readable: flag("epg_readable")
+    .notNull()
+    .default(sql`1`),
+  /**
+   * チャンネルの伝送の形式 (`types.Transport`)。`tlv` はケーブルで受けた 4K の局 (MMT/TLV)。
+   * スキャンがチャンネルの控えに書き、取り込みのたびに入れ直す (`epg.syncServices`)。選局の前に読み方と復号できるかを決めるのに使う
+   */
+  transport: text("transport").$type<Transport>().notNull().default("ts"),
+  /**
+   * いまエージェントの一覧にある局か (`epg.currentServices`)。**画面とルールに出すのはこの局。** 行は消さない
+   * (その局の録画と過去の予約を辿るため)。取り込みで局が 1 つでも取れた回に、見かけた局を 1、見かけなかった局を 0 にする
+   * (`epg.syncServices`)。設定から種別を消したときは、その種別の局をその場で 0 にする (`epg.unlistType`)
+   */
+  listed: flag("listed")
+    .notNull()
+    .default(sql`1`),
+  /** 最後に取り込みで見かけた時刻。見かけない時間が長い局の番組表と予約を片付けるのに使う (`epg.forgetMissing`) */
   updated_at: integer("updated_at").notNull(),
   /**
    * 番組表の取得 (`epg-collect.ts`) がこの局の番組を最後に書いた時刻。まだなら null。
@@ -246,8 +316,10 @@ export const services = sqliteTable("services", {
 export const channelReception = sqliteTable(
   "channel_reception",
   {
+    /** 選局したエージェント (`agents.id`)。アンテナとチューナーはエージェントごとなので、エージェントごとに数える */
+    agent_id: integer("agent_id").notNull(),
     type: text("type").$type<ChannelType>().notNull(),
-    /** チャンネルの名前 (`T27`・`BS15:16625`)。`services.channel` と同じもの */
+    /** チャンネルの名前 (`T27`・`BS15:16625`)。`agent_channels.channel` と同じもの */
     channel: text("channel").notNull(),
     /** 最後に受信できた時刻。一度も確かめていなければ null */
     ok_at: integer("ok_at"),
@@ -262,12 +334,43 @@ export const channelReception = sqliteTable(
       .notNull()
       .default(sql`0`),
   },
-  (t) => [primaryKey({ columns: [t.type, t.channel] })],
+  (t) => [primaryKey({ columns: [t.agent_id, t.type, t.channel] })],
+);
+
+/**
+ * **どの TS を、どのエージェントのどのチャンネルで受けられるか** (`agent-channels.ts`)。
+ *
+ * 控え (`channels.json`) はエージェントが持ち、ここはその写し。取り込み (`epg.syncServices`) のたびに、
+ * 一覧を返したエージェントのぶんだけ入れ直す。返さなかった (落ちている) エージェントの行は前のまま残し、
+ * その台にしか無い局を片付けない。
+ *
+ * 局 (`services`) は局の ID で 1 行のまま。同じ TS を複数のエージェントが受けられれば、ここに台数ぶんの行がある。
+ * 中継局の違いで、同じ TS を別の物理チャンネルで受けることもある。
+ * エージェントの行を消したら、ここの行もコードで消す (`agents.syncEnvAgents`。外部キーは効かせていない)
+ */
+export const agentChannels = sqliteTable(
+  "agent_channels",
+  {
+    /** `agents.id` */
+    agent_id: integer("agent_id").notNull(),
+    type: text("type").$type<ChannelType>().notNull(),
+    /** そのエージェントでの物理チャンネルの名前 (`T27`・`BS15:16625`)。選局にそのまま渡す */
+    channel: text("channel").notNull(),
+    network_id: integer("network_id").notNull(),
+    /** transport_stream_id (TLV なら tlv_stream_id) */
+    transport_stream_id: integer("transport_stream_id").notNull(),
+    /** 伝送の形式 (`types.Transport`)。控えに無ければ `ts` */
+    transport: text("transport").$type<Transport>().notNull(),
+  },
+  (t) => [
+    primaryKey({ columns: [t.agent_id, t.type, t.channel] }),
+    index("agent_channels_ts").on(t.type, t.network_id, t.transport_stream_id),
+  ],
 );
 
 /**
  * 放送の一覧が変わり、受信できるチャンネルを書き換えた記録 (`lineup-follow.ts`)。
- * 録画・番組表・ライブの上のお知らせの 1 行に出し、設定の「受信」を開いたら消す
+ * ヘッダーの印 (`ChannelAlert.svelte`) に出し、設定の「受信」を開いたら消す
  */
 export const channelChanges = sqliteTable("channel_changes", {
   id: integer("id").primaryKey({ autoIncrement: true }),
@@ -281,18 +384,16 @@ export const channelChanges = sqliteTable("channel_changes", {
 
 /**
  * B-CAS カードごとの有料放送契約・復号状態の控え。
-/**
- * B-CAS カードごとの有料放送契約・復号状態の控え。
- * 設定の「有料契約確認」に出し、自動予約で有料放送を録る局を決めるのに使う (`contracts.paidAllowed`)。
+ * 設定の「受信」の「有料契約を確認」に出し、自動予約で有料放送を録る局を決めるのに使う (`contracts.paidAllowed`)。
  */
 export const cardContracts = sqliteTable(
   "card_contracts",
   {
-    /** カード番号 (16桁の文字列) */
+    /** カード番号 (16 桁の文字列) */
     card_id: text("card_id").notNull(),
     /** 局の内部 ID (services.id) */
     service_id: integer("service_id").notNull(),
-    /** 契約状態: subscribed(契約中) / unsubscribed(未契約) / expired(期限切れ) / unknown(未確認) */
+    /** 契約状態: subscribed (契約中) / unsubscribed (未契約) / expired (期限切れ) / unknown (未確認) */
     state: text("state")
       .$type<"subscribed" | "unsubscribed" | "expired" | "unknown">()
       .notNull(),
@@ -304,7 +405,7 @@ export const cardContracts = sqliteTable(
     >(),
     /** B-CAS 契約確認コマンド (0x90 0x3C) の返り値コード (0x0800 等) */
     code: integer("code"),
-    /** 契約の有効期限（epoch ms）。判定できた場合 */
+    /** 契約の有効期限 (epoch ms)。判定できた場合 */
     valid_until: integer("valid_until"),
     /** 実ストリームでの復号可否 (true: 成功, false: スクランブル残存, null: 未確認) */
     decode_ok: flag("decode_ok"),
@@ -385,7 +486,7 @@ export const programs = sqliteTable(
     copy_never: flag("copy_never")
       .notNull()
       .default(sql`0`),
-    /** CA契約情報記述子 (0xCB) の verificationData (Base64)。有料放送の契約確認・復号判定に使う */
+    /** CA 契約情報記述子 (0xCB) の verificationData (Base64)。有料放送の契約確認・復号判定に使う */
     contract_verification: text("contract_verification"),
     /*
      * **シリーズ** (EIT のシリーズ記述子)。載せる局のぶんだけ入り、載っていない番組は全部 NULL。
@@ -425,7 +526,7 @@ export const rules = sqliteTable("rules", {
   search_fields: text("search_fields").notNull().default("name"),
   /** JSON 配列。NULL は全局 */
   service_ids: json("service_ids", numbers),
-  /** JSON 配列 (GR/BS/CS/SKY)。個別の局 (`service_ids`) との OR で効く */
+  /** JSON 配列 (`ChannelType`)。個別の局 (`service_ids`) との OR で効く */
   service_types: json("service_types", strings),
   /** JSON 配列。`"7"` (大分類) か `"7-0"` (中分類まで)。NULL は全ジャンル */
   genres: json("genres", strings),
@@ -442,7 +543,7 @@ export const rules = sqliteTable("rules", {
     .default(sql`1`),
   /**
    * チューナーが足りないとき、どの予約を残すか。大きいほうが残る (conflict.ts)。
-   * **エージェントに渡すチューナーの取り合いの優先度 (`config.priority`) とは別物** (docs/agent.md)。
+   * **エージェントに渡すチューナーの取り合いの順 (`config.priority`) とは別物** (docs/agent.md)。
    * ルールは 1、手動予約は 2。比べる相手は予約どうしだけなので小さいところから数える
    */
   priority: integer("priority").notNull().default(1),
@@ -534,8 +635,9 @@ export const reservations = sqliteTable(
       .notNull()
       .default(sql`0`),
     /**
-     * 「エンコードするか否か」だけは予約した時点で固定する (recorder が読む)。エンコード方法の細目
-     * (元の TS を残すか・CM の扱い・コーデック) は持たず、エンコードするときに settings を見る
+     * 「エンコードするか否か」は予約した時点の設定を写す (recorder が読む)。録り終えたときの設定が「エンコードしない」なら、
+     * 1 でもエンコードしない。エンコード方法の細目
+     * (元の TS を残すか・コーデック) は持たず、エンコードするときに settings を見る
      */
     encode: flag("encode")
       .notNull()
@@ -595,13 +697,18 @@ export const recordings = sqliteTable(
     reservation_id: integer("reservation_id"),
     program_id: integer("program_id"),
     service_id: integer("service_id").notNull(),
+    /**
+     * 最後に録ったエージェント (`agents.id`)。取り直しで別のエージェントに入れば書き換える。
+     * 有料の番組を復号できて録れたとき、そのエージェントのカードを契約中にする (`contracts.noteDecoded`)。列を足す前の行と、まだ選局していない行は null
+     */
+    agent_id: integer("agent_id"),
     service_name: text("service_name").notNull().default(""),
     name: text("name").notNull(),
     /** 保存先でシリーズとしてまとめる単位 */
     series: text("series").notNull().default(""),
     subtitle: text("subtitle").notNull().default(""),
     description: text("description").notNull().default(""),
-    /** 詳細(拡張形式)。JSON {見出し:本文}。番組詳細の画面に概要と続けて出す */
+    /** 詳細 (拡張形式)。JSON {見出し:本文}。番組詳細の画面に概要と続けて出す */
     extended: json("extended", record),
     start_at: integer("start_at").notNull(),
     end_at: integer("end_at").notNull(),
@@ -649,7 +756,7 @@ export const recordings = sqliteTable(
     series_repeat: integer("series_repeat"),
     /** 実際に録れた長さ。番組表の尺 (end_at - start_at) は予定でしかない。取れていなければ NULL (古い行) */
     duration_ms: integer("duration_ms"),
-    /** エンコードしたもののコマ数 (30/60)。実測 (fpsDetect) か既定の 60。未エンコード・fps 記録前の古い行は NULL */
+    /** エンコードしたもののコマ数 (30/60。本編の映像から測ったもの)。未エンコード・fps 記録前の古い行は NULL */
     fps: integer("fps"),
     /** 消した時刻 (denpa から、または外から)。行は履歴として残す */
     deleted_at: integer("deleted_at"),
@@ -671,7 +778,14 @@ export const recordings = sqliteTable(
      */
     cm_note: text("cm_note"),
     /**
-     * CM を切ってエンコードしたときに**残した区間** (入れ物の先頭からの秒)。NULL は切っていない。
+     * **番組のうち、元の TS に映像が無かった長さ** (`types.VideoLoss`)。CM 検出でコマの時刻を読んだときに測る (`video-loss.ts`)。
+     * NULL は測っていない (映像の無い録画・CM 検出の前の録画・映像を読めなかった録画)。一覧で「録画が途中で切れています」と出すかは
+     * 画面が決める (`format.videoLossNote`)。測った値をそのまま持つので、出す条件を変えても録ってある分に効く
+     */
+    video_loss: json("video_loss", videoLoss),
+    /**
+     * v2.37 までに CM を切ってエンコードした録画の**残した区間** (入れ物の先頭からの秒)。NULL は切っていない。
+     * いまは CM を切らないので新しくは書かない (切らずに再エンコードしたら NULL に戻す)。
      * 切ったものからは CM を戻せないので、CM 検出のやり直しはこれを見て断る (再エンコードを促す)
      */
     cm_kept: json("cm_kept", objects<Range>()),
@@ -744,10 +858,10 @@ const ENCODE_STATES = [
  * エンコードの段階。`encode` 以外は ffmpeg が回る前の下ごしらえで、長いものだと
  * 数十分かかる。進み具合が出せない代わりにこれを状態として出す
  */
-export const ENCODE_PHASES = ["descramble", "cm", "cut", "encode"] as const;
+export const ENCODE_PHASES = ["descramble", "remux", "cm", "encode"] as const;
 
 /**
- * ジョブの種類。`encode` はエンコードする (CM 検出も一緒に行う)、`cm` は**CM 検出だけやり直す**
+ * ジョブの種類。`encode` はエンコードする (CM 検出も一緒にする)、`cm` は**CM 検出だけやり直す**
  * (エンコードしたものにはチャプターを書き直すだけ。`encoder.runCmJob`)。同じ待ち行列に並べ、同時に走る本数も一緒に数える
  */
 export const ENCODE_KINDS = ["encode", "cm"] as const;
@@ -761,10 +875,10 @@ export const encodeJobs = sqliteTable(
     state: text("state", { enum: ENCODE_STATES }).notNull().default("queued"),
     phase: text("phase", { enum: ENCODE_PHASES }).notNull().default("encode"),
     percent: real("percent").notNull().default(0),
-    /** 残り時間の見込み(ms)。ffmpeg の speed から出す。分からない間は NULL */
+    /** 残り時間の見込み (ms)。ffmpeg の speed から出す。分からない間は NULL */
     eta_ms: integer("eta_ms"),
     log: text("log").notNull().default(""),
-    /** ジョブを取り出した回数 (`encoder.pump`)。1 回の実行の中の ffmpeg の起こし直しは数えない (`config.encodeMaxAttempts`) */
+    /** ジョブを取り出した回数 (`encoder.pump`)。1 回の実行の中で ffmpeg を起動し直したぶんは数えない (`config.encodeMaxAttempts`) */
     attempts: integer("attempts").notNull().default(0),
     error: text("error"),
     created_at: integer("created_at").notNull(),
@@ -940,7 +1054,49 @@ export const niconicoLink = sqliteTable("niconico_link", {
 });
 
 /**
- * **ロゴを取りに行った記録** (`logo-record.ts`)。設定の「その他」の「ロゴの取得を記録する」(`recordLogo`) がオンの間だけ、
+ * **予約数ランキングへの参加** (`ranking.ts`。世帯で 1 つなので行は多くて 1 つ、`id` はいつも 1)。行があれば参加している。
+ *
+ * - トークンは denpa-hub が出したもの。denpa のサーバだけが持ち、端末と記録には出さない
+ * - 送る時刻は 6 時間の中の `slot` を家ごとに乱数で決め、毎回そこから ±15 分ずらす (`next_at`)
+ * - オフにしたら行ごと消す (送った票を hub で取り消してから)
+ */
+export const rankingLink = sqliteTable("ranking_link", {
+  id: integer("id").primaryKey(),
+  token: text("token").notNull(),
+  /** 6 時間の中で送る位置 (ms。0 以上 6 時間未満)。参加したときに乱数で決める */
+  slot: integer("slot").notNull(),
+  /** 次に送る時刻 (unix ms) */
+  next_at: integer("next_at").notNull(),
+  /** 最後に送れた時刻。まだなら null */
+  sent_at: integer("sent_at"),
+  /** 最後に送れなかった時刻。そのあと送れたら null に戻す */
+  failed_at: integer("failed_at"),
+  /** 送れなかったわけ。`unreachable` = 届かない・断られた、`disabled` = hub がランキングを受け付けていない (404) */
+  failure: text("failure", { enum: ["unreachable", "disabled"] }),
+  joined_at: integer("joined_at").notNull(),
+});
+
+/**
+ * **予約数ランキングに送った予約の控え** (`ranking.ts`)。次に送るときに、いまの予約と比べて差分 (add・remove) を作る。
+ * 送った中身 (時刻・番組名・局名・ジャンル・ルールの予約か手の予約か) は `digest` にまとめて持ち、変わったら送り直す。
+ * 始まった番組の行は hub に送らずに消す (hub は始まった番組を順位に入れない)
+ */
+export const rankingSent = sqliteTable(
+  "ranking_sent",
+  {
+    network_id: integer("network_id").notNull(),
+    service_id: integer("service_id").notNull(),
+    event_id: integer("event_id").notNull(),
+    /** 番組の始まり (unix ms) */
+    start_at: integer("start_at").notNull(),
+    /** 送った中身の SHA-256 (`ranking.ts` の `digest`) */
+    digest: text("digest").notNull(),
+  },
+  (t) => [primaryKey({ columns: [t.network_id, t.service_id, t.event_id] })],
+);
+
+/**
+ * **ロゴを取得した記録** (`logo-record.ts`)。設定の「その他」の「ロゴの取得を記録する」(`recordLogo`) がオンの間だけ、
  * 当たりの中継で待つたびに 1 行足す。衛星のロゴはダウンロードの期間にしか流れず、期間がいつ来るかは分からないので、
  * その来方 (間隔・長さ) を実測で知るためのもの (docs/logo.md「ロゴの取得を記録する」)。
  * 新しい順で `LOGO_RECORD_KEEP` 行・`LOGO_RECORD_DAYS` 日ぶんまで残し、古いものから消す
@@ -953,7 +1109,7 @@ export const logoRecords = sqliteTable(
     started_at: integer("started_at").notNull(),
     /** 開いた中継 (`BS15:16625` など) */
     channel: text("channel").notNull(),
-    /** 取りに行った経緯。`wait` = 空いたときに自分で開いた、`now` = 「ロゴをいますぐ集める」 */
+    /** 取得した経緯。`wait` = 空いたときに自分で開いた、`now` = 「ロゴをいますぐ集める」 */
     origin: text("origin").$type<"wait" | "now">().notNull(),
     /** 開いていた長さ (ms) */
     opened_ms: integer("opened_ms").notNull(),
@@ -975,3 +1131,56 @@ export const logoRecords = sqliteTable(
   },
   (t) => [index("logo_records_started").on(t.started_at)],
 );
+
+/**
+ * **エージェントが知らせた機材の異常** (`agent-faults.ts`。IT930x のブリッジの TS のバッファの溢れなど)。
+ * エージェントの記録はメモリと標準出力だけで、エージェントを入れ替えると消える。溢れた瞬間に何を選局していたかを
+ * あとから読むために、エージェントが送ってきた行 (`/denpa/events` の `fault`) を、その前の記録と一緒に残す (docs/tuner-it930x.md「TS のバッファの溢れ」)。
+ * 新しい順で `AGENT_FAULT_KEEP` 行・`AGENT_FAULT_DAYS` 日ぶんまで残し、古いものから消す
+ */
+export const agentFaults = sqliteTable(
+  "agent_faults",
+  {
+    id: integer("id").primaryKey({ autoIncrement: true }),
+    /** 知らせたエージェント (`agents.id`) */
+    agent_id: integer("agent_id").notNull(),
+    /** エージェントがその行を記録に出した時刻 (unix ms) */
+    at: integer("at").notNull(),
+    /** 記録の行 (「[PLEX PX-MLT8PE 3-1] 受信機 4 を選局したあとに TS のバッファが溢れていました …」) */
+    text: text("text").notNull(),
+    /** その前の記録 (`[{"at":ミリ秒,"text":"…"}]` の JSON。古い順) */
+    context: text("context").notNull().default("[]"),
+  },
+  (t) => [
+    // エージェントは、denpa が繋ぎ直すたびに直近のものを送り直すので、同じ行を重ねない
+    uniqueIndex("agent_faults_line").on(t.agent_id, t.at, t.text),
+    index("agent_faults_at").on(t.at),
+  ],
+);
+
+/**
+ * **つないだチューナーエージェント** (`agents.ts`。1 台 1 行)。
+ *
+ * - どのエージェントかは、組んだときに保存した証明書 (`cert`) で見分ける。URL と名前は変わってよい
+ * - `TUNER_AGENT_URL` に書いたもの (`from_env`) は、起動のたびに環境変数と突き合わせる。
+ *   環境変数から消したものは行も消す (環境変数が持ち主)
+ * - **組むときの合言葉は持たない。** 環境変数のものは環境変数から読む。DB は別の機械へ移すときの写しにも載るため
+ * - 別の機械へ移すときの写しからは消す (`transfer.ts`。組んだ相手は `tls/denpa.key` に結び付いていて、移した先では組み直す)
+ */
+export const agents = sqliteTable("agents", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  /** 画面に出す名前。エージェントが名乗る名前 (`agent-name.ts`)、名乗らない古いエージェントは URL のホスト名。設定で変えられる */
+  name: text("name").notNull(),
+  /** `https://ホスト:ポート` (`#` から後ろは持たない) */
+  origin: text("origin").notNull(),
+  /** 組んだときに保存したエージェントの証明書 (PEM)。組む前は null */
+  cert: text("cert"),
+  /** `cert` の指紋 (DER の SHA-256。小文字の 16 進)。組む前は null */
+  fingerprint: text("fingerprint").unique(),
+  /** `TUNER_AGENT_URL` に書いたものか */
+  from_env: flag("from_env").notNull(),
+  /** 並び。環境変数に書いた順が先 */
+  position: integer("position").notNull(),
+  /** 行を足した時刻 (unix ms) */
+  added_at: integer("added_at").notNull(),
+});

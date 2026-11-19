@@ -13,12 +13,12 @@
  *
  * **エンコードしたもの (fMP4) を canvas に描く経路もここで受ける** (`messages.ts` の `RawInput`)。
  * <video> の再生が止まる端末 (テスラの車載ブラウザ) のための経路で、映像は WebCodecs、音は
- * 同じ WASM (AAC・Opus) でデコードする。中身は `fmp4.ts`。時計・小窓・切り抜き・間に合っているかの判定はこことで共有する
+ * 同じ WASM (AAC・Opus) でデコードする。中身は `fmp4.ts`。時計・小窓・切り抜きと、間に合っているかの判定は MPEG-2 の経路と同じものを使う
  *
  * ## 貯めるのはデコードする前
  *
- * 貯め (0.2 秒〜) のぶんをデコードしたフレームで持つと、1080 のフレームは 1 枚 3MB あるので 1 秒で 90MB になる。
- * **圧縮のまま持っておき、番の少し前 (`AHEAD`) にデコードする。** デコードするのは実測で 1 コマ 3〜5ms (重いもので 10ms 近く)
+ * バッファ (0.2 秒〜) のぶんをデコードしたフレームで持つと、1080 のフレームは 1 枚 3 MB あるので 1 秒で 90 MB になる。
+ * **圧縮のまま持っておき、番の少し前 (`AHEAD`) にデコードする。** デコードするのは実測で 1 コマ 3〜5 ms (重いもので 10 ms 近く)
  * なので、0.3 秒前に始めれば間に合う。デコードできたフレームはデコーダの中で順番待ちさせる
  * (`dec_peek` / `dec_pop`)。
  *
@@ -44,9 +44,24 @@ import {
 } from "@danything/arib/pes";
 
 import { DecodeBudget } from "./budget";
-import { fieldAt, type Shown, SmoothClock, Vsync, VsyncClock } from "./cadence";
+import {
+  COST_SAMPLES,
+  fieldAt,
+  mayDecode,
+  type Shown,
+  SmoothClock,
+  Vsync,
+  VsyncClock,
+} from "./cadence";
 import { downscale } from "./downscale";
-import { Fmp4Video, FOLLOW_BYTES_MOST } from "./fmp4";
+import {
+  AHEAD,
+  BEHIND_MOST,
+  Fmp4Video,
+  FOLLOW_BYTES_MOST,
+  newestKey,
+  PENDING_MOST,
+} from "./fmp4";
 import type { FromWorker, GrabSize, RawInput, ToWorker } from "./messages";
 import { MkvInput } from "./mkv";
 import { YuvRenderer } from "./render";
@@ -60,35 +75,34 @@ import {
 
 const scope = self as unknown as DedicatedWorkerGlobalScope;
 
-/** 番のこれだけ前からデコードする (90kHz)。デコードするのは重いコマでも 10ms 近く */
-const AHEAD = 0.3 * CLOCK;
 /**
- * デコードできたフレームを待たせる上限。**これ以上は先にデコードしない** (1 枚 3MB)。
+ * デコードできたフレームを待たせる上限。**これ以上は先にデコードしない** (1 枚 3 MB)。
  * 実測 (`tests/bench`。docs/stream.md#デコードしたフレームを持つ数) では、1 回に 1 枚ずつデコードするので
  * 待たせるのは多くて 3〜5 枚で、8 にも届かない。2 だと追いつかずに毎秒 30 フィールド前後まで落ちた。
- * WASM のメモリは最初の 64MB のまま増えないので、上げても下げても使う量は変わらない。
+ * WASM のメモリは伸ばせる (Dockerfile の `ALLOW_MEMORY_GROWTH`) が、測った範囲ではどの値でも最初の 64 MB から増えなかった。
  * fMP4 の `DECODED_MOST` (fmp4.ts) と同じ数だが、数えているもの (あちらは GPU の VideoFrame) も決め手も違う
  */
 const DECODED_MOST = 8;
-/** 圧縮のまま持っておく上限 (90kHz)。止めている間に溜め込まない */
-const PENDING_MOST = 8 * CLOCK;
-/** これだけ遅れたら、デコードしながら追いつくのをやめて I フレームまで飛ぶ (90kHz) */
-const BEHIND_MOST = 0.5 * CLOCK;
-/** 1 コマの長さの目安 (90kHz)。29.97 コマ。実際の間隔が分かればそれを使う */
+/** 1 コマの長さの目安 (90 kHz)。29.97 コマ。実際の間隔が分かればそれを使う */
 const FRAME = 3003;
 /**
- * 録画 (`follow`) で圧縮のまま持っておく上限。**時間 (90kHz) とバイト数の小さいほう。** 読む側
+ * 録画 (`follow`) で圧縮のまま持っておく上限。**時間 (90 kHz) とバイト数の小さいほう。** 読む側
  * (`canvas-player.ts`) が先へ読みすぎないようにしているので、ふつうは届かない。超えたら受け取るのを
  * やめて `full` を返す (fMP4 の `FOLLOW_AHEAD_MOST` と同じ考え)。バイト数は fMP4 と同じ `FOLLOW_BYTES_MOST`
  */
 const FOLLOW_PENDING_MOST = 30 * CLOCK;
-/** 飛び先より手前をデコードして捨てるとき、1 回の刻みでデコードする上限 (1 枚は重いもので 10ms 近く) */
+/** 飛び先より手前をデコードして捨てるとき、1 回の刻みでデコードする上限 (1 枚は重いもので 10 ms 近く) */
 const UNDER_PER_TICK = 4;
 
 /** デコーダ (`wasm/decoder.c`)。音とメモリの関数は `wasm-audio.ts` */
 interface Decoder extends AudioDecoder {
   _dec_open(): number;
   _dec_push(data: number, length: number, pts: number): number;
+  /**
+   * I フレームを別のデコーダでその場で 1 枚出す (`still`)。前のバージョンのデコーダ (オフラインで観るときに
+   * service worker が持っているもの) には無い
+   */
+  _dec_still?(data: number, length: number, pts: number): number;
   _dec_count(): number;
   _dec_peek(): number;
   _dec_peek_pts(): number;
@@ -102,7 +116,8 @@ interface Pending {
   pts: number;
   dts: number;
   data: Uint8Array;
-  intra: boolean;
+  /** I フレームか */
+  key: boolean;
 }
 
 let decoder: Decoder | null = null;
@@ -124,6 +139,8 @@ const clock = new SmoothClock();
 const vsync = new Vsync();
 /** 画面の切り替わりごとの PTS (`cadence.ts`) */
 const locked = new VsyncClock();
+/** 直近にデコードした 1 枚ずつの時間 (ms)。デコードを始めてよいかの見積もりに使う (`mayDecode`) */
+let recentCost: number[] = [];
 /** いま出しているコマ */
 let current: Shown | null = null;
 /** 描く先。小窓へ書き込むときに、描いたものをここから写す (`toPip`) */
@@ -143,7 +160,7 @@ let shownSinceReset = false;
 let failed = false;
 /** 放送の今を追わないか (追っかけ・録画。`messages.ts` の `follow`)。`init` で決まる */
 let follow = false;
-/** 録画で抱えきれなくなったか。**次の `reset` (リクエストし直し) まで、届いたものは捨てる** */
+/** 録画で抱えきれなくなったか。**リクエストし直して `reset` が来るまで、届いたものは捨てる** */
 let overflowed = false;
 /** 圧縮のまま持っているバイト数 (`FOLLOW_BYTES_MOST`) */
 let pendingBytes = 0;
@@ -176,7 +193,7 @@ let early: Uint8Array[] | null = [];
 let earlyBytes = 0;
 /** `early` を溜めている間に末尾まで届いた (`end`)。溜めたぶんを渡しきってから出しきる */
 let earlyEnd = false;
-/** `early` に溜める上限 (箱の数)。1 秒に 20 個ほど来るので、読み込みが 10 秒掛かっても足りる */
+/** `early` に溜める上限 (ボックスの数)。1 秒に 20 個ほど来るので、読み込みが 10 秒掛かっても足りる */
 const EARLY_MOST = 200;
 let dropped = 0;
 let shown = 0;
@@ -198,10 +215,11 @@ function postSize(): void {
   post({ type: "size", width, height });
 }
 
-function fail(reason: string): void {
+/** 使えなくなったと画面に伝える (1 回だけ)。`slow` は間に合わずに打ち切ったときの、掛かった条件 (`DecodeBudget.why`) */
+function fail(reason: string, slow?: string): void {
   if (failed) return;
   failed = true;
-  post({ type: "fail", reason });
+  post({ type: "fail", reason, slow });
 }
 
 /** 描く道具を用意できなかった */
@@ -254,7 +272,7 @@ function onVideo(pes: Pes): void {
   const pts =
     pes.pts === null ? (last?.pts ?? 0) + frameTicks : extend(pes.pts);
   const dts = pes.dts === null ? pts : extend(pes.dts);
-  pending.push({ pts, dts, data: pes.data, intra });
+  pending.push({ pts, dts, data: pes.data, key: intra });
   pendingBytes += pes.data.length;
   if (follow) {
     /*
@@ -308,11 +326,7 @@ function dropUnder(): void {
  * 飛ばしたコマを参照するフレームを出させないため
  */
 function skipTo(target: number): void {
-  let found = -1;
-  for (let i = 0; i < pending.length; i++) {
-    if (pending[i]!.dts > target) break;
-    if (pending[i]!.intra) found = i;
-  }
+  const found = newestKey(pending, target);
   if (found <= 0) return;
   pending = pending.slice(found);
   pendingBytes = pending.reduce((sum, item) => sum + item.data.length, 0);
@@ -371,9 +385,23 @@ function decodeAudio(audio: WasmAudio, data: Uint8Array, pts: number): void {
 function decode(item: Pending): void {
   if (decoder === null) return;
   input = ensure(decoder, input, item.data.length);
+  // 取れなければ捨てる (アドレス 0 へ書かせない。`ensure`)
+  if (input.pointer === 0) return;
   decoder.HEAPU8.set(item.data, input.pointer);
   decoder._dec_push(input.pointer, item.data.length, item.pts);
-  budget.record(decoder._dec_last_ms());
+  const ms = decoder._dec_last_ms();
+  budget.record(ms);
+  recentCost.push(ms);
+  if (recentCost.length > COST_SAMPLES) recentCost.shift();
+}
+
+/**
+ * `decode` したばかりの I を、別のデコーダでその場で 1 枚出させる (`wasm/decoder.c` の `dec_still`)。**選局したての 1 枚目だけ**。
+ * WASM のメモリには `decode` が写したものがそのまま残っているので、写し直さない。デコードの重さ (`budget`) には数えない
+ */
+function still(item: Pending): void {
+  if (decoder?._dec_still === undefined || input.pointer === 0) return;
+  decoder._dec_still(input.pointer, item.data.length, item.pts);
 }
 
 /** いちばん古いデコードできたフレームをテクスチャへ上げて、`current` にする */
@@ -471,13 +499,13 @@ function toPip(): void {
   }
   const writer = pip;
   writer.write(frame).catch(() => {
-    // 受け手が畳まれた (小窓のストリームを止めた・変換しない経路を出た)。もう書かない
+    // 受け手が閉じた (小窓のストリームを止めた・変換しない経路を出た)。もう書かない
     frame.close();
     if (pip === writer) pip = null;
   });
 }
 
-/** 刻むたびに: 番の近いものをデコードし、番が来たコマを出す */
+/** 刻むたびに呼ぶ。番の近いものをデコードし、番が来たコマを出す */
 function tick(): void {
   if (decoder === null || failed) return;
   schedule();
@@ -501,21 +529,25 @@ function tick(): void {
   /*
    * **新しい局の 1 枚目は、デコードできたらすぐ出して待つ**。前の局の映像のまま新しい局の音を
    * 聞かせると、見えているものと聞こえるものが食い違う。音の時計が動き出していても
-   * 待たない: 放送の映像は音より先に届く (VBV の遅れ) ので、番を待つと 1 枚目が
+   * 待たない。放送の映像は音より先に届く (VBV の遅れ) ので、番を待つと 1 枚目が
    * 0.5〜2 秒遅れていた (本番の実測)。番が来るまではこの 1 枚のまま止めておく。
    *
    * **録画で飛んだあとは、飛び先より前をデコードして捨てる** (`floor`)。それまでは前のフレームのまま
    * (CM を飛ばしたなら本編の映像のまま)。1 回にデコードするのは `UNDER_PER_TICK` 枚まで
+   *
+   * **1 枚目の I は、デコーダが出すのを待たずに出す** (`still`)。デコーダは次の参照フレーム (P) を読むまで
+   * I を出さないので、届いてから 4 コマぶん (0.13 秒ほど) 待っていた
    */
   if (!shownSinceReset) {
-    const limit =
-      floor !== null || floorRaw !== null
-        ? UNDER_PER_TICK
-        : Number.POSITIVE_INFINITY;
+    const seeking = floor !== null || floorRaw !== null;
+    const limit = seeking ? UNDER_PER_TICK : Number.POSITIVE_INFINITY;
     for (let i = 0; ; i++) {
       dropUnder();
       if (decoder._dec_count() > 0 || pending.length === 0 || i >= limit) break;
-      decode(shift());
+      const item = shift();
+      decode(item);
+      // 飛び先より前の I は描かないので、先に出させない
+      if (item.key && !seeking && decoder._dec_count() === 0) still(item);
     }
     if (decoder._dec_count() > 0) {
       take();
@@ -531,18 +563,27 @@ function tick(): void {
 
   /*
    * **先に出す。描いた回はデコードしない**。描いたものはその回の終わりに画面へ渡るので、続けて
-   * デコードする (1 枚は重いもので 10ms 近く) と回が延び、次の画面の切り替わりに間に合わないことがある。
+   * デコードする (1 枚は重いもので 10 ms 近く) と回が延び、次の画面の切り替わりに間に合わないことがある。
    * 番のコマがまだデコードできていなければ、デコードしてから出す
    */
   if (!present(decoder, at)) {
     /*
-     * **1 回にデコードするのは 1 枚まで** (遅れているときだけ 3 枚まで)。1 枚は重いもので 10ms 近くかかるので、
+     * **1 回にデコードするのは 1 枚まで** (遅れているときだけ 3 枚まで)。1 枚は重いもので 10 ms 近くかかるので、
      * まとめてデコードするとその間コマを出せず、番を過ぎて捨てるコマが増える。
-     * 先にデコードしたものがあるうちは、画面の切り替わりの直後にだけ始める (`Vsync.settled`)
+     * 先にデコードしたものがあるうちは、描くものが次に変わる画面の切り替わりまでにデコードを終えて描けるときだけ始める
+     * (`mayDecode`。同じフィールドを続けて出す切り替わりはまたいでよい)
      */
     const ready =
       decoder._dec_count() === 0 ||
-      vsync.settled(performance.timeOrigin + performance.now());
+      mayDecode(
+        vsync,
+        performance.timeOrigin + performance.now(),
+        at,
+        current,
+        frameTicks,
+        recentCost,
+        decoder._dec_count(),
+      );
     for (
       let i = 0;
       ready &&
@@ -560,10 +601,19 @@ function tick(): void {
   }
 
   // 映像が時計からどれだけ遅れているか。**デコードできたフレームが無いまま番を過ぎている**ぶん
-  const late =
+  const behind =
     current === null || decoder._dec_count() > 0
       ? 0
       : Math.max(0, (at - current.pts - frameTicks) / CLOCK);
+  /*
+   * **遅れていてもデコードするデータが届いていないなら、回線の詰まり** (`starved`)。デコードが間に合わないのとは
+   * 分けて、B を飛ばしはじめる (`thin`) のにも、エンコードしたものに戻る (`budget.ts`) のにも数えない。
+   * 届いたあとは番を過ぎたコマをまとめて捨てて追いつくので、そのあいだ (`BACK_GRACE`) も数えない。
+   * 家の中の Wi-Fi で放送のまま (約 17 Mbit/s) 受けると一瞬の詰まりは起きやすく、数えると変換した映像へ早めに戻っていた
+   */
+  const starved = behind > 0 && (pending.length === 0 || pending[0]!.dts > at);
+  if (starved) starve();
+  const late = starved ? 0 : behind;
   thin(decoder, late);
   watch(
     late,
@@ -598,7 +648,7 @@ let thinCheckAt = 0;
 let thinDropped = 0;
 
 /**
- * 飛ばすのをやめて、数え直す。局を変えたとき (`reset`) と、裏から戻ったとき。
+ * 飛ばすのをやめて、数え直す。局を変えたとき (`reset`) と、裏から戻った・再開したとき (`catchUp`)。
  * **戻った直後は追いつくまでコマを捨てる** (飛び先の I まで捨て、番を過ぎたものも捨てる) ので、それを
  * 「間に合っていない」と数えると、戻るたびに B を飛ばしはじめていた。`grace` (ms) のあいだは数えない
  */
@@ -619,6 +669,17 @@ function resetThin(grace = 0): void {
 function catchUp(): void {
   resetThin(BACK_GRACE);
   budget.reset(performance.now() + BACK_GRACE);
+}
+
+/**
+ * 回線が詰まって、デコードするデータが届いていない (`tick` の `starved`)。届いて追いつくまで (`BACK_GRACE`) は、
+ * 捨てたコマも遅れも数えない。`catchUp` と違って、B を飛ばしている最中ならそのまま続け、打ち切りの回数も残す
+ */
+function starve(): void {
+  const until = performance.now() + BACK_GRACE;
+  if (thinCheckAt < until) thinCheckAt = until;
+  thinDropped = dropped;
+  budget.pause(until);
 }
 
 function thin(decoder: Decoder, late: number): void {
@@ -685,7 +746,7 @@ function watch(
 ): void {
   const wall = performance.now();
   if (budget.tick(wall, (frame / CLOCK) * 1000, late, queued, dropped, stretch))
-    fail(reason);
+    fail(reason, budget.why());
   report();
 }
 
@@ -708,7 +769,7 @@ function schedule(): void {
   /*
    * **rAF ではなく細かい時計で刻む。** worker の rAF は描いたものが画面に出る速さに
    * 引っ張られ、実機の録画 (1080i) をヘッドレスで流すと毎秒 6 回しか来なかった。1 回に
-   * 何枚もデコードすることになり、コマを出す番を逃し続ける。4ms ごとに 1 枚ずつデコードして、番が来た
+   * 何枚もデコードすることになり、コマを出す番を逃し続ける。4 ms ごとに 1 枚ずつデコードして、番が来た
    * コマを出す (描いたものはその回の終わりに画面へ渡る)
    */
   setTimeout(next, 4);
@@ -732,6 +793,7 @@ function reset(from: number | null): void {
   current = null;
   drawn = { pts: Number.NaN, field: Number.NaN };
   lastFramePts = null;
+  recentCost = [];
   shownSinceReset = false;
   budget.reset();
   mkv?.reset();
@@ -867,13 +929,22 @@ async function init(
   for (const bytes of held) feed(bytes);
   if (earlyEnd) {
     earlyEnd = false;
-    mkv?.finish();
+    finish();
   }
   post({ type: "ready" });
   schedule();
 }
 
-/** 届いたものを読む (fMP4 は箱ごと、Matroska は要素ごと、TS は PES に組んで) */
+/**
+ * 末尾まで読んだ。Matroska は待たせているコマを出しきり (`mkv.ts`)、fMP4 と Matroska の映像はデコーダに
+ * 残ったフレームを出させる (`fmp4.ts` の `finish`)
+ */
+function finish(): void {
+  mkv?.finish();
+  fmp4?.finish();
+}
+
+/** 届いたものを読む (fMP4 はボックスごと、Matroska は要素ごと、TS は PES に組んで) */
 function feed(bytes: Uint8Array): void {
   if (mode === "fmp4") {
     fmp4?.feed(bytes);
@@ -883,10 +954,10 @@ function feed(bytes: Uint8Array): void {
     mkv?.feed(bytes);
     return;
   }
-  // 録画で抱えきれなくなった。リクエストし直し (`reset`) まで受け取らない
+  // 録画で抱えきれなくなった。リクエストし直して `reset` が来るまで受け取らない
   if (overflowed) return;
-  const { pes, changed } = demuxer.feed(bytes);
-  if (changed) demuxer.selectAudio(audioIndex);
+  // PMT が変わったときの音声の選び直しは `PesDemuxer` が持つ (`audioIndex` を写してある)
+  const { pes } = demuxer.feed(bytes);
   for (const item of pes) {
     if (item.kind === "video") onVideo(item);
     else onAudio(item);
@@ -938,12 +1009,12 @@ scope.onmessage = (event: MessageEvent<ToWorker>) => {
     case "end":
       // 末尾まで読んだ。デコーダを読み終えるまでは溜めたぶんの後ろで (`early`)
       if (early !== null) earlyEnd = true;
-      else mkv?.finish();
+      else finish();
       break;
     case "audio":
       // エンコードしたものには選んだ音声 1 本しか入っていない (選び直すとサーバが再エンコードする)
       if (mode === "mkv") {
-        // 保存した録画はトラックを選び直す (次のリクエストし直しから効く。画面がリクエストし直す)
+        // 保存した録画はトラックを選び直す (画面がリクエストし直したときから効く)
         mkv?.selectAudio(message.index);
         break;
       }

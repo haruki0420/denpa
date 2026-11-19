@@ -1,8 +1,8 @@
 /**
  * **この端末で元の TS をデコードできるか** (docs/stream.md#放送そのままmpeg-2を送る)。デコードできなければ理由を返す。
  *
- * 要るのは 5 つ: WebAssembly (MPEG-2 と AAC のデコーダ)、worker、worker へ渡す OffscreenCanvas と、その中の WebGL2 (描く)、
- * AudioContext (鳴らす)。AAC も WASM でデコードするので、WebCodecs (AudioDecoder) は要らない。
+ * 要るのは WebAssembly (MPEG-2 と AAC のデコーダ)、worker、worker へ渡す OffscreenCanvas と、その中の WebGL2 (描く)、
+ * AudioContext (鳴らす) の 5 つ。AAC も WASM でデコードするので、WebCodecs (AudioDecoder) は要らない。
  * http で開いた LAN や、AudioDecoder の無い iPhone の Safari (iOS 26 まで) でも変換せずに送れる。
  *
  * 1 つでも欠けていれば、MPEG-2 を選んでも画面はエンコードしたものをリクエストする。
@@ -56,7 +56,7 @@ export interface CanvasSupport {
  *
  * **H.265 は問い合わせない。** 互換モードは H.265 を選ばず、サーバにも描けるものとして渡さない。ライブ・追っかけは
  * `live-player.svelte.ts` の `canvasCan` (段を下げたときの `playable` も同じ)、録画の観る画面は `ts/playback.ts` の
- * `CanvasCodec` と `canvasPlayable`、端末に保存した録画は `mkv-source.ts` (H.264 と AV1 しか読まない) で外している
+ * `CanvasCodec` と `routes/watch/[id]/+page.svelte` の `canvasPlayable`、端末に保存した録画は `mkv-source.ts` (H.264 と AV1 しか読まない) で外している
  */
 const PROBE = { h264: "avc1.640029", av1: "av01.0.08M.08" } as const;
 

@@ -20,7 +20,7 @@ test.describe("ルールの一覧", () => {
     await clearRules(page);
   });
 
-  test("1件も無いときは、検索から作れると案内する", async ({ page }) => {
+  test("1 件も無いときは、検索から作れると案内する", async ({ page }) => {
     await goto(page, "/rules");
     await expect(page.getByTestId("rule-empty")).toContainText(
       "ルールとして保存",
@@ -29,7 +29,7 @@ test.describe("ルールの一覧", () => {
     await page.waitForURL(/\/search$/);
   });
 
-  test("行に条件・次の放送・予約の数を出し、スイッチで止め、2回押しで消す", async ({
+  test("行に条件・次の放送・予約の数を出し、スイッチで止め、2 回押しで消す", async ({
     page,
   }) => {
     await page.setViewportSize({ width: 1440, height: 900 });
@@ -50,18 +50,18 @@ test.describe("ルールの一覧", () => {
     // 条件は 1 行で。局の名前・同じ回・除外
     await expect(anime).toContainText(`番組名、${BS11.name}`);
     await expect(none).toContainText("全局、同じ回は 1 度、除外: 再放送");
-    // 次の放送と予約の数。当たらないルールは「予定なし」
+    // 次の放送と予約の数。当たらないルールは「次の放送なし」
     await expect(anime.getByTestId("rule-next")).toContainText(BS11.name);
     await expect(anime.getByTestId("rule-reservations")).not.toHaveText("0");
-    await expect(none.getByTestId("rule-next")).toHaveText("予定なし");
+    await expect(none.getByTestId("rule-next")).toHaveText("次の放送なし");
     await expect(page.getByTestId("rule-summary")).toContainText(
       /これから 7 日の予約\s*\d+ 件/,
     );
-    // 広い画面では絞り込み・並び・集計は右のサイドバー。細い帯は出さない
+    // 広い画面では絞り込み・並び・集計は右のサイドバー。細い 1 行は出さない
     await expect(page.getByTestId("rule-sidebar")).toBeVisible();
     await expect(page.getByTestId("rule-bar")).toBeHidden();
 
-    // 既定は次の放送が近い順 (予定なしは下)
+    // 既定は次の放送が近い順 (次の放送なしは下)
     await expect(rows.first()).toContainText("テストアニメ");
     await page.getByTestId("rule-sort-new").click();
     await expect(rows.first()).toContainText("どこにも無い番組");
@@ -106,13 +106,13 @@ test.describe("ルールの一覧", () => {
   /**
    * **狭い画面では 2 段の行。** 1 段目に名前とスイッチ・削除、2 段目に次の放送と予約・録画の数。横にはみ出さない
    */
-  test("狭い画面では2段の行にする", async ({ page }) => {
+  test("狭い画面では 2 段の行にする", async ({ page }) => {
     await page.setViewportSize({ width: 390, height: 844 });
     await makeRule(page, "どこにも無い番組");
     await goto(page, "/rules");
     const row = page.getByTestId("rule-row").first();
     await expect(row).toContainText(/予約\s*0\s*・\s*録画\s*0/);
-    // 絞り込みと並びは細い帯にまとめ、画面の下 (タブのすぐ上) に置く
+    // 絞り込みと並びは細い 1 行にまとめ、画面の下 (タブのすぐ上) に置く
     const bar = await page.getByTestId("rule-bar").boundingBox();
     expect(bar?.y ?? 0).toBeGreaterThan(844 / 2);
     await expect(page.getByTestId("rule-bar-filter-all")).toBeInViewport();
@@ -158,7 +158,7 @@ test.describe("ルールの一覧", () => {
     expect(Math.round((side?.y ?? 0) + (side?.height ?? 0))).toBe(768);
     await expect(page.getByTestId("rule-new")).toBeInViewport({ ratio: 1 });
 
-    // 絞り込みを替えても (当たる行が同じなら) 見ていた所から跳ばない
+    // 絞り込みを替えても (当たる行が同じなら) 見ていた所から飛ばない
     const before = await page.evaluate(() => scrollY);
     await page.getByTestId("rule-filter-on").click();
     await expect(page.getByTestId("rule-filter-on")).toHaveAttribute(

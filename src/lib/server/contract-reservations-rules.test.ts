@@ -5,7 +5,8 @@ import { join } from "node:path";
 
 import { eq } from "drizzle-orm";
 
-import { fakeAgentTls, fakeAgentUrl, trustFakeAgent } from "./fake-agent";
+import { fakeAgentTls, fakeAgentUrl } from "./fake-agent";
+import { trustFakeAgent } from "./fake-agent-trust";
 
 /*
  * 自動予約は、有料の番組を契約中と確かめた局のものだけ録る (contracts.paidAllowed・rules.PaidAllowed)。
@@ -77,7 +78,6 @@ describe("契約状態と予約作成 (reservations.ts)", () => {
         network_id: 4,
         name: "有料CS局A",
         type: "CS",
-        channel: "CS1",
         updated_at: 0,
       })
       .run();
@@ -123,7 +123,6 @@ describe("契約状態と予約作成 (reservations.ts)", () => {
         network_id: 4,
         name: "有料CS局A",
         type: "CS",
-        channel: "CS1",
         updated_at: 0,
       })
       .run();
@@ -169,7 +168,6 @@ describe("契約状態と予約作成 (reservations.ts)", () => {
         network_id: 4,
         name: "未契約CS局B",
         type: "CS",
-        channel: "CS2",
         updated_at: 0,
       })
       .run();
@@ -219,7 +217,6 @@ describe("番組表での契約警告 (guide.ts)", () => {
         network_id: 4,
         name: "BS有料局",
         type: "BS",
-        channel: "BS1",
         updated_at: 0,
       })
       .run();
@@ -287,7 +284,6 @@ describe("自動録画ルールの局優先度とチューナー競合解決 (ru
           network_id: 4,
           name: "期限切れCS",
           type: "CS",
-          channel: "CS1",
           updated_at: 0,
         },
         {
@@ -296,7 +292,6 @@ describe("自動録画ルールの局優先度とチューナー競合解決 (ru
           network_id: 4,
           name: "契約中BS",
           type: "BS",
-          channel: "BS2",
           updated_at: 0,
         },
       ])
@@ -391,7 +386,6 @@ describe("自動録画ルールの局優先度とチューナー競合解決 (ru
           network_id: 4,
           name: "期限切れCS",
           type: "CS",
-          channel: "CS1",
           updated_at: 0,
         },
         {
@@ -400,7 +394,6 @@ describe("自動録画ルールの局優先度とチューナー競合解決 (ru
           network_id: 4,
           name: "無料BS局",
           type: "BS",
-          channel: "BS11",
           updated_at: 0,
         },
       ])
@@ -481,7 +474,6 @@ describe("自動録画ルールの局優先度とチューナー競合解決 (ru
         network_id: 4,
         name: "確かめていないCS",
         type: "CS",
-        channel: "CS3",
         updated_at: 0,
       })
       .run();
@@ -544,7 +536,6 @@ describe("自動録画ルールの局優先度とチューナー競合解決 (ru
           network_id: 4,
           name: "期限切れ有料局",
           type: "CS",
-          channel: "CS1",
           updated_at: 0,
         },
         {
@@ -553,7 +544,6 @@ describe("自動録画ルールの局優先度とチューナー競合解決 (ru
           network_id: 4,
           name: "無料BS局",
           type: "BS",
-          channel: "BS2",
           updated_at: 0,
         },
       ])
@@ -660,7 +650,6 @@ function paidAiring(serviceId: number): void {
       network_id: 4,
       name: `CS${serviceId}`,
       type: "CS",
-      channel: `CS${serviceId}`,
       updated_at: 0,
     })
     .run();

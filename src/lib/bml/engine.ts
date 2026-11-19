@@ -8,19 +8,23 @@
  *     bml.destroy();
  *
  * - 映像は動かさない。映像の object の場所を `onVideoRect` で知らせ、置くのは呼ぶ側
- * - 文書は自前の XML パーサ → 中身の木 → Shadow DOM の中の絶対配置の div ([render.ts](render.ts))
+ * - 文書は自前の XML パーサ → 中身の木 → Shadow DOM に置いた絶対配置の div ([render.ts](render.ts))
  * - スクリプトは自前の VM ([vm.ts](vm.ts))。イベントは 1 つずつ順に動かす
- * - **ページを占めるのは 1 つの仕事 (タスクとそれに続くマイクロタスク) で 5ms まで** ([budget.ts](budget.ts))。
- *   スクリプト・描き直し・約束の続きは全部その下で動かし、休みなく回り続ける文書は止める
+ * - **ページを占めるのは 1 つの仕事 (タスクとそれに続くマイクロタスク) で 5 ms まで** ([budget.ts](budget.ts))。
+ *   スクリプト・描き直し・Promise の続きは全部その下で動かし、休みなく回り続ける文書は止める
  *
- * 時計は `clock` (録画は再生位置から放送の時刻を出す)。無ければ TOT + 経過時間。
+ * 時計は `clock` (録画は再生位置から放送の時刻を出す)。無ければ TOT + 経過時間 (TOT が来なくなったら、30 秒たった所で止める)。
  */
 
 import type {
+  ComponentPMT,
   ProgramInfoMessage,
   ResponseMessage,
 } from "@danything/arib/bml-protocol";
 import { ascii, u16 } from "@danything/arib/bytes";
+import { STREAM_AAC } from "@danything/arib/psi";
+
+import { autoStarts } from "#lib/ts/data-auto-start.js";
 
 import {
   type BmlIp,
@@ -34,7 +38,7 @@ import { DEFAULT_CLUT, readClut, type Rgba } from "./clut";
 import { type Code, compileScript } from "./compiler";
 import { parseStylesheet, parseUrl, type Rule } from "./css";
 import { BmlDocument, type BmlElement } from "./document";
-import { Dom, type DomHost } from "./dom";
+import { Dom, type DomHost, numberAttr } from "./dom";
 import { fontIdOf, parseDrcs } from "./drcs";
 import { decodeEuc } from "./euc";
 import { parseMng } from "./mng";
@@ -113,6 +117,14 @@ export interface BmlOptions {
    */
   onTune?: (service: Service) => boolean;
   /**
+   * 文書が主音声を替えた (映像の object の `setMainAudioStream`。STD-B24 第二編)。**替えるのは呼ぶ側。**
+   * 渡すのは、PMT にある音声の ES の何本目か (0 から。ライブの音声 `N:es` の N)。null はふだんの音声に戻す。
+   * 番組が替わって選んだ ES が無くなったときも null
+   */
+  onMainAudio?: (index: number | null) => void;
+  /** `getIRDID(type)` の答え (`browser.ts` の `BrowserHost.irdId`)。無ければいつも null */
+  irdId?: (type: number) => string | null;
+  /**
    * Hybridcast (startAITControlledApp)。**開くのは呼ぶ側。** `ready` は開けるか (双方向がオンで、
    * AIT にアプリがある)、`start` は開く (開けたら true)。`hint` は文書が渡した数 (どのアプリかの
    * 手がかり)。無ければ AIT の問い合わせに 0 と答え、起動は失敗を返す。
@@ -157,7 +169,7 @@ export interface Bml {
   destroy(): void;
 }
 
-/** AribKeyCode (STD-B24 第二分冊 付属 2 表 5-9) */
+/** AribKeyCode (STD-B24 第二編 付属 2 表 5-9) */
 const KEY = {
   up: 1,
   down: 2,
@@ -171,12 +183,14 @@ const KEY = {
   red: 22,
   green: 23,
   yellow: 24,
-  data1: 25,
-  data2: 26,
 } as const;
 
-/** キーの組 (TR-B14 第二分冊 5.3.1 表 5-5)。used-key-list で受けるかを決める */
-function keyGroup(code: number): string | null {
+/**
+ * キーの組 (TR-B14 第二分冊 5.3.1 表 5-5)。used-key-list で受けるかを決める。
+ * データ 1・データ 2 (25・26。accesskey の E・F) はどの組にも無いので、文書には届かない
+ * (web-bml の `keyCodeToKeyGroup` も同じ表)。d (20) は組を見ずに DataButtonPressed だけを起こす (`key`)
+ */
+export function keyGroup(code: number): string | null {
   if (code >= KEY.up && code <= KEY.right) return "basic";
   if (code === KEY.enter || code === KEY.back) return "basic";
   if (code >= KEY.blue && code <= KEY.yellow) return "data-button";
@@ -184,15 +198,13 @@ function keyGroup(code: number): string | null {
   return null;
 }
 
-/** accesskey の字 (付属 2 5.4.2.3) */
+/** accesskey の字 (付属 2 5.4.2.3)。E・F (データ 1・2) のキーは組に無く届かないので持たない (`keyGroup`) */
 const ACCESS_KEYS: Record<number, string> = {
   [KEY.back]: "X",
   [KEY.blue]: "B",
   [KEY.red]: "R",
   [KEY.green]: "G",
   [KEY.yellow]: "Y",
-  [KEY.data1]: "E",
-  [KEY.data2]: "F",
 };
 
 /*
@@ -200,12 +212,19 @@ const ACCESS_KEYS: Record<number, string> = {
  * 止まらずに来る (NHK は 10 分で DII の更新 48 回・イベントメッセージ 4234 件)。文書が
  * 後始末をしなくても、エンジンが持つものは一定に収める
  */
-/** 待っているイベントの上限 (溢れた受け手は捨てる) */
+/** 待っているイベントの上限 (溢れたハンドラは捨てる) */
 export const MAX_QUEUE = 512;
 /** 同時に動かすタイマー (setInterval) の上限。超えたら NaN (本番の局は 2 つほど) */
 export const MAX_TIMERS = 64;
 /** 「1 回だけ知らせる」ために覚えておく数 */
 const MAX_REPORTED = 256;
+/**
+ * 取得を待っている画像と、「無い」と決めた画像を持つ数 (それぞれ)。画像のキーはモジュールとファイルの組なので、
+ * 文書を移るたびに別のキーが増えうる。1 つの文書が描く画像の数より十分大きくする。
+ * 待ちが上限なら新しい取得を始めず、待ちが 1 つ終わったら描き直して取得する。「無い」は古いものから消す。
+ * 消した画像は、次に描くときに 1 回取得し直して、すぐ「無い」に戻る
+ */
+export const MAX_IMAGES = 256;
 
 type Job =
   | {
@@ -237,7 +256,7 @@ interface Timer {
   interval: number;
   remaining: number;
   handle: ReturnType<typeof setInterval> | null;
-  /** 積んだ受け手がまだ動いていない (重ねて積まない) */
+  /** 積んだハンドラがまだ動いていない (重ねて積まない) */
   queued: boolean;
 }
 
@@ -251,8 +270,10 @@ function looksLikeBml(file: CarouselFile): boolean {
   return /<bml[\s>]/i.test(ascii(file.data, 0, 1024));
 }
 
-/** JPEG の大きさ (SOF) */
-function jpegSize(data: Uint8Array): { width: number; height: number } | null {
+/** JPEG の画像の大きさ (SOF)。描く大きさは render.ts の `jpegSize` */
+function jpegDimensions(
+  data: Uint8Array,
+): { width: number; height: number } | null {
   let at = 2;
   while (at + 9 < data.length) {
     if (data[at] !== 0xff) return null;
@@ -278,7 +299,7 @@ function blobUrl(data: Uint8Array, type: string): string {
 }
 
 /**
- * 受け手の `f();` の形 (関数を呼ぶだけのもの) なら、その名前。無ければ null。
+ * ハンドラの `f();` の形 (関数を呼ぶだけのもの) なら、その名前。無ければ null。
  * 前後の空白は先に落として、量指定子が隣り合わない形で見る (`\s*;?\s*$` は空白が並ぶと 2 乗かかり、
  * ネイティブの正規表現なので VM の上限でも止まらない)。長いものは呼ぶだけの形ではないので見ない
  */
@@ -287,6 +308,15 @@ function callee(code: string): string | null {
   return (
     /^([A-Za-z_$][\w$]*)\s*\(\s*\)(?:\s*;)?$/.exec(code.trim())?.[1] ?? null
   );
+}
+
+/**
+ * 部品を指す書き方 (`/70`、いまの局を明示した `/-1/70`) から部品タグを読む。読めなければ null。
+ * `setMainAudioStream` と音声の object の `data` で同じ読み方にする
+ */
+function componentTag(ref: string): number | null {
+  const match = /^\/(?:-1\/)?([0-9a-f]{1,2})$/i.exec(ref.trim());
+  return match === null ? null : Number.parseInt(match[1]!, 16);
 }
 
 /** 入口のモジュール */
@@ -315,6 +345,14 @@ class Engine implements DomHost, BrowserHost, RenderHost {
   private running = false;
   private scheduled = false;
   private destroyed = false;
+  /** PMT にある音声の ES の部品タグ (PMT の順。部品タグの無い ES は null。`audioComponents`) */
+  private audios: (number | null)[] = [];
+  /** 文書が選んだ主音声の部品タグ。ふだんの音声 (PMT の 1 本目) なら null (`setMainAudio`) */
+  private mainAudio: number | null = null;
+  /** 主音声を音声の object で選んだか (`objectAudio`)。object が無くなったときに戻すのは、object で選んだときだけ */
+  private audioByObject = false;
+  /** 最後に記録に出した音声の object の様子 (`objectAudio`。同じなら出さない) */
+  private loggedAudioObjects = "";
   private loading = false;
   private currentEvent: Value = null;
   private focusedElement: BmlElement | null = null;
@@ -332,7 +370,7 @@ class Engine implements DomHost, BrowserHost, RenderHost {
   private tot: { at: number; received: number } | null = null;
   /** Ureg を消す目安 (前のサービス) */
   private service: number | null = null;
-  /** 文書を読み込んでいる間。外から来るイベントは捨てる (onload より前に受け手を動かさない) */
+  /** 文書を読み込んでいる間。外から来るイベントは捨てる (onload より前にハンドラを動かさない) */
   private preparing = false;
   private readonly budget: Budget;
   /** 文書が休みなく動き続けたので止めた (epgTune で選局を任せたときも)。このエンジンではもう文書を出さない */
@@ -344,6 +382,8 @@ class Engine implements DomHost, BrowserHost, RenderHost {
   private depth = 0;
   /** 取得して「無い」と決まった画像。モジュールが届き直すまで取得しない */
   private readonly missingImages = new Set<string>();
+  /** 待ちが上限 (`MAX_IMAGES`) で取得を始めなかった画像がある。待ちが 1 つ終わったら描き直す */
+  private imagesDeferred = false;
   private receiver: ReceiverInfo = { zipcode: "", prefecture: 255 };
   /** 扱えない名前だと知らせたもの (同じものを何度も知らせない) */
   private readonly reported = new Set<string>();
@@ -374,8 +414,10 @@ class Engine implements DomHost, BrowserHost, RenderHost {
 
   feed(message: ResponseMessage): void {
     if (this.destroyed) return;
-    // 届いたものを捌くのもエンジンの仕事に数える (ライブは止まらずに流れ込み続ける。
-    // モジュールをデコードする・受け手を探すのを数えないと、「10 秒のうち 4 割を超えて動いたら止める」
+    if (message.type === "pmt")
+      this.audioComponents(message.components, message.audios);
+    // 届いたものを処理するのもエンジンの仕事に数える (ライブは止まらずに届き続ける。
+    // モジュールをデコードする・ハンドラを探すのを数えないと、「10 秒のうち 4 割を超えて動いたら止める」
     // 決まり (budget.ts) の勘定から漏れる)
     this.work(() => {
       for (const event of this.resources.feed(message)) this.react(event);
@@ -383,7 +425,18 @@ class Engine implements DomHost, BrowserHost, RenderHost {
   }
 
   releaseKeys(): void {
+    const held = this.held;
     this.held = null;
+    // 決定の keyup は来ないので、押している間の見た目 (activeStyle) を戻す。keydown の後始末が済んでから
+    if (held === null || this.doc === null) return;
+    this.enqueue({
+      kind: "native",
+      token: this.token,
+      run: () => {
+        const focused = this.focusedElement;
+        if (focused?.state === "active") focused.setState("focus");
+      },
+    });
   }
 
   get path(): string | null {
@@ -502,7 +555,7 @@ class Engine implements DomHost, BrowserHost, RenderHost {
         });
       }
     }
-    // 受け手が文書を替えなければ、入口から出直す (TR-B14 第二分冊 表 5-11)
+    // ハンドラが文書を替えなければ、入口から出直す (TR-B14 第二分冊 表 5-11)
     this.enqueue({
       kind: "native",
       token: this.token,
@@ -539,14 +592,11 @@ class Engine implements DomHost, BrowserHost, RenderHost {
 
   /**
    * 入口を始めてよいか。開いていれば始める。開いていなければ、入口の部品に自動起動の指定
-   * (`auto_start_flag`) があるときだけ始める。テレビは選局したら入口を裏で動かす (`opened` の説明)
+   * (`auto_start_flag`。`ts/data-auto-start.ts` の `autoStarts`) があるときだけ始める。テレビは選局したら入口を裏で動かす (`opened` の説明)
    */
   private mayStart(): boolean {
     if (this.options.opened?.() !== false) return true;
-    return (
-      this.resources.pmt.get(STARTUP_COMPONENT)?.bxmlInfo?.entryPointInfo
-        ?.autoStartFlag === true
-    );
+    return autoStarts(this.resources.pmt.values());
   }
 
   /** 今の文書の残り (待っているイベント・タイマー・続き) を捨てる。文書を替える前に同期で */
@@ -560,7 +610,7 @@ class Engine implements DomHost, BrowserHost, RenderHost {
   /** 今の実行を打ち切って入口から出直す */
   private restart(): void {
     this.abandon();
-    // 入口が届くまでのあいだ、古い文書の受け手を動かさない
+    // 入口が届くまでのあいだ、古い文書のハンドラを動かさない
     this.preparing = true;
     void this.startup();
   }
@@ -646,24 +696,27 @@ class Engine implements DomHost, BrowserHost, RenderHost {
     }
     for (const beitem of this.beitems("EventMessageFired")) {
       if (target(beitem) !== message.componentId) continue;
-      const group =
-        Number.parseInt(beitem.attr("message_group_id") ?? "0", 10) || 0;
-      const wantId = Number.parseInt(beitem.attr("message_id") ?? "255", 10);
-      const wantVersion = Number.parseInt(
-        beitem.attr("message_version") ?? "255",
-        10,
-      );
+      // 読めない値は DOM の messageId などと同じく既定 (255 は何でも合う)
+      const group = numberAttr(beitem, "message_group_id", 0);
+      const wantId = numberAttr(beitem, "message_id", 255);
+      const wantVersion = numberAttr(beitem, "message_version", 255);
       for (const event of message.events) {
-        // 時刻指定 (NPT) のイベントは NPT を持たないので動かせない。すぐ起きるものだけ
+        // 起こすのはすぐ起きるものだけ。時刻指定 (NPT) のものは、NPT が達するとサーバが直して送る (`@danything/arib` の `dueEvents`)
         if (
           event.type !== "immediateEvent" ||
           event.eventMessageGroupId !== group
         )
           continue;
+        /*
+         * **message_group_id 0 は、今の文書のカルーセルの回 (data_event_id) と同じときだけ起こす。** 比べるのは
+         * 今の文書の部品の DII。イベントメッセージは運用では文書とは別の部品 (`es_ref`) で送られ、その部品には DII が無い。
+         * イベントの部品の DII と比べていた頃は、別の部品で送られたものが 1 つも起きなかった
+         */
         if (
           group === 0 &&
-          this.resources.dii.get(message.componentId)?.dataEventId !==
-            message.dataEventId
+          (component === null ||
+            this.resources.dii.get(component)?.dataEventId !==
+              message.dataEventId)
         )
           continue;
         const id = event.eventMessageId >> 8;
@@ -729,7 +782,7 @@ class Engine implements DomHost, BrowserHost, RenderHost {
   }
 
   /**
-   * 文書を読んで出す。`name` は文書の中の書き方のまま (今の文書から見た相対でもよい)。
+   * 文書を読んで出す。`name` は文書に書かれたまま (今の文書から見た相対でもよい)。
    * 読めなければ入口から出直す (入口が読めなければ止める)
    */
   private async load(name: string, entry = false): Promise<void> {
@@ -745,7 +798,7 @@ class Engine implements DomHost, BrowserHost, RenderHost {
         : await this.resources.fetch(ref);
     if (token !== this.token || this.destroyed) return;
     // 問い合わせ (`next.bml?tsid=…`) は、ファイルを引くのには使わず文書の名前に残す。移った先の文書は
-    // getActiveDocument で読む (テレ朝。STD-B24 に放送の文書の問い合わせの決まりは無く、名前の一部として扱う)
+    // getActiveDocument で読む (テレ朝。STD-B24 には放送の文書に付ける問い合わせの決まりが無いので、名前の一部として扱う)
     // 通信の文書は問い合わせごと URL (`refToPath`) に入っている
     const query =
       ref?.url !== undefined ? "" : (/\?[^#]*/.exec(name)?.[0] ?? "");
@@ -883,7 +936,7 @@ class Engine implements DomHost, BrowserHost, RenderHost {
         ? { width: 720, height: 480, aspect }
         : { width: 960, height: 540, aspect: "16:9" };
 
-    // スクリプトの世界は文書ごとに作り直す
+    // スクリプトの Realm (グローバルと組み込み) は文書ごとに作り直す
     const realm = createRealm({ now: () => this.now() });
     this.doc = doc;
     this.focusedElement = null;
@@ -900,6 +953,8 @@ class Engine implements DomHost, BrowserHost, RenderHost {
       this.options.onVideoRect?.(rect, this.size),
     );
     this.options.onLoad?.(this.size);
+    // 文書に初めから再生の音声の object があれば、その音声にする (無くなったら戻す)
+    this.objectAudio("文書を読み込んだ");
     this.setHidden(body?.attr("invisible") === "invisible");
     this.screenLocked = false;
     this.renderer.draw(true);
@@ -932,8 +987,8 @@ class Engine implements DomHost, BrowserHost, RenderHost {
 
   private enqueue(job: Job): void {
     if (job.token !== this.token) return;
-    // 待ちの上限。受け手が待ち (sleep・届かないモジュール) で止まっている間もライブの通知は
-    // 来続けるので、溢れた分の受け手は捨てる (テレビも動いている間の通知は取りこぼす)。
+    // 待ちの上限。ハンドラが待ち (sleep・届かないモジュール) で止まっている間もライブの通知は
+    // 来続けるので、溢れた分のハンドラは捨てる (テレビも動いている間の通知は取りこぼす)。
     // エンジンの中の続き (native) は捨てない
     if (job.kind !== "native" && this.queue.length >= MAX_QUEUE) {
       // 捨てたタイマーの刻みは、次の刻みで積み直せるように
@@ -1015,7 +1070,7 @@ class Engine implements DomHost, BrowserHost, RenderHost {
           } else {
             const name = callee(job.handler);
             if (name === null)
-              throw new ScriptError(`受け手の形が読めません: ${job.handler}`);
+              throw new ScriptError(`ハンドラの形が読めません: ${job.handler}`);
             this.currentEvent = dom.event({
               ...job.event,
               target: dom.wrap(job.target),
@@ -1035,7 +1090,7 @@ class Engine implements DomHost, BrowserHost, RenderHost {
   }
 
   /**
-   * スクリプトを続ける。約束の続き (すぐ返る待ちのくり返し) で来ても、今の仕事の区切りを
+   * スクリプトを続ける。Promise の続き (すぐ返る待ちのくり返し) で来ても、今の仕事の区切りを
    * 使い切っていれば次のタスクへ回す
    */
   private step(token: number, vm: Vm): void {
@@ -1132,7 +1187,7 @@ class Engine implements DomHost, BrowserHost, RenderHost {
     const { window, ratio } = this.budget.limits;
     this.halted = true;
     this.log(
-      `文書が休みなく動き続けるので止めました (${window}ms のうち ${Math.round(ratio * 100)}% を超えて動いた): ${this.current ?? ""}`,
+      `文書が休みなく動き続けるので止めました (${window} ms のうち ${Math.round(ratio * 100)}% を超えて動いた): ${this.current ?? ""}`,
     );
     this.exit();
   }
@@ -1197,19 +1252,150 @@ class Engine implements DomHost, BrowserHost, RenderHost {
     this.handle(element, "onblur", { type: "blur" });
   }
 
+  /**
+   * PMT にある音声の ES の部品タグを、PMT の順に覚える。選んでいた ES が無くなったか、1 本目 (ふだんの音声) になったら戻す。
+   * 順番が入れ替わって何本目かが変わったら、新しい何本目かを渡し直す (画面は何本目かで選んでいる)。
+   *
+   * **部品タグの無い音声の ES も数に入れる** (`audios`。部品タグの無い ES は null)。画面の再生と ffmpeg の `0:a:<n>` は
+   * 部品タグに関係なく数えるので、落とすと部品タグの無い ES より後ろの音声が 1 本ずれる。
+   * `audios` の無い PMT (これを足す前に録った `.bml.jsonl`) は、部品タグのある ES (`components`) だけで数える
+   */
+  private audioComponents(
+    components: readonly ComponentPMT[],
+    audios: readonly (number | null)[] | undefined,
+  ): void {
+    const before =
+      this.mainAudio === null ? -1 : this.audios.indexOf(this.mainAudio);
+    this.audios =
+      audios?.slice() ??
+      components
+        .filter((component) => component.streamType === STREAM_AAC)
+        .map((component) => component.componentId);
+    // 文書の音声の object が指す ES が PMT に入ってきたなら、その音声にする (`objectAudio`)
+    if (this.mainAudio === null) {
+      this.objectAudio("PMT を読んだ");
+      return;
+    }
+    const index = this.audios.indexOf(this.mainAudio);
+    if (index <= 0) {
+      this.mainAudio = null;
+      this.audioByObject = false;
+      this.options.onMainAudio?.(null);
+    } else if (index !== before) {
+      this.options.onMainAudio?.(index);
+    }
+  }
+
+  /**
+   * 主音声を替える (`setMainAudioStream`)。`ref` は部品を指す書き方 (`/70`)。PMT に無い部品と、音声でない部品は false。
+   * ふだんの音声 (PMT の 1 本目) を指せば戻す
+   */
+  setMainAudio(ref: string): boolean {
+    const tag = componentTag(ref);
+    const index = tag === null ? -1 : this.audios.indexOf(tag);
+    this.log(
+      `setMainAudioStream(${ref})${
+        tag === null
+          ? " は部品を指す書き方 (/70 の形) ではありません"
+          : index === -1
+            ? " は PMT の音声にありません"
+            : ""
+      }`,
+    );
+    // 替える側がいない (録画の再生) なら、替えられないと答える
+    if (tag === null || index === -1 || this.options.onMainAudio === undefined)
+      return false;
+    this.chooseAudio(tag);
+    this.audioByObject = false;
+    return true;
+  }
+
+  irdId(type: number): string | null {
+    return this.options.irdId?.(type) ?? null;
+  }
+
+  /** 主音声を部品タグ `tag` の ES にする (PMT の 1 本目ならふだんの音声に戻す)。替わったら画面に渡す (`onMainAudio`) */
+  private chooseAudio(tag: number | null): void {
+    const index = tag === null ? 0 : this.audios.indexOf(tag);
+    const chosen = index <= 0 ? null : tag;
+    if (chosen === this.mainAudio) return;
+    this.mainAudio = chosen;
+    this.options.onMainAudio?.(chosen === null ? null : index);
+  }
+
+  /**
+   * **再生にした音声の object (`audio/X-arib-mpeg2-aac`) の ES を主音声にする** (STD-B24 第二編。`data` が部品を指す `/70`)。
+   * 文書を読み込んだとき・object の `streamStatus` や `data` を書き換えたときに決め直す。再生の object が無くなれば、
+   * object で選んでいた音声だけをふだんの音声に戻す (`setMainAudioStream` で選んだものは戻さない)。
+   * どの書き方で切り替える文書かを見分けるため、音声の object の様子は記録に出す
+   */
+  private objectAudio(why: string): void {
+    if (this.doc === null) return;
+    const objects = this.doc
+      .elements("object")
+      .filter((element) => element.type === "audio/x-arib-mpeg2-aac");
+    if (objects.length === 0) {
+      if (this.audioByObject) {
+        this.audioByObject = false;
+        this.chooseAudio(null);
+      }
+      return;
+    }
+    // 様子が前と同じなら記録に出さない (PMT は届くたびにここを通る)
+    const shape = objects
+      .map(
+        (element) =>
+          `data=${element.attr("data") ?? ""} streamstatus=${element.attr("streamstatus") ?? "stop"}`,
+      )
+      .join(" / ");
+    if (shape !== this.loggedAudioObjects) {
+      this.loggedAudioObjects = shape;
+      this.log(`音声の object (${why}): ${shape}`);
+    }
+    if (this.options.onMainAudio === undefined) return;
+    const tag = objects
+      .filter(
+        (element) =>
+          (element.attr("streamstatus") ?? "stop").toLowerCase() === "play",
+      )
+      .map((element) => componentTag(element.attr("data") ?? ""))
+      .find((found) => found !== null && this.audios.includes(found));
+    if (tag !== undefined) {
+      this.chooseAudio(tag);
+      this.audioByObject = true;
+    } else if (this.audioByObject) {
+      this.audioByObject = false;
+      this.chooseAudio(null);
+    }
+  }
+
+  /** object の `data` を書き換えた (`Dom`)。音声の object なら主音声を決め直す */
+  objectChanged(element: BmlElement): void {
+    if (element.type === "audio/x-arib-mpeg2-aac")
+      this.objectAudio("data を書き換えた");
+  }
+
+  /** 今の主音声 (`getMainAudioStream`)。替えていなければ PMT の 1 本目 (分からない・1 本目に部品タグが無ければ `/10`) */
+  mainAudioRef(): string {
+    const tag = this.mainAudio ?? this.audios[0] ?? 0x10;
+    return `/${tag.toString(16).padStart(2, "0")}`;
+  }
+
   stream(element: BmlElement, status: string): void {
-    const type = (element.attr("type") ?? "").toLowerCase();
+    const type = element.type;
     if (type !== "audio/x-arib-aiff") {
       // MNG は止めるとコマの位置が 0 に戻る (付属 2 4.8.5.3 表 4-27)
       if (type === "image/x-arib-mng" && status.toLowerCase() === "stop")
         element.setAttr("streamposition", "0");
       element.setAttr("streamstatus", status);
+      if (type === "audio/x-arib-mpeg2-aac")
+        this.objectAudio(`streamStatus を ${status} にした`);
       return;
     }
     this.playing.get(element)?.();
     this.playing.delete(element);
     element.setAttr("streamstatus", "stop");
-    if (status !== "play") return;
+    if (status.toLowerCase() !== "play") return;
     const ref = this.resources.resolve(
       element.attr("data") ?? "",
       this.current,
@@ -1244,7 +1430,7 @@ class Engine implements DomHost, BrowserHost, RenderHost {
   }
 
   /**
-   * 外のアプリを開けるか。**開く前 (常に受信しているだけ) は開けない。** 画面が開く前の起動を断るので、
+   * 外のアプリを開けるか。**開く前 (自動で受信しているだけ) は開けない。** 画面が開く前の起動を断るので、
    * 問い合わせに 1 と答えると、文書は起動を求めたまま返らなくなる
    */
   private appable(): boolean {
@@ -1431,7 +1617,7 @@ class Engine implements DomHost, BrowserHost, RenderHost {
 
   setTimer(code: string, interval: number, count: number): number {
     if (!(interval > 0)) return Number.NaN;
-    // 消し忘れて積み上がるタイマーを止める (受け手のたびに回数 0 で作り直す文書など)
+    // 消し忘れて積み上がるタイマーを止める (ハンドラのたびに回数 0 で作り直す文書など)
     if (this.timers.size >= MAX_TIMERS) {
       this.report(
         "#timers",
@@ -1471,7 +1657,7 @@ class Engine implements DomHost, BrowserHost, RenderHost {
   private startTimer(id: number, timer: Timer): void {
     const token = this.token;
     timer.handle = setInterval(() => {
-      // 前に積んだものがまだ動いていなければ積まない (受け手が間隔より重いと、待ちが際限なく伸びる)
+      // 前に積んだものがまだ動いていなければ積まない (ハンドラが間隔より重いと、待ちが際限なく伸びる)
       if (token !== this.token || timer.queued) return;
       timer.remaining--;
       if (timer.remaining <= 0) this.timer(id, "clear");
@@ -1570,6 +1756,10 @@ class Engine implements DomHost, BrowserHost, RenderHost {
     return (
       ref !== null && this.resources.unlock(ref.component, ref.module, kind)
     );
+  }
+
+  unlockAll(): void {
+    this.resources.unlockAll();
   }
 
   locked(): [string, boolean, boolean][] {
@@ -1681,21 +1871,32 @@ class Engine implements DomHost, BrowserHost, RenderHost {
     const file = this.resources.file(ref);
     if (file === null) {
       const key = refToPath(ref);
-      if (!this.waitingImages.has(key) && !this.missingImages.has(key)) {
-        this.waitingImages.add(key);
-        void this.resources.fetch(ref).then(() => {
-          this.waitingImages.delete(key);
-          // 描けるようにならなかった (来ないと決まった・押さえた古いバージョンに無い) なら描き直さない。
-          // 描き直すとまたここへ来て、すぐ「無い」と返るのをくり返す (2026-10-12 本番で
-          // タブが固まった)。モジュールが届き直したら探し直す
-          if (this.resources.file(ref) === null) {
-            this.missingImages.add(key);
-            return;
-          }
-          this.doc?.touch();
-          this.drawSoon();
-        });
+      if (this.waitingImages.has(key) || this.missingImages.has(key))
+        return null;
+      if (this.waitingImages.size >= MAX_IMAGES) {
+        this.imagesDeferred = true;
+        return null;
       }
+      this.waitingImages.add(key);
+      void this.resources.fetch(ref).then(() => {
+        this.waitingImages.delete(key);
+        // 上限で取得を始めなかった画像がある。空いたので、描き直して取得させる
+        const deferred = this.imagesDeferred;
+        this.imagesDeferred = false;
+        // 描けるようにならなかった (来ないと決まった・押さえた古いバージョンに無い) なら描き直さない。
+        // 描き直すとまたここへ来て、すぐ「無い」と返るのをくり返す (2026-10-12 本番で
+        // タブが固まった)。モジュールが届き直したら探し直す
+        if (this.resources.file(ref) === null) {
+          if (this.missingImages.size >= MAX_IMAGES) {
+            const oldest = this.missingImages.values().next();
+            if (oldest.done !== true) this.missingImages.delete(oldest.value);
+          }
+          this.missingImages.add(key);
+          if (!deferred) return;
+        }
+        this.doc?.touch();
+        this.drawSoon();
+      });
       return null;
     }
     const png = type === "image/x-arib-png";
@@ -1719,7 +1920,7 @@ class Engine implements DomHost, BrowserHost, RenderHost {
       }
     } else {
       const mime = `${file.type.type}/${file.type.subtype}`;
-      const size = mime === "image/jpeg" ? jpegSize(file.data) : null;
+      const size = mime === "image/jpeg" ? jpegDimensions(file.data) : null;
       source = {
         url: blobUrl(file.data, mime),
         width: size?.width ?? null,
@@ -1759,13 +1960,10 @@ class Engine implements DomHost, BrowserHost, RenderHost {
 
   /** used-key-list で受けるキーか */
   private accepts(code: number): boolean {
+    // 既定のスタイル (`style.ts` の `DEFAULTS`) が「basic data-button」を入れるので、文書があれば空にならない
     const list = this.doc?.body?.style().usedKeyList ?? [];
-    if (list[0] === "none") return false;
     const group = keyGroup(code);
-    if (group === null) return false;
-    return list.length === 0
-      ? group === "basic" || group === "data-button"
-      : list.includes(group);
+    return group !== null && list.includes(group);
   }
 
   private keyDown(code: number): void {
@@ -1849,11 +2047,12 @@ class Engine implements DomHost, BrowserHost, RenderHost {
       this.handle(focused, "onclick", { type: "click" });
       if (focused.tag === "a") {
         const href = focused.attr("href") ?? "";
-        if (href !== "" && !href.startsWith("#") && !this.unknownName(href)) {
+        // launchDocument と同じ確認を通す (移れない先なら今の文書のまま、通信の文書は取り直す)
+        if (href !== "") {
           this.enqueue({
             kind: "native",
             token: this.token,
-            run: () => void this.load(href),
+            run: () => void this.launch(href),
           });
         }
       }
@@ -1906,7 +2105,10 @@ export function createBml(options: BmlOptions): Bml {
   return new Engine(options);
 }
 
-/** 押したキー (KeyboardEvent.key) → AribKeyCode。英字は大文字でも同じ */
+/**
+ * 押したキー (KeyboardEvent.key) → AribKeyCode。英字は大文字でも同じ。
+ * e・f (データ 1・2) は文書に届かない (`keyGroup`) ので割り当てず、プレイヤーの操作 (f の全画面) に残す
+ */
 const KEYS = new Map<string, number>([
   ["ArrowUp", KEY.up],
   ["ArrowDown", KEY.down],
@@ -1921,8 +2123,6 @@ const KEYS = new Map<string, number>([
   ["r", KEY.red],
   ["g", KEY.green],
   ["y", KEY.yellow],
-  ["e", KEY.data1],
-  ["f", KEY.data2],
 ]);
 
 /** 押したキー (KeyboardEvent.key) を AribKeyCode に。対応が無ければ -1 */

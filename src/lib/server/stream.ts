@@ -1,8 +1,8 @@
 import { createServer, type Socket } from "node:net";
 import { constants, setPriority } from "node:os";
 
-/** ffmpeg の 4 本目の出口 (`sideOutput`) */
-export interface SideOutput {
+/** ffmpeg の 4 本目の出力 (`sideOutput`) */
+interface SideOutput {
   /** ffmpeg に書かせる先 (`pipe:3` か名前付きパイプの名前) */
   readonly url: string;
   /** Bun.spawn の stdio の 4 本目 (Windows では無し) */
@@ -17,18 +17,18 @@ export interface SideOutput {
 let sides = 0;
 
 /**
- * **ffmpeg の 4 本目の出口** (録画のエンコードの進み具合・ライブの字幕)。ffmpeg を起こす直前に作り、
+ * **ffmpeg の 4 本目の出力** (録画のエンコードの進み具合・ライブの字幕)。ffmpeg を起こす直前に作り、
  * 起こしたら間に `await` を挟まずに `read` を呼ぶ (Windows では、呼ばれないまま次の周回に入ると、起こせなかったとみなして閉じる)。
  *
  * Linux・Mac は stdio の 4 本目のパイプを開けて `pipe:3` に書かせる。**Windows の bun は 4 本目のパイプを
  * 開けても読めない** (`Bun.file(fd)` は EMFILE、`fs.read` は EBADF。tests/native-smoke.ts で確かめた)。
  * 読まずにいると、パイプが詰まったところで ffmpeg が止まる。そこで Windows では名前付きパイプを開けて待ち、
- * ffmpeg にはその名前を出口として渡す (ffmpeg は名前付きパイプをファイルと同じく開いて書く)。
- * 待ち受けはこの呼び出しの中で始まり、ffmpeg が出口を開くのは入力を読み始めたあとなので、起こすより先に開いている
+ * ffmpeg にはその名前を出力として渡す (ffmpeg は名前付きパイプをファイルと同じく開いて書く)。
+ * 待ち受けはこの呼び出しの中で始まり、ffmpeg が出力を開くのは入力を読み始めたあとなので、起こすより先に開いている
  *
- * **ffmpeg には `-y` を付ける。** 付けないと ffmpeg は出口が既にあるかを `access` で確かめ、Windows ではそれが
+ * **ffmpeg には `-y` を付ける。** 付けないと ffmpeg は出力が既にあるかを `access` で確かめ、Windows ではそれが
  * 名前付きパイプへの 1 本目の接続になる。受けるのは 1 本だけなので、本物の書き込みが開けずに
- * 「Error opening output file」で降りる (ライブの字幕で起きた)
+ * 「Error opening output file」で失敗する (ライブの字幕で起きた)
  */
 export function sideOutput(): SideOutput {
   if (process.platform !== "win32") {
@@ -82,7 +82,7 @@ export function sideOutput(): SideOutput {
   server.listen(url);
   /*
    * **ffmpeg を起こせなかったら閉じる。** 起こしたら同じ流れのまま `read` を呼ぶ決まり (上) なので、
-   * 次の周回までに呼ばれていなければ、起こすところで投げている (`Bun.spawn` が ffmpeg を見つけられないなど)。
+   * 次の周回までに呼ばれていなければ、起こすところで例外になっている (`Bun.spawn` が ffmpeg を見つけられないなど)。
    * 閉じないと、名前付きパイプが待ち受けたまま残る
    */
   let reading = false;
@@ -94,7 +94,7 @@ export function sideOutput(): SideOutput {
     stdio: [],
     read: (proc) => {
       reading = true;
-      // 出口を開かないまま終わった (起こせなかった・入力が読めなかった) ときも終える
+      // 出力を開かないまま終わった (起こせなかった・入力が読めなかった) ときも終える
       void proc.exited.then(() => {
         if (!connected) finish();
       });
@@ -110,7 +110,7 @@ export function sideOutput(): SideOutput {
  * Symbol.asyncIterator が無く型エラーになる。reader を明示的に回すことで型を通しつつ、
  * abort 時に read() が reject する挙動もそのまま使える。
  *
- * **途中で抜けたら (`break`・`return`・投げた) 読み元を cancel する。** 手放すだけだと、読み元は
+ * **途中で抜けたら (`break`・`return`・例外) 読み元を cancel する。** 手放すだけだと、読み元は
  * 誰も読まないまま動き続ける。追っかけの `chase.followFile` は、録画が終わるまでファイルを読み足し続けていた。
  * 抜けたあとも同じストリームを読み続ける所は無い。ライブの TS を起こし直しても使い回す `live.ts` の流し込みは、
  * `for await` にせず `next()` で読むので抜けない。cancel は待たない (読み元の後始末で、抜けるのを遅らせない)
@@ -140,6 +140,46 @@ export async function* chunks(
     if (!ended) reader.cancel().catch(() => undefined);
     reader.releaseLock();
   }
+}
+
+/**
+ * **`feed` が true を返すまで読み、読み元を cancel する** (スキャンが局の一覧を読む。`scan.readServices`・`satellite.readTables`)。
+ * `timeout` を過ぎるか `abort` が立てば、そこで打ち切る。`abort` は走査全体で 1 つなので、足したリスナーは読み終えたら外す
+ * (局ごとに残すと、総当たりで 100 を超えて積もる)。
+ * 読み元が失敗で終わったら、その理由の最後の行を返す (選局が落ちた理由。デバイスが無い・使用中など)。ほかは空
+ */
+export async function readUntil(
+  stream: ReadableStream<Uint8Array>,
+  feed: (chunk: Uint8Array) => boolean,
+  timeout: number,
+  abort?: AbortSignal,
+): Promise<string> {
+  const source = stream.getReader();
+  let error = "";
+  let stop = (): void => {};
+  const deadline = new Promise<void>((resolve) => {
+    stop = resolve;
+  });
+  const timer = setTimeout(stop, timeout);
+  timer.unref?.();
+  // 呼ぶ前に中止されていれば、合図はもう来ない
+  if (abort?.aborted) stop();
+  else abort?.addEventListener("abort", stop, { once: true });
+
+  const read = (async () => {
+    for (;;) {
+      const { done, value } = await source.read();
+      if (done || value === undefined || feed(value)) return;
+    }
+  })().catch((reason: unknown) => {
+    error = String(reason).trim().split("\n").at(-1)?.trim() ?? "";
+  });
+
+  await Promise.race([read, deadline]);
+  clearTimeout(timer);
+  abort?.removeEventListener("abort", stop);
+  await source.cancel().catch(() => undefined);
+  return error;
 }
 
 /** ストリームを最後まで読んで文字列にする */
@@ -216,15 +256,14 @@ interface RunResult {
 }
 
 /**
- * 外の道具を 1 回動かして、終わるまで待つ。
+ * 外部のプログラム (ffmpeg / ffprobe) を 1 回動かして、終わるまで待つ。
  *
- * ffmpeg / ffprobe を呼ぶところで、起こす・出力を読み切る・中止 (AbortSignal) や時間切れで殺す・待つ、
- * という同じ処理をあちこちで書いていた。ここに寄せて、**読み切る前に `exited` を待たない**
- * (パイプが詰まって固まる) などの決まりごとを 1 か所で守る。
+ * 起こす・出力を読み切る・中止 (AbortSignal) や時間切れで止める・待つ、をここにまとめ、
+ * **読み切る前に `exited` を待たない** (パイプが詰まって固まる) などの決まりごとを 1 か所で守る。
  *
  * - `signal` … 押されたら殺す (エンコードの中止など)
  * - `timeoutMs` … これを過ぎたら殺す (壊れたファイルで待ち続けない)
- * - 起こせなかった (道具が入っていない) ときは投げずに `code: 127` で返す
+ * - 起こせなかった (プログラムが入っていない) ときは例外にせず `code: 127` で返す
  */
 export async function run(
   argv: string[],
@@ -249,9 +288,9 @@ export async function run(
 ): Promise<RunResult> {
   /*
    * **もう押されている合図は、起こす前に見る。** `abort` のリスナーは押された
-   * *瞬間*にしか呼ばれないので、押された後に起こした道具には届かず、最後まで
+   * *瞬間*にしか呼ばれないので、押された後に起こしたプロセスには届かず、最後まで
    * 走り切っていた。中止を押したあとに CM 検出が無音検出へ落ち、字幕まで
-   * 画像にしてから畳んでいたのはこれ。殺されたときと同じコード (143 = SIGTERM) で返す
+   * 画像にしてから終わっていたのはこれ。殺されたときと同じコード (143 = SIGTERM) で返す
    */
   if (options.signal?.aborted === true) {
     return { code: 143, stdout: new Uint8Array(), stderr: "中止されました" };
@@ -311,7 +350,7 @@ export async function run(
               ))
                 onStdout(chunk);
             } catch (error) {
-              // 受け手が投げたら誰も読まなくなる。詰まって居座らないよう止めてから投げ直す
+              // 読む側が例外を出したら誰も読まなくなる。子プロセスが詰まって残らないよう止めてから例外を出し直す
               kill();
               throw error;
             }
@@ -339,56 +378,6 @@ export async function run(
     if (timer !== null) clearTimeout(timer);
     options.signal?.removeEventListener("abort", kill);
   }
-}
-
-/**
- * **ffmpeg の出口をそのまま応答の本文にする** (音声だけの取り出し。`stdout` に流させる)。
- * 録画のその場の変換・詰め替えは、降りたときの次の手と詰まりの検出を足した `playback.transcodeBody`
- *
- * - 読まれたぶんしか読み出さない (`pull`)。相手が読まなければ出口が詰まり、ffmpeg も止まる
- * - 閉じられたら (`cancel`) ffmpeg を殺す
- * - **途中で落ちたら、ログに残して本文もエラーで終える。** 200 のまま静かに閉じると、
- *   受け手は最後まで届いたと思い、どこで何が起きたのかも残らなかった (レビュー指摘)
- *
- * `-loglevel error` で起こすこと。出るのは失敗の理由だけで、それをログへ回す
- *
- * @param what ログの先頭 (`[audio] 音声だけの取り出し …`)
- */
-export function ffmpegBody(
-  argv: string[],
-  what: string,
-): ReadableStream<Uint8Array> {
-  const ffmpeg = Bun.spawn(argv, {
-    stdin: "ignore",
-    stdout: "pipe",
-    stderr: "pipe",
-  });
-  const stderr = new Response(ffmpeg.stderr).text().catch(() => "");
-  let canceled = false;
-  const reader = ffmpeg.stdout.getReader();
-  return new ReadableStream<Uint8Array>({
-    async pull(controller) {
-      const { done, value } = await reader.read();
-      if (!done) {
-        controller.enqueue(value);
-        return;
-      }
-      const code = await ffmpeg.exited;
-      // 受け手が閉じたあとは、もう閉じてある (二度閉じると投げる)
-      if (canceled) return;
-      if (code === 0) {
-        controller.close();
-        return;
-      }
-      const why = (await stderr).trim().split("\n").slice(-3).join(" / ");
-      console.warn(`${what}が止まりました (${code}): ${why}`);
-      controller.error(new Error(`ffmpeg exited with ${code}`));
-    },
-    cancel() {
-      canceled = true;
-      ffmpeg.kill();
-    },
-  });
 }
 
 /** 子プロセスの標準入力を閉じる。もう閉じていてもいい */

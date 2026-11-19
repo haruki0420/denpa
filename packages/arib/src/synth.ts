@@ -2,7 +2,7 @@
  * TS のセクションを組み立てる。
  *
  * 実チューナーが無いので、解析のテストにも偽エージェントにも「それらしい TS」が要る。
- * 読む側 (psi.ts・eit.ts・dsmcc.ts・ait.ts、denpa の logo.ts など) と対になる書く側で、ここだけが仕様の写し。
+ * 読む側 (psi.ts・eit.ts・dsmcc.ts・ait.ts、denpa の logo.ts など) と対になる書く側で、TS の PSI・SI の仕様を書き写しているのはここだけ。
  */
 
 import { joinBytes } from "./bytes.js";
@@ -14,14 +14,14 @@ export { withCrc };
 const be = (value: number) => [(value >> 8) & 0xff, value & 0xff];
 const be32 = (value: number) => [...be(value >>> 16), ...be(value & 0xffff)];
 
-/** 表のバージョンと、何本に分けたうちのどれか。指定しなければバージョン 0・節 0/0 */
+/** 表のバージョンと、何本に分けたうちのどれか。指定しなければバージョン 0・セクション 0/0 */
 export interface SectionPart {
   version?: number;
   sectionNumber?: number;
   lastSectionNumber?: number;
 }
 
-/** セクションの頭 8 バイト (長さは `withCrc` が埋める) */
+/** セクションの先頭 8 バイト (長さは `withCrc` が埋める) */
 function head(
   tableId: number,
   extension: number,
@@ -38,7 +38,7 @@ function head(
   ];
 }
 
-/** PCR の基準部 (90kHz) を適応フィールドに書く (旗は呼ぶ側)。拡張部 (27MHz の端数) は読む側が見ていないので 0 */
+/** PCR の基準部 (90kHz) を適応フィールドに書く (フラグは呼ぶ側が立てる)。拡張部 (27MHz の端数) は読む側が見ていないので 0 */
 export function putPcr(packet: Uint8Array, pcr: number): void {
   const base = Math.round(pcr) % 2 ** 33;
   packet[6] = Math.floor(base / 2 ** 25) & 0xff;
@@ -113,7 +113,7 @@ function encodeSiText(text: string): number[] {
 /** 言語の符号 "jpn" (ISO 639-2) */
 const JPN = [0x6a, 0x70, 0x6e];
 
-/** 長さ 1 バイトを頭に付けた文字列。SI の記述子はどこもこの形式 */
+/** 長さ 1 バイトを先頭に付けた文字列。SI の記述子はどこもこの形式 */
 const sized = (text: string) => {
   const body = encodeSiText(text);
   return [body.length, ...body];
@@ -150,7 +150,7 @@ const bcd = (value: number) =>
   ((Math.floor(value / 10) << 4) | (value % 10)) & 0xff;
 
 /** epoch ms → MJD + BCD の 5 バイト。放送の時刻は日本時間で書く */
-function mjdTime(at: number): number[] {
+export function mjdTime(at: number): number[] {
   const jst = Math.floor(at / 1000) + 9 * 3600;
   const mjd = Math.floor(jst / 86400) + 40587;
   const rest = ((jst % 86400) + 86400) % 86400;
@@ -163,7 +163,7 @@ function mjdTime(at: number): number[] {
 }
 
 /** ms → BCD 3 バイトの尺 */
-function bcdDuration(ms: number): number[] {
+export function bcdDuration(ms: number): number[] {
   const total = Math.floor(ms / 1000);
   return [
     bcd(Math.floor(total / 3600)),
@@ -372,12 +372,16 @@ export function nitSection(
   networkId: number,
   remoteControlKeyId: number | null,
   streams: [number, number, [number, number][], number[]?][],
-  /** `other` なら NIT[other] (0x41。ほかのネットワークのもの) */
-  options: SectionPart & { other?: boolean } = {},
+  /** `other` なら NIT[other] (0x41。ほかのネットワークのもの)。`name` を渡すとネットワーク名の記述子 (0x40) を付ける */
+  options: SectionPart & { other?: boolean; name?: string } = {},
 ): Uint8Array {
+  const network = options.name === undefined ? [] : encodeSiText(options.name);
+  const networkDescriptors =
+    network.length === 0 ? [] : [0x40, network.length, ...network];
   const body = [
     ...head(options.other === true ? 0x41 : 0x40, networkId, options),
-    ...be(0xf000),
+    ...be(0xf000 | networkDescriptors.length),
+    ...networkDescriptors,
   ];
 
   const loop: number[] = [];
@@ -439,6 +443,33 @@ export function satelliteDeliveryDescriptor(
   ];
 }
 
+/**
+ * ケーブルの分配の記述子 (0x44)。周波数は Hz で渡す (111000000)。
+ * 既定は TS が 1 つの搬送波 (多重フレーム型式番号 0xF)・RS(204,188)・64QAM・5.274 Msym/s・内符号なし
+ */
+export function cableDeliveryDescriptor(
+  frequency: number,
+  options: {
+    frameType?: number;
+    modulation?: number;
+    symbolRate?: number;
+  } = {},
+): number[] {
+  const symbol = bcdBytes((options.symbolRate ?? 5_274_000) / 100, 7);
+  return [
+    0x44,
+    11,
+    ...bcdBytes(frequency / 100, 8),
+    0xff,
+    ((options.frameType ?? 0x0f) << 4) | 0x02,
+    options.modulation ?? 0x03,
+    symbol[0]!,
+    symbol[1]!,
+    symbol[2]!,
+    (symbol[3]! & 0xf0) | 0x0f,
+  ];
+}
+
 /** 地上の分配の記述子 (0xFA)。周波数は Hz で渡す (1/7 MHz 単位に丸める) */
 export function terrestrialDeliveryDescriptor(
   areaCode: number,
@@ -451,7 +482,7 @@ export function terrestrialDeliveryDescriptor(
   return [0xfa, body.length, ...body];
 }
 
-/** セクションを TS パケットに詰める。頭のパケットには pointer_field が付く */
+/** セクションを TS パケットに詰める。最初のパケットには pointer_field が付く */
 export function packetize(
   pid: number,
   section: Uint8Array,
@@ -476,7 +507,7 @@ export function packetize(
   return Uint8Array.from(packets);
 }
 
-/** 部品を 1 本のバイト列に繋ぐ。組んだパケットを流し込むときの糊 */
+/** 部品を 1 本のバイト列に繋ぐ。組んだパケットを流し込むときに使う */
 export function stream(...parts: Uint8Array[]): Uint8Array {
   return joinBytes(parts);
 }
@@ -520,7 +551,7 @@ export function patSection(
 }
 
 /**
- * PMT。ロゴのカルーセルが乗る ES を 1 つだけ持たせる。
+ * PMT。ロゴのカルーセルを運ぶ ES を 1 つだけ持たせる。
  * 目印は stream_identifier_descriptor (0x52) の component_tag
  */
 export function pmtSection(
@@ -588,17 +619,25 @@ export function programMap(
 /**
  * データ符号化方式記述子 (0xFD)。**BML が載っている ES の目印。**
  *
- * 中身は「入口かどうか」と、カルーセルの回 (dataEventId)。
- * 既定は地上波 (0x0C) の入口つき・960x540
+ * 中身は「入口かどうか」と、自動起動の指定 (`autoStart`。入口のときだけ)、カルーセルの回 (dataEventId)。
+ * 既定は地上波 (0x0C) の入口つき・自動起動つき・960x540
  */
 export function bxmlDescriptor(
-  options: { dataComponentId?: number; entryPoint?: boolean } = {},
+  options: {
+    dataComponentId?: number;
+    entryPoint?: boolean;
+    autoStart?: boolean;
+  } = {},
 ): number[] {
-  const { dataComponentId = 0x0c, entryPoint = true } = options;
+  const {
+    dataComponentId = 0x0c,
+    entryPoint = true,
+    autoStart = true,
+  } = options;
   const body = [
     ...be(dataComponentId),
     // 伝送方式 00 / 入口 / 自動起動 / 解像度 0011 (960x540)
-    ...(entryPoint ? [0x33, 0x70] : [0x00, 0xff]),
+    ...(entryPoint ? [autoStart ? 0x33 : 0x23, 0x70] : [0x00]),
     0xf8, // dataEventId 0xF / event_section_flag
     0xa0, // 即時取得あり / 蓄積不可 / 起動優先
   ];
@@ -717,6 +756,66 @@ export function ddbSection(
   ]);
 }
 
+/**
+ * ストリーム記述子のセクション (table_id 0x3D)。**イベントメッセージと NPT 参照を運ぶ。**
+ * table_id_extension の上位 4 ビットが data_event_id
+ */
+export function streamDescriptorSection(
+  descriptors: number[][],
+  dataEventId = 0x0f,
+  version = 0,
+): Uint8Array {
+  return withCrc([
+    ...head(0x3d, ((dataEventId & 0x0f) << 12) | 0x0fff, { version }),
+    ...descriptors.flat(),
+  ]);
+}
+
+/** 33 ビットの値を、上位 7 ビットを 1 で埋めた 5 バイトに */
+const be33 = (value: number) => [
+  0xfe | Math.floor(value / 2 ** 32),
+  ...be32(value % 2 ** 32),
+];
+
+/**
+ * 汎用イベントメッセージ記述子 (0x40)。`npt` を渡せば時刻指定 (time_mode 2)、渡さなければすぐ起きるもの (time_mode 0)。
+ * `id` は event_msg_id の上位 8 ビット (message_id)、`version` は下位 8 ビット (message_version)
+ */
+export function eventMessageDescriptor(options: {
+  group?: number;
+  id: number;
+  version?: number;
+  npt?: number;
+  data?: number[];
+}): number[] {
+  const { group = 0, id, version = 1, npt, data = [] } = options;
+  const body = [
+    ...be(((group & 0x0fff) << 4) | 0x0f),
+    npt === undefined ? 0 : 2,
+    ...(npt === undefined ? [0xff, 0xff, 0xff, 0xff, 0xff] : be33(npt)),
+    0x00, // event_msg_type
+    id & 0xff,
+    version & 0xff,
+    ...data,
+  ];
+  return [0x40, body.length, ...body];
+}
+
+/** NPT 参照記述子 (0x17)。STC が `stc` のとき NPT が `npt` で、そこから同じ速さ (scale 1/1) で進む */
+export function nptReferenceDescriptor(stc: number, npt: number): number[] {
+  const body = [
+    0x00, // post_discontinuity_indicator 0・dsm_content_id 0
+    ...be33(stc),
+    0xff,
+    0xff,
+    0xff, // reserved (NPT_Reference の手前の 31 ビットのうち 24)
+    ...be33(npt),
+    ...be(1), // scale_numerator
+    ...be(1), // scale_denominator
+  ];
+  return [0x17, body.length, ...body];
+}
+
 /** ロゴデータモジュール (ARIB STD-B21)。カルーセルで運ばれる中身 */
 export function logoModule(
   logoType: number,
@@ -735,8 +834,8 @@ export function logoModule(
 
 /*
  * --- データ放送のテストで使う定番の割り振り ---
- * denpa の bml / data-timeline / recorded-bml の 3 つのテストが、同じ表と同じ組み立てを
- * それぞれに書いていた。番号そのものに意味は無く、揃っていることに意味がある。
+ * denpa の databroadcast・data-timeline・recorded-bml・ts-head のテストが、同じ表と同じ組み立てを使う。
+ * 番号そのものに意味は無く、揃っていることに意味がある。
  */
 export const BML_TS = {
   service: 1024,
@@ -759,7 +858,7 @@ export function bmlPmt(): Uint8Array {
   ]);
 }
 
-/** PAT と PMT。データ放送のストリームの頭 */
+/** PAT と PMT。データ放送のストリームの先頭 */
 export function bmlHead(): Uint8Array[] {
   return [
     packetize(0x0000, patSection([[BML_TS.service, BML_TS.pmtPid]])),
@@ -769,7 +868,7 @@ export function bmlHead(): Uint8Array[] {
 
 /**
  * モジュール 1 つぶんの中身。**放送は multipart/mixed で複数のファイルを詰める。**
- * 本物と同じく、頭に Content-Type、境界で区切って各ファイルに Content-Location
+ * 本物と同じく、先頭に Content-Type、境界で区切って各ファイルに Content-Location
  */
 export function multipartModule(
   files: [location: string, type: string, body: string][],
@@ -783,7 +882,7 @@ export function multipartModule(
   return new TextEncoder().encode(out);
 }
 
-/** PMT の ES に付ける application_signalling_descriptor (0x6F)。**AIT の在り処の印** */
+/** PMT の ES に付ける application_signalling_descriptor (0x6F)。**AIT の在りかの印** */
 export function aitSignallingDescriptor(
   applicationType = 0x0010,
   version = 1,
@@ -797,7 +896,7 @@ export interface SynthHybridcastApp {
   /** `CONTROL` の値。既定は autostart */
   controlCode?: number;
   name?: string;
-  /** URL の頭。**通信路で運ぶもの** (protocol_id = 3) として入れる */
+  /** URL の先頭部分。**通信路で運ぶもの** (protocol_id = 3) として入れる */
   base?: string;
   /** その先のパス */
   path?: string;
@@ -806,7 +905,7 @@ export interface SynthHybridcastApp {
 /**
  * AIT (table_id 0x74)。**Hybridcast のアプリのアドレス (URL) が載っている表。**
  *
- * 中身そのものは電波に乗っていないので、ここに入るのは URL と名前だけ
+ * アプリそのものは放送では送られていないので、ここに入るのは URL と名前だけ
  */
 export function aitSection(
   applications: SynthHybridcastApp[],
@@ -822,7 +921,7 @@ export function aitSection(
     }
     if (app.base !== undefined) {
       const base = [...new TextEncoder().encode(app.base)];
-      // transport_protocol_descriptor: protocol_id=3 (通信路)、label、URL の頭
+      // transport_protocol_descriptor: protocol_id=3 (通信路)、label、URL の先頭部分
       info.push(
         0x02,
         5 + base.length,

@@ -2,7 +2,7 @@
  * **字幕の文字の配置を canvas に描く** ([caption-text.ts](../../../../packages/arib/src/caption-text.ts))。ライブ・追っかけ・観る画面で同じもの。
  *
  * サーバが置き場所まで決めて送ってくるので、ここは言われたとおりに塗るだけ。描き方は
- * libaribcaption の描き手 (region_renderer / text_renderer_freetype) に揃えてある:
+ * libaribcaption のレンダラ (region_renderer / text_renderer_freetype) に揃えてある。
  *
  * - 背景は区画 (`w`x`h`) ごとに塗る。空白も塗る
  * - 字は字の枠の左端をペンの位置にして、**縦は「永」の墨の上下を枠の真ん中に置く**
@@ -27,7 +27,7 @@ import { fitRect } from "./paint";
 
 /**
  * 字は画面の放送の字と同じ Denpa Font (`+layout.svelte` が読む CSS で名乗らせてある。`#lib/font.ts`)。
- * 基本の字と JIS X 0213 で足された漢字の 2 つの woff2 に分かれていて、後のほうはその字が出たときだけ落ちてくる。
+ * 基本の字と JIS X 0213 で足された漢字の 2 つの woff2 に分かれていて、後のほうはその字が出たときだけ読み込む。
  * **canvas は読み込みを待たずに端末の字で描いてしまう**ので、出す字幕の字を `document.fonts.load` に
  * 渡して要るほうを読ませ、届いたら描き直す (`loadFor`)。手元の開発ではイメージに無いので、画面の字へ落ちる
  */
@@ -187,7 +187,7 @@ function drawRun(
     const bottom = (run.y + run.h) * sy;
     /*
      * **塗る枠だけ画素の境目にそろえる。** 半端な位置のまま塗ると、隣の字との境の 1 画素が
-     * 両方から半分ずつしか塗られず、半透明の背景に縦の筋が出ていた。
+     * 両方から半分ずつしか塗られず、半透明の背景に縦の筋が出る。
      * 隣どうしは同じ値に丸まるので、隙間も重なりもできない。字の位置は丸めない (字間が不揃いになる)
      */
     const [l, t, r, b] = [left, top, right, bottom].map(Math.round) as [
@@ -273,7 +273,7 @@ export function inkSpan(page: CaptionPage): [number, number] {
 }
 
 /**
- * 1 枚の canvas に字幕を出し続ける係。**出すものが変わったら `show` を呼ぶだけ。**
+ * 1 枚の canvas に字幕を出し続ける処理。**出すものが変わったら `show` を呼ぶだけ。**
  *
  * - canvas の大きさを画面の画素に合わせ直す (全画面の出入りで描き直す)
  * - 字がまだ届いていなければ、届いてから描き直す
@@ -326,7 +326,7 @@ export class CaptionPainter {
     });
   }
 
-  /** 畳む。canvas は消して返す */
+  /** 破棄する。canvas は消して返す */
   close(): void {
     this.resize?.disconnect();
     window.removeEventListener("resize", this.rescale);
