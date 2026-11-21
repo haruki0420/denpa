@@ -92,7 +92,7 @@ public sealed class Dt295ResidentImage
     public const string FileName = "magicvision-firmware.bin";
 
     /// <summary>同梱のファームウェアの SHA-256。違うものは使わない</summary>
-    public const string Sha256 = "0b2147e190afc7626165594fdedbedc6461c0e1f044b17742123b77fc5026fcc";
+    public const string Sha256 = "77ade6cf9e48d00ce8fe32e4fea3f6fec41b12fc0ff99ee4339175e6404bf545";
 
     private static readonly Lazy<Dt295ResidentImage> BundledImage = new(() =>
     {
