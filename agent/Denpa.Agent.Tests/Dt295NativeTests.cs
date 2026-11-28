@@ -745,4 +745,58 @@ public class Dt295NativeTests
         await Assert.That(runs.Select(run => run.Length)).IsEquivalentTo(new[] { 188, 188 });
         await Assert.That(runs[0][187]).IsEqualTo((byte)5);
     }
+
+    [Test]
+    public async Task 地上波は_TMCC_やワンセグの前でもフルセグ_B_階層がロックしたら受かったとみなす()
+    {
+        var fake = Rig();
+        var port = $"test-{Guid.NewGuid():N}";
+        var device = Dt295NativeDevice.Acquire(port, () => fake, null, _ => { }, 2000);
+        try
+        {
+            // 0x80 は TMCC 未確定 (bit5=1)、0x81 は bit4=1、0x96 は B 階層 (0x40) のみロック
+            fake.Terrestrial.Regs[0x80] = 0x20;
+            fake.Terrestrial.Regs[0x81] = 0x10;
+            fake.Terrestrial.Regs[0x96] = 0x40;
+            var readsBefore = fake.I2cLog.Count;
+            var ok = device.Frontend.WaitTerrestrialLock(TimeSpan.FromMilliseconds(50));
+            await Assert.That(ok).IsTrue();
+            // TMCC (0xB2..0xB9 = 8 バイト読み出し) を待たずに抜ける
+            await Assert.That(fake.I2cLog.Skip(readsBefore).Any(line => line == "10 R 8")).IsFalse();
+        }
+        finally
+        {
+            device.Release();
+            Dt295NativeDevice.CloseIfIdle(port);
+        }
+    }
+
+    [Test]
+    public async Task 地上波は_A_階層単独や_A_のみ指定では_TMCC_と要求階層に従って待つ()
+    {
+        var fake = Rig();
+        var port = $"test-{Guid.NewGuid():N}";
+        var device = Dt295NativeDevice.Acquire(port, () => fake, null, _ => { }, 2000);
+        try
+        {
+            fake.Terrestrial.Regs[0x80] = 0x00;
+            fake.Terrestrial.Regs[0x81] = 0x10;
+            fake.Terrestrial.Regs[0x96] = 0x40;
+            // A 階層のみ (0x80) を要求しているときは B 階層ロック (0x40) では抜けない
+            await Assert.That(device.Frontend.WaitTerrestrialLock(TimeSpan.FromMilliseconds(1), layers: 0x80)).IsFalse();
+
+            // A 階層単独放送 (13 セグが A 階層、B/C = 0xF) では TMCC の PresentLayers に従って 0x80 で受かる
+            fake.Terrestrial.Regs[0x96] = 0x80;
+            fake.Terrestrial.Regs[0xB4] = 13 << 3;
+            fake.Terrestrial.Regs[0xB5] = 0x03;
+            fake.Terrestrial.Regs[0xB6] = 0xC0;
+            fake.Terrestrial.Regs[0xB7] = 0x1E;
+            await Assert.That(device.Frontend.WaitTerrestrialLock(TimeSpan.FromMilliseconds(50))).IsTrue();
+        }
+        finally
+        {
+            device.Release();
+            Dt295NativeDevice.CloseIfIdle(port);
+        }
+    }
 }

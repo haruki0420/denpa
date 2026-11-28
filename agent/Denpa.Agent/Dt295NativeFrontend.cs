@@ -368,6 +368,17 @@ public sealed class Dt295NativeFrontend(Dt295NativeI2c i2c, Action<int> sleep, D
             if ((v80[1] & 0x10) != 0)
             {
                 var v96 = DemodRead(Terrestrial, 0x96, 1)[0];
+                // 通常の地上波ではフルセグ本放送 (B 階層 = 0x40) が先にロックし、
+                // 長い時間インタリーブを持つワンセグ (A 階層 = 0x80) より約 250 ms 早く復調できる。
+                // 実機 (PIX-DT295、地上波 6 局) で B 階層ロック時点で開始すると 374〜436 ms まで縮み
+                // (先頭約 0.19 秒のみ transport_error_indicator 38〜58 パケット・continuity_counter 飛び 0)、
+                // 映像・PAT とも正常に取得できるため、B 階層が要求に含まれロックした時点で受かったとみなす。
+                // A 階層単独放送や A のみ指定時は下の全階層 / TMCC 判定へ進む
+                if ((v96 & layers & 0x40) != 0)
+                {
+                    Report();
+                    return true;
+                }
                 if ((v96 & layers) == layers)
                 {
                     Report();
